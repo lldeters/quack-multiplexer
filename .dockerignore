@@ -1,0 +1,25 @@
+# Build context of the gateway image (Dockerfile in the repository root).
+# The engine image is built from images/engine with its own context.
+
+# Version control and editor state
+.git
+.gitignore
+.dockerignore
+.idea
+.vscode
+**/.DS_Store
+
+# Build outputs
+bin
+dist
+**/*.exe
+
+# Test outputs
+**/*.test
+**/coverage.out
+**/*.coverprofile
+**/_output
+
+# Not needed to build the gateway
+docs
+images

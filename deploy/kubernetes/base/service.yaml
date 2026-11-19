@@ -1,0 +1,62 @@
+# Cluster-internal access to the gateway:
+#   Quack:  quack:quackmux.quackmux.svc.cluster.local:9494
+#   Admin:  http://quackmux.quackmux.svc.cluster.local:9495 (API, /metrics)
+#
+# Only ready gateway pods receive traffic; with ha.enabled that is the leader.
+apiVersion: v1
+kind: Service
+metadata:
+  name: quackmux
+  labels:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: quack
+      port: 9494
+      targetPort: quack
+      protocol: TCP
+    - name: admin
+      port: 9495
+      targetPort: admin
+      protocol: TCP
+# -----------------------------------------------------------------------------
+# Variant: expose the Quack port through an L4 (TCP) load balancer.
+#
+# Copy this Service into your own overlay, or uncomment it here including the
+# "---" line (service.yaml is already listed in kustomization.yaml). It
+# publishes the Quack port only; keep the admin port internal. Do not put an
+# L7 ingress in front of the gateway (see README.md, "Verbinden").
+#
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: quackmux-external
+#   labels:
+#     app.kubernetes.io/name: quackmux
+#     app.kubernetes.io/component: gateway
+#   annotations:
+#     # A FETCH request carries no bytes while the engine computes the next
+#     # batch: raise the load balancer's idle timeout (provider specific),
+#     # for example on Azure (minutes, 4-100):
+#     # service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout: "30"
+# spec:
+#   type: LoadBalancer
+#   # Keeps the client address (logs, audit) and sends traffic only to the
+#   # node of the ready gateway pod.
+#   externalTrafficPolicy: Local
+#   # Restrict the clients that may connect:
+#   # loadBalancerSourceRanges: [203.0.113.0/24]
+#   selector:
+#     app.kubernetes.io/name: quackmux
+#     app.kubernetes.io/component: gateway
+#   ports:
+#     - name: quack
+#       port: 9494
+#       targetPort: quack
+#       protocol: TCP

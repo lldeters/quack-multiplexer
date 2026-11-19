@@ -1,0 +1,18 @@
+# Keeps the serving gateway (the leader, the only ready pod) from being
+# evicted voluntarily, e.g. by "kubectl drain". Drain the leader's node after
+# a controlled failover (delete the leader pod; README.md, "Hochverfügbarkeit").
+# The unready follower may always be evicted.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: quackmux
+  labels:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+spec:
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quackmux
+      app.kubernetes.io/component: gateway

@@ -1,0 +1,61 @@
+# Users file for auth.mode=static (auth.static.file), used by
+# examples/config.static.yaml. The Kubernetes deployment keeps its copy in a
+# Secret (deploy/kubernetes/base/secrets/users.yaml).
+#
+# Create a token and its hash:   quackmux token
+# Hash an existing token:        quackmux hash-token TOKEN
+#
+# Clients send the token itself, optionally followed by options:
+#   change-me-example-token-0000?share_level=connection&profile=large
+# The file stores only the sha256 of the part before '?', so tokens must not
+# contain '?'. Every token may appear only once in the whole file.
+#
+# The example tokens below are public (they are in this repository). Replace
+# them before you use this file anywhere else than on your own machine.
+#
+# Rules:
+# - "users" must exist; "users: []" rejects everybody.
+# - Unknown fields and duplicate keys are errors: a typo such as
+#   "disable: true" cannot silently leave a user enabled.
+# - User and group names: unique, non-empty, at most 256 bytes, no control
+#   characters, no surrounding white space. The order of the groups matters:
+#   the first one is the default for share_level=group.
+# - Every token sets exactly one of sha256 (64 hex digits) or plain
+#   (accepted, but every load logs a warning - development only).
+# - expires (optional, RFC 3339): the token is rejected from then on.
+#
+# The file is re-read when its modification time or size changes
+# (auth.static.reloadInterval, default 10s) and on SIGHUP. An invalid file is
+# rejected and the previous users stay active. Replace the file atomically
+# (write a temporary file and rename it), as Kubernetes does for Secrets.
+users:
+  - name: alice
+    groups: [analytics]
+    tokens:
+      # sha256 of "change-me-example-token-0000"
+      - sha256: "cef58a2821dd799a53522c76b3e602d8534f044586a2eb12a890e09e3a8f2de2"
+        description: "example token"
+
+  - name: bob
+    groups: [analytics, etl]
+    tokens:
+      # sha256 of "change-me-example-token-0001"
+      - sha256: "16697c4ca896457057d33e36c16376a96389ae5f1f80c1cdedea3d4b65ee4632"
+        description: "laptop"
+        expires: "2027-12-31T23:59:59Z"
+
+  # A technical user, e.g. for a nightly job.
+  - name: etl-bot
+    groups: [etl]
+    tokens:
+      # sha256 of "change-me-example-token-0002"
+      - sha256: "8bbbb4cbac671b2d12f44acc68767a2a84f3390e90be3df49468cc2920c271d2"
+        description: "nightly ETL job"
+
+  # A disabled user keeps its tokens, but every one of them is rejected.
+  - name: mallory
+    disabled: true
+    tokens:
+      # sha256 of "change-me-example-token-0003"
+      - sha256: "c8fa63389b8b30d3dcd561fe8c0fbd00291f219cb9a10ef69472595b347c3a01"
+        description: "revoked"

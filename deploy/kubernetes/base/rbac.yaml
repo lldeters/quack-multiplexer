@@ -1,0 +1,49 @@
+# Namespace-scoped permissions of the gateway.
+#
+# If engines run in another namespace (provider.kubernetes.namespace), create
+# this Role and RoleBinding in that namespace as well; the lease for
+# ha.enabled lives in the engine namespace unless ha.namespace says otherwise.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: quackmux-gateway
+  labels:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+rules:
+  # Engine pods: launch, watch (informer), re-label warm-pool engines when a
+  # session claims them, delete.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete, patch]
+  # One token Secret per engine, owned by its pod (owner reference patched
+  # in after the pod exists); orphaned ones are cleaned up.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, delete, patch]
+  # Kubernetes events about engines (kubectl describe pod / get events).
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  # Leader election (ha.enabled).
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quackmux-gateway
+  labels:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: quackmux-gateway
+subjects:
+  # Without an explicit namespace a ServiceAccount subject of a RoleBinding
+  # refers to the RoleBinding's own namespace, so the binding keeps working
+  # when an overlay moves everything to another namespace.
+  - kind: ServiceAccount
+    name: quackmux-gateway

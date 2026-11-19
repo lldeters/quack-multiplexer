@@ -1,0 +1,102 @@
+# quackmux gateway configuration for development on kind. It replaces
+# ../../base/config.yaml completely.
+#
+# DEVELOPMENT ONLY: auth.mode none accepts every token, and the client picks
+# its user name with the token option "user", e.g. TOKEN 'dev?user=alice'.
+
+server:
+  listen: ":9494"
+  # Keeps sessions alive across gateway restarts (useful to try adoption).
+  sessionKeyFile: /etc/quackmux/session/key
+  upstream:
+    # Message buffer budget that fits the 512 MiB gateway container (the
+    # default of 1 GiB would not).
+    bufferBudgetBytes: 268435456
+
+admin:
+  listen: ":9495"
+  # No tokenFile: the admin API is open to everybody who can reach port
+  # 9495 (the namespace, or kubectl port-forward).
+
+auth:
+  mode: none
+  none:
+    defaultUser: dev
+    defaultGroups: [dev]
+
+defaults:
+  shareLevel: USER
+  subdomain: default
+  profile: default
+
+session:
+  idleTimeout: 1h
+  maxLifetime: 0s
+  minHeartbeatTimeout: 5s
+  maxHeartbeatTimeout: 300s
+  heartbeatGrace: 15s
+  backendHeartbeatTimeout: 1h
+  tombstoneTTL: 1h
+  checkInterval: 5s
+
+engine:
+  # Generous for a busy laptop.
+  startupTimeout: 300s
+  # Free the laptop quickly.
+  idleTimeout:
+    CONNECTION: 0s
+    USER: 5m
+    GROUP: 5m
+    SERVER: 5m
+  maxLifetime: 0s
+  drainTimeout: 1h
+  recoveryGrace: 180s
+  checkInterval: 5s
+  replaceOnSpecChange: true
+  # Keep failed engine pods longer for "kubectl describe/logs".
+  failedRetention: 30m
+
+limits:
+  # Enough for a few users and the end-to-end tests (test/e2e/kind), small
+  # enough for a laptop: every engine requests 100m CPU and 256 MiB.
+  maxSessions: 100
+  maxSessionsPerUser: 20
+  maxEngines: 8
+  maxEnginesPerUser: 3
+  maxStartingEngines: 4
+
+provider:
+  type: kubernetes
+  kubernetes:
+    namespace: quackmux
+    instance: default
+
+profiles:
+  default:
+    description: "Small development engine"
+    # Built from images/engine and loaded into kind:
+    #   kind load docker-image quackmux/duckdb-engine:2.0.0
+    image: quackmux/duckdb-engine:2.0.0
+    imagePullPolicy: IfNotPresent
+    database: ":memory:"
+    settings:
+      memory_limit: 700MB
+      threads: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+audit:
+  enabled: true
+  maxQueryBytes: 4096
+
+ha:
+  enabled: false
+
+log:
+  level: debug
+  format: text

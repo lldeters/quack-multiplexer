@@ -1,0 +1,19 @@
+# Dedicated namespace for the gateway and the engine pods it launches.
+#
+# Keep quackmux alone in this namespace: the gateway's Role may read every
+# Secret in it (it creates one token Secret per engine).
+#
+# Pod Security Admission enforces the "restricted" standard. The gateway and
+# the engine pods the gateway renders comply with it (non-root, no
+# capabilities, no privilege escalation, RuntimeDefault seccomp). A profile
+# pod template that needs more (e.g. a sidecar without a hardened security
+# context) is rejected; then relax "enforce" to "baseline" deliberately.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quackmux
+  labels:
+    app.kubernetes.io/name: quackmux
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

@@ -1,0 +1,502 @@
+# quackmux configuration reference.
+#
+# Every option of the configuration file with its default value, as applied
+# when the option is missing. The only exception is auth.static.file, which
+# has no default but is required for the default auth.mode "static".
+# Commented lines show examples of non-default values.
+#
+# Copy what you need into your own file; omitted options keep their
+# defaults. The deployable Kubernetes configuration is
+# deploy/kubernetes/base/config.yaml. Check a file with:
+#   quackmux validate -config FILE
+#
+# Format notes:
+# - Unknown fields and duplicate keys are errors.
+# - Durations are Go duration strings ("90s", "30m", "6h", "1h30m") or plain
+#   numbers of seconds. An explicit 0 ("0s") means "disabled" where an option
+#   says so; it is not replaced by the default.
+# - Share levels (CONNECTION, USER, GROUP, SERVER) are case-insensitive.
+
+# -----------------------------------------------------------------------------
+# Quack endpoint (clients ATTACH 'quack:<host>:<port>').
+server:
+  # Listen address of the Quack endpoint.
+  listen: ":9494"
+  # HTTPS on the Quack endpoint (null = plain HTTP). Clients then connect
+  # without DISABLE_SSL; the certificate must be trusted by them.
+  tls: null
+  # tls:
+  #   certFile: /etc/quackmux/tls/tls.crt
+  #   keyFile: /etc/quackmux/tls/tls.key
+  # File with the secret that seals gateway connection ids (at least 16
+  # bytes, ideally 32 random bytes; surrounding white space is ignored). All
+  # replicas must share it. The environment variable QUACKMUX_SESSION_KEY
+  # wins over the file. Without either a random key is generated at start-up
+  # and sessions do not survive a gateway restart. Required for ha.enabled.
+  sessionKeyFile: ""
+  # sessionKeyFile: /etc/quackmux/session/key
+  # Text returned on GET / (without authentication).
+  banner: "This is a quackmux gateway for DuckDB Quack. Use ATTACH 'quack:...' to connect here.\n"
+  # CORS origins for DuckDB-Wasm clients, like the stock Quack server.
+  allowedOrigins: ["*"]
+  # Upper bound for the body of a CONNECTION_REQUEST (bytes, default 64 KiB).
+  maxHandshakeBytes: 65536
+  # Time a client may take to send the HTTP request headers.
+  readHeaderTimeout: 30s
+  # Keep-alive timeout of idle client connections (the stock
+  # quack_server_keep_alive_timeout).
+  idleTimeout: 300s
+  # Graceful shutdown: time in-flight requests get to finish.
+  shutdownTimeout: 30s
+
+  # HTTP client of the gateway towards the engines.
+  upstream:
+    # TCP connect timeout to an engine.
+    dialTimeout: 5s
+    # Time to the first response byte; 0s = no limit. A FETCH blocks on the
+    # engine until the next batch is ready, so a limit must exceed the
+    # longest expected wait for the first rows of a query.
+    responseHeaderTimeout: 0s
+    # Idle keep-alive connections kept per engine.
+    maxIdleConnsPerEngine: 64
+    # Idle keep-alive connections are closed after this long.
+    idleConnTimeout: 90s
+    # Timeout of requests the gateway sends on its own (DISCONNECT and
+    # CANCEL on behalf of a closed session, heartbeats to the engine,
+    # health probes).
+    controlTimeout: 10s
+    # The engine's HTTP server aborts a connection whose peer stalls for 5s.
+    # The gateway therefore buffers messages completely in memory, so that a
+    # slow client never stalls an engine: requests up to
+    # maxBufferedRequestBytes (100 MiB) and responses up to
+    # maxBufferedResponseBytes (64 MiB), as long as all buffers together
+    # stay within bufferBudgetBytes (1 GiB). Everything else is streamed. A
+    # negative value disables buffering in that direction. Size the gateway's
+    # memory limit for the budget.
+    maxBufferedRequestBytes: 104857600
+    maxBufferedResponseBytes: 67108864
+    bufferBudgetBytes: 1073741824
+    # Larger requests are rejected up front with a Quack error (100 MiB, the
+    # engine's own limit).
+    maxRequestBytes: 104857600
+
+# -----------------------------------------------------------------------------
+# Admin listener: GET /healthz, /readyz, /metrics and the API under /api/v1.
+admin:
+  # Listen address; "" disables the admin listener (and with it the probes).
+  listen: ":9495"
+  # File with the bearer token for /api/v1. Without it the API is open to
+  # everybody who can reach the port. Probes and /metrics never need it.
+  tokenFile: ""
+  # tokenFile: /etc/quackmux/admin/token
+  # HTTPS on the admin listener (null = plain HTTP).
+  tls: null
+  # tls:
+  #   certFile: /etc/quackmux/admin-tls/tls.crt
+  #   keyFile: /etc/quackmux/admin-tls/tls.key
+
+# -----------------------------------------------------------------------------
+# Authentication of clients (the token of their quack secret, without the
+# "?option=value" suffix).
+auth:
+  # none (development only), static (users file) or jwt.
+  mode: static
+
+  # mode none: every token is accepted; the user comes from the token option
+  # "user" (1-64 characters of A-Z a-z 0-9 . _ @ -) or defaultUser. In the
+  # other modes the option "user" is rejected.
+  none:
+    defaultUser: anonymous
+    # Groups of every identity.
+    defaultGroups: []
+
+  # mode static: YAML file with users, groups and the sha256 of their tokens
+  # (format: examples/users.yaml).
+  static:
+    # Required for mode static (no default).
+    file: /etc/quackmux/users/users.yaml
+    # Poll the file for changes; 0s disables polling (SIGHUP still reloads).
+    reloadInterval: 10s
+
+  # mode jwt: the token is a signed JSON Web Token. At least one key source
+  # (hmacSecretFile, publicKeyFiles, jwksURL) is required.
+  jwt:
+    # Required "iss" value ("" = not checked).
+    issuer: ""
+    # "aud" must contain one of these ([] = not checked).
+    audience: []
+    # audience: [quackmux]
+    # Claim with the user name.
+    userClaim: sub
+    # Claim with the groups: a string or an array of strings. A name with
+    # dots that is not present verbatim is looked up as a path in nested
+    # objects (e.g. realm_access.roles).
+    groupsClaim: groups
+    # Permitted algorithms ([] = every algorithm the configured keys
+    # support; "none" is never permitted).
+    algorithms: []
+    # algorithms: [RS256, ES256]
+    # Shared secret for HS256/HS384/HS512.
+    hmacSecretFile: ""
+    # PEM files with RSA (>= 2048 bits), ECDSA or Ed25519 public keys.
+    publicKeyFiles: []
+    # publicKeyFiles: [/etc/quackmux/jwt/issuer.pem]
+    # JSON Web Key Set, fetched at start-up, every jwksRefresh (0s = never
+    # again) and when a token names an unknown key id.
+    jwksURL: ""
+    # jwksURL: https://login.example.com/realms/data/protocol/openid-connect/certs
+    jwksRefresh: 15m
+    # Tolerated clock skew for exp, nbf and iat.
+    leeway: 30s
+
+# -----------------------------------------------------------------------------
+# Routing of a session unless the client asks for something else. Priority:
+# token options > X-Quackmux-* headers > matching override defaults > these.
+defaults:
+  # CONNECTION | USER | GROUP | SERVER
+  shareLevel: USER
+  # Separates several engines per owner ([a-z0-9-], at most 32 characters).
+  subdomain: default
+  # Must be defined under profiles.
+  profile: default
+
+# Defaults and restrictions per user or group. The first entry that matches
+# (user name, "*" for everybody, or one of the user's groups) wins.
+overrides: []
+# overrides:
+#   - groups: [analytics]
+#     # Like "defaults", but only for matching users.
+#     defaults:
+#       shareLevel: GROUP
+#       subdomain: default
+#       profile: default
+#   - users: [etl-bot]
+#     groups: []
+#     defaults:
+#       shareLevel: CONNECTION
+#       profile: large
+#     # What matching users may request ([] = no extra restriction).
+#     allowedShareLevels: [CONNECTION]
+#     allowedProfiles: [large]
+#     # Replaces limits.maxSessionsPerUser for matching users (0 = keep it).
+#     maxSessions: 20
+
+# -----------------------------------------------------------------------------
+# Session lifecycle.
+session:
+  # Close sessions without queries for this long; heartbeats do not count
+  # (Kyuubi: kyuubi.session.idle.timeout). 0s disables.
+  idleTimeout: 6h
+  # Close sessions older than this. 0s disables.
+  maxLifetime: 0s
+  # The heartbeat lease the client asks for (DuckDB: 60s) is clamped to
+  # [minHeartbeatTimeout, maxHeartbeatTimeout] (at most 65535s).
+  minHeartbeatTimeout: 5s
+  maxHeartbeatTimeout: 300s
+  # Added to the lease before a silent client counts as dead; the gateway
+  # then sends DISCONNECT to the engine to free the connection there.
+  heartbeatGrace: 15s
+  # Lease the gateway requests from the engine (at least 30s). The gateway
+  # answers client heartbeats itself and renews this lease every third of it
+  # for quiet sessions.
+  backendHeartbeatTimeout: 1h
+  # Closed sessions are remembered this long, so that clients get a precise
+  # error ("session closed: idle timeout ...") instead of "Invalid
+  # connection id".
+  tombstoneTTL: 1h
+  # Period of the session reaper.
+  checkInterval: 5s
+
+# -----------------------------------------------------------------------------
+# Engine lifecycle. Profiles can override startupTimeout, idleTimeout and
+# maxLifetime.
+engine:
+  # Launch budget until an engine is ready
+  # (Kyuubi: kyuubi.session.engine.initialize.timeout).
+  startupTimeout: 180s
+  # An engine without sessions for this long is terminated, per share level
+  # (Kyuubi: kyuubi.session.engine.idle.timeout). CONNECTION: 0s = as soon
+  # as its session ends.
+  idleTimeout:
+    CONNECTION: 0s
+    USER: 30m
+    GROUP: 30m
+    SERVER: 30m
+  # Engines older than this are drained: no new sessions, existing ones
+  # finish. 0s disables.
+  maxLifetime: 0s
+  # Sessions of a draining engine are closed after this long.
+  drainTimeout: 1h
+  # After a gateway (re)start or failover, recovered engines are not reaped
+  # as idle for this long, so that their sessions can re-attach with their
+  # next heartbeat. Default: session.maxHeartbeatTimeout / 2 + 30s; must be
+  # at least 0.4 * session.maxHeartbeatTimeout.
+  recoveryGrace: 180s
+  # Period of the engine reconciler (timeouts, warm pools).
+  checkInterval: 5s
+  # Drain engines whose profile changed since their launch and start new
+  # ones on demand ("rolling update" without interrupting sessions).
+  replaceOnSpecChange: true
+  # Failed engines (pods) are kept this long for debugging, then deleted.
+  failedRetention: 10m
+
+# -----------------------------------------------------------------------------
+# Limits that protect the cluster. 0 = unlimited.
+limits:
+  # Open sessions in total.
+  maxSessions: 0
+  # Open sessions per user (overrides[].maxSessions can raise or lower it).
+  maxSessionsPerUser: 0
+  # Engines in total (starting, ready and draining).
+  maxEngines: 0
+  # USER and CONNECTION engines per user.
+  maxEnginesPerUser: 0
+  # Engines launching at the same time (0 means the default, 20).
+  maxStartingEngines: 20
+
+# -----------------------------------------------------------------------------
+# Where engines run.
+provider:
+  # kubernetes (pods), process (local DuckDB CLI processes, development) or
+  # static (Quack servers managed elsewhere).
+  type: kubernetes
+
+  kubernetes:
+    # Namespace of the engine pods ("" = $POD_NAMESPACE, else the namespace
+    # of the gateway's service account).
+    namespace: ""
+    # Path of a kubeconfig file ("" = in-cluster configuration).
+    kubeconfig: ""
+    # Separates several gateways in one namespace (label quackmux.io/instance,
+    # and the default lease name quackmux-<instance>).
+    instance: default
+    # Prefix of engine pod names, e.g. quack-user-alice-x7k2p.
+    namePrefix: quack
+    # Grace period when deleting engine pods.
+    deleteGracePeriod: 30s
+    # Rate limit of the Kubernetes API client.
+    qps: 20
+    burst: 40
+
+  # Only used with type process.
+  process:
+    # DuckDB 2.0 CLI binary (looked up in PATH).
+    duckdbPath: duckdb
+    # Parent of the per-engine scratch directories ("" = in the system's
+    # temporary directory).
+    workDir: ""
+    # Address the engine processes listen on.
+    bindHost: 127.0.0.1
+    # Port range for engine processes (one port each).
+    portRangeStart: 19500
+    portRangeEnd: 19999
+
+  # Only used with type static (then engines must not be empty).
+  static:
+    engines: []
+    # engines:
+    #   - # Unique name, used as engine id.
+    #     name: shared
+    #     # Base URL of the Quack server (without /quack).
+    #     url: http://duckdb-shared.example.internal:9494
+    #     # The server's token: inline or (better) from a file.
+    #     token: ""
+    #     tokenFile: /etc/quackmux/engines/shared.token
+    #     # The engine key this server answers for (CONNECTION is not
+    #     # possible).
+    #     shareLevel: SERVER
+    #     # User (USER), group (GROUP) or "" (SERVER).
+    #     owner: ""
+    #     subdomain: default
+    #     profile: default
+    #     # Position in a pool (profiles.<name>.pool.size > 1).
+    #     poolIndex: 0
+    # Period of the GET / health probes.
+    healthInterval: 10s
+
+# -----------------------------------------------------------------------------
+# Engine profiles: what an engine looks like. Names must not be empty or
+# contain any of / # ? & = or space. Without any profile a profile "default"
+# with the defaults below exists.
+profiles:
+  default:
+    # Free text for operators (admin API).
+    description: ""
+    # Engine container image: DuckDB 2.0 with the quack and httpfs extensions
+    # (images/engine). The engine container contract: the gateway sets
+    # QUACK_TOKEN, QUACKMUX_DATABASE, QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494),
+    # QUACKMUX_ENGINE_ID, QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER,
+    # QUACKMUX_SUBDOMAIN and QUACKMUX_PROFILE.
+    image: quackmux/duckdb-engine:2.0.0
+    # Always | IfNotPresent | Never
+    imagePullPolicy: IfNotPresent
+    # DuckDB database inside the engine. ":memory:" is lost with the pod; a
+    # file needs a volume (see podTemplate).
+    database: ":memory:"
+    # SQL that runs before the Quack server starts (after settings), e.g.
+    # ATTACH data sources or create views. A failing statement fails the
+    # engine.
+    initSQL: ""
+    # initSQL: |
+    #   ATTACH 'https://data.example.com/lake.duckdb' AS lake (READ_ONLY);
+    #   CREATE VIEW trips AS FROM lake.main.trips;
+    # DuckDB settings, applied as SET name = 'value' (sorted by name) before
+    # initSQL. Names must be identifiers; quote numbers ("4"). Most DuckDB
+    # options are global; options with session scope only affect the init
+    # script's own connection.
+    settings: {}
+    # settings:
+    #   memory_limit: 3GB
+    #   threads: "2"
+    #   temp_directory: /tmp/duckdb-spill
+    # Several engines per key, sessions spread over them (Kyuubi:
+    # kyuubi.engine.pool.size / selectPolicy). Every engine has its own
+    # database state: only for stateless workloads (reading a lake).
+    pool:
+      # 1-64
+      size: 1
+      # RANDOM or POLLING (round robin)
+      selectPolicy: RANDOM
+    # Pre-started engines for share_level=connection (0-64; 0 = none).
+    warmPool:
+      size: 0
+    # Access control ([] = unrestricted).
+    allowedShareLevels: []
+    # allowedShareLevels: [USER, CONNECTION]
+    allowedUsers: []
+    # allowedUsers: [alice, "*"]
+    allowedGroups: []
+    # allowedGroups: [analytics]
+    # Lifecycle overrides (null = the engine.* value).
+    startupTimeout: null
+    # startupTimeout: 10m
+    # One idle timeout for all share levels of this profile.
+    idleTimeout: null
+    # idleTimeout: 5m
+    maxLifetime: null
+    # maxLifetime: 24h
+
+    # Kubernetes pod shaping (provider kubernetes only).
+    # Resources of the engine container. Keep settings.memory_limit below
+    # limits.memory.
+    resources: {}
+    # resources:
+    #   requests:
+    #     cpu: "1"
+    #     memory: 2Gi
+    #   limits:
+    #     cpu: "2"
+    #     memory: 4Gi
+    # Extra environment variables of the engine container (the contract
+    # variables above are always set by the gateway and cannot be replaced).
+    env: []
+    # env:
+    #   - name: TZ
+    #     value: Europe/Berlin
+    #   # Options of the engine image (images/engine): Quack server threads
+    #   # (one per TCP connection) and keep-alive timeout in seconds.
+    #   - name: QUACKMUX_MAX_CONNECTIONS
+    #     value: "1024"
+    #   - name: QUACKMUX_KEEP_ALIVE_TIMEOUT
+    #     value: "300"
+    #   - name: LAKE_PASSWORD
+    #     valueFrom:
+    #       secretKeyRef:
+    #         name: lake-credentials
+    #         key: password
+    nodeSelector: {}
+    # nodeSelector:
+    #   node.kubernetes.io/instance-type: m7i.2xlarge
+    tolerations: []
+    # tolerations:
+    #   - key: dedicated
+    #     operator: Equal
+    #     value: duckdb
+    #     effect: NoSchedule
+    affinity: null
+    # affinity:
+    #   nodeAffinity:
+    #     requiredDuringSchedulingIgnoredDuringExecution:
+    #       nodeSelectorTerms:
+    #         - matchExpressions:
+    #             - key: kubernetes.io/arch
+    #               operator: In
+    #               values: [amd64, arm64]
+    # Service account of the engine pods ("" = the namespace's default
+    # account). Its token is not mounted.
+    serviceAccountName: ""
+    imagePullSecrets: []
+    # imagePullSecrets:
+    #   - name: registry-credentials
+    priorityClassName: ""
+    # Extra labels and annotations of the engine pods.
+    labels: {}
+    # labels:
+    #   team: analytics
+    annotations: {}
+    # annotations:
+    #   cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    # Optional base pod. The gateway adds what it needs (labels, token,
+    # probes, the engine container) on top of it.
+    podTemplate: null
+    # podTemplate:
+    #   metadata:
+    #     labels:
+    #       cost-center: data-platform
+    #   spec:
+    #     # Sandbox runtime for engines that run untrusted SQL, if available.
+    #     runtimeClassName: gvisor
+    #     topologySpreadConstraints:
+    #       - maxSkew: 1
+    #         topologyKey: topology.kubernetes.io/zone
+    #         whenUnsatisfiable: ScheduleAnyway
+    #         labelSelector:
+    #           matchLabels:
+    #             app.kubernetes.io/component: engine
+
+  # A second profile, requested with the token option profile=large:
+  # large:
+  #   description: "4 CPUs, 16 GiB"
+  #   allowedShareLevels: [USER, CONNECTION]
+  #   settings:
+  #     memory_limit: 12GB
+  #     threads: "4"
+  #   resources:
+  #     requests: {cpu: "4", memory: 16Gi}
+  #     limits: {cpu: "4", memory: 16Gi}
+
+# -----------------------------------------------------------------------------
+# Query audit log.
+audit:
+  # Log every query (PREPARE_REQUEST) with user, session, engine,
+  # client_query_id and SQL as a structured log line (component "audit").
+  enabled: false
+  # SQL longer than this is truncated in the log.
+  maxQueryBytes: 4096
+
+# -----------------------------------------------------------------------------
+# High availability: leader election on a Kubernetes Lease. Only the leader
+# is ready and serves; requires provider.type kubernetes and a shared
+# session key.
+ha:
+  enabled: false
+  # Name of the Lease ("" = quackmux-<provider.kubernetes.instance>).
+  leaseName: ""
+  # Namespace of the Lease ("" = the engine namespace).
+  namespace: ""
+  # A follower may take over this long after the last renewal (whole
+  # seconds).
+  leaseDuration: 15s
+  # The leader steps down (and the process exits) when it could not renew
+  # the lease for this long; must be shorter than leaseDuration.
+  renewDeadline: 10s
+  # Interval of renewal and acquisition attempts.
+  retryPeriod: 2s
+
+# -----------------------------------------------------------------------------
+# Logging (to stderr).
+log:
+  # debug | info | warn | error
+  level: info
+  # json | text
+  format: json

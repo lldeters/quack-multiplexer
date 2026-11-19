@@ -1,0 +1,35 @@
+# Two replicas, replaced one at a time and never more than two pods.
+#
+# Only the leader passes the readiness probe, so the Deployment counts one of
+# the two pods as available. A rollout therefore replaces the (unready)
+# follower first and then waits: the new pod cannot become ready while the
+# old leader holds the lease. Delete the old leader pod to hand over (it
+# releases the lease on SIGTERM, the new pod takes over within seconds), and
+# the rollout completes. For the same reason "kubectl rollout status" never
+# reports success here (it waits for both pods to be available); the
+# Deployment is done at UP-TO-DATE 2, AVAILABLE 1. See README.md,
+# "Hochverfügbarkeit".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quackmux
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    spec:
+      # Prefer different nodes, so that a node failure leaves a follower.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: quackmux
+                    app.kubernetes.io/component: gateway

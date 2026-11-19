@@ -1,0 +1,23 @@
+# A small gateway for a laptop cluster. The image is loaded into kind and
+# must not be pulled.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quackmux
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          imagePullPolicy: IfNotPresent
+          env:
+            # About 10 % below limits.memory (see the base deployment).
+            - name: GOMEMLIMIT
+              value: 450MiB
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

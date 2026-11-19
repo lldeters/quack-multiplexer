@@ -1,0 +1,759 @@
+// Package config defines the gateway configuration file (YAML) and its
+// defaults and validation rules.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
+)
+
+// Config is the root of the configuration file.
+type Config struct {
+	Server   ServerConfig   `json:"server"`
+	Admin    AdminConfig    `json:"admin"`
+	Auth     AuthConfig     `json:"auth"`
+	Defaults SessionOptions `json:"defaults"`
+	// Overrides adjust defaults and permissions for matching users/groups.
+	// The first matching entry wins.
+	Overrides []Override         `json:"overrides,omitempty"`
+	Session   SessionConfig      `json:"session"`
+	Engine    EngineConfig       `json:"engine"`
+	Limits    LimitsConfig       `json:"limits"`
+	Provider  ProviderConfig     `json:"provider"`
+	Profiles  map[string]Profile `json:"profiles"`
+	Audit     AuditConfig        `json:"audit"`
+	HA        HAConfig           `json:"ha"`
+	Log       LogConfig          `json:"log"`
+}
+
+// ServerConfig configures the Quack-facing listener.
+type ServerConfig struct {
+	// Listen is the address of the Quack endpoint (default ":9494").
+	Listen string     `json:"listen"`
+	TLS    *TLSConfig `json:"tls,omitempty"`
+	// SessionKeyFile holds the secret that seals connection ids. All replicas
+	// must share it. The QUACKMUX_SESSION_KEY environment variable wins over
+	// the file. Without either, a random key is generated and sessions do not
+	// survive a gateway restart.
+	SessionKeyFile string `json:"sessionKeyFile,omitempty"`
+	// Banner is returned on GET /.
+	Banner string `json:"banner,omitempty"`
+	// AllowedOrigins for CORS (DuckDB-Wasm clients). Default ["*"] like the
+	// stock Quack server.
+	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
+	// MaxHandshakeBytes bounds a CONNECTION_REQUEST body (default 64KiB).
+	MaxHandshakeBytes int `json:"maxHandshakeBytes,omitempty"`
+	// ReadHeaderTimeout for incoming HTTP requests (default 30s).
+	ReadHeaderTimeout Duration `json:"readHeaderTimeout,omitempty"`
+	// IdleTimeout for keep-alive client connections (default 300s, the stock
+	// quack_server_keep_alive_timeout).
+	IdleTimeout Duration `json:"idleTimeout,omitempty"`
+	// ShutdownTimeout bounds the graceful drain of in-flight requests.
+	ShutdownTimeout Duration `json:"shutdownTimeout,omitempty"`
+	// Upstream configures the gateway's HTTP client towards engines.
+	Upstream UpstreamConfig `json:"upstream"`
+}
+
+// TLSConfig enables HTTPS on a listener.
+type TLSConfig struct {
+	CertFile string `json:"certFile"`
+	KeyFile  string `json:"keyFile"`
+}
+
+// UpstreamConfig tunes the connections from the gateway to engines.
+type UpstreamConfig struct {
+	DialTimeout Duration `json:"dialTimeout,omitempty"`
+	// ResponseHeaderTimeout 0 disables the limit. FETCH requests block on the
+	// engine until a batch is ready, so a limit must exceed the longest
+	// expected wait for the first rows of a query.
+	ResponseHeaderTimeout Duration `json:"responseHeaderTimeout,omitempty"`
+	MaxIdleConnsPerEngine int      `json:"maxIdleConnsPerEngine,omitempty"`
+	IdleConnTimeout       Duration `json:"idleConnTimeout,omitempty"`
+	// ControlTimeout bounds requests the gateway sends on its own
+	// (DISCONNECT, CANCEL on behalf of a closed session).
+	ControlTimeout Duration `json:"controlTimeout,omitempty"`
+	// The engine's HTTP server (cpp-httplib) aborts a connection when the
+	// peer stalls for 5s and rejects bodies over 100 MiB. Like nginx, the
+	// gateway therefore buffers messages in memory so that slow clients never
+	// stall an engine. Messages up to MaxBufferedRequestBytes /
+	// MaxBufferedResponseBytes are buffered while the total stays within
+	// BufferBudgetBytes; anything else is streamed. A negative value disables
+	// buffering in that direction (always stream).
+	MaxBufferedRequestBytes  int64 `json:"maxBufferedRequestBytes,omitempty"`
+	MaxBufferedResponseBytes int64 `json:"maxBufferedResponseBytes,omitempty"`
+	BufferBudgetBytes        int64 `json:"bufferBudgetBytes,omitempty"`
+	// MaxRequestBytes rejects larger messages up front (default 100 MiB, the
+	// engine's own limit). 0 disables the check.
+	MaxRequestBytes int64 `json:"maxRequestBytes,omitempty"`
+}
+
+// AdminConfig configures the admin/metrics listener.
+type AdminConfig struct {
+	// Listen address; empty disables the admin listener.
+	Listen string `json:"listen"`
+	// TokenFile holds the bearer token for /api. Without it the API is open
+	// (only acceptable on a private network); /metrics, /healthz and /readyz
+	// never need a token.
+	TokenFile string     `json:"tokenFile,omitempty"`
+	TLS       *TLSConfig `json:"tls,omitempty"`
+}
+
+// AuthConfig selects and configures the authenticator.
+type AuthConfig struct {
+	// Mode is one of "none", "static", "jwt".
+	Mode   string           `json:"mode"`
+	None   NoneAuthConfig   `json:"none"`
+	Static StaticAuthConfig `json:"static"`
+	JWT    JWTAuthConfig    `json:"jwt"`
+}
+
+// NoneAuthConfig is for development only: every token is accepted.
+type NoneAuthConfig struct {
+	// DefaultUser is used when the client names no user (default "anonymous").
+	DefaultUser string `json:"defaultUser,omitempty"`
+	// DefaultGroups are assigned to every identity.
+	DefaultGroups []string `json:"defaultGroups,omitempty"`
+}
+
+// StaticAuthConfig reads users and token hashes from a YAML file.
+type StaticAuthConfig struct {
+	File string `json:"file"`
+	// ReloadInterval re-reads the file when it changed (default 10s, 0 disables).
+	ReloadInterval Duration `json:"reloadInterval,omitempty"`
+}
+
+// JWTAuthConfig validates JSON Web Tokens.
+type JWTAuthConfig struct {
+	Issuer   string   `json:"issuer,omitempty"`
+	Audience []string `json:"audience,omitempty"`
+	// UserClaim names the user (default "sub").
+	UserClaim string `json:"userClaim,omitempty"`
+	// GroupsClaim names a string or string-array claim (default "groups").
+	GroupsClaim string `json:"groupsClaim,omitempty"`
+	// Algorithms permitted (default ["RS256","ES256","HS256"] restricted to
+	// the configured key types).
+	Algorithms []string `json:"algorithms,omitempty"`
+	// HMACSecretFile holds a shared secret for HS256/HS384/HS512.
+	HMACSecretFile string `json:"hmacSecretFile,omitempty"`
+	// PublicKeyFiles hold PEM encoded RSA/ECDSA/Ed25519 public keys.
+	PublicKeyFiles []string `json:"publicKeyFiles,omitempty"`
+	// JWKSURL is fetched and refreshed periodically.
+	JWKSURL     string   `json:"jwksURL,omitempty"`
+	JWKSRefresh Duration `json:"jwksRefresh,omitempty"`
+	// Leeway tolerates clock skew for exp/nbf/iat (default 30s).
+	Leeway Duration `json:"leeway,omitempty"`
+}
+
+// SessionOptions are the per-session routing options a client may request.
+type SessionOptions struct {
+	ShareLevel string `json:"shareLevel,omitempty"`
+	Subdomain  string `json:"subdomain,omitempty"`
+	Profile    string `json:"profile,omitempty"`
+}
+
+// Override adjusts defaults and permissions for some users or groups.
+type Override struct {
+	Users    []string       `json:"users,omitempty"`
+	Groups   []string       `json:"groups,omitempty"`
+	Defaults SessionOptions `json:"defaults,omitempty"`
+	// AllowedShareLevels / AllowedProfiles restrict what matching users may
+	// request (empty = no additional restriction).
+	AllowedShareLevels []string `json:"allowedShareLevels,omitempty"`
+	AllowedProfiles    []string `json:"allowedProfiles,omitempty"`
+	// MaxSessions overrides limits.maxSessionsPerUser for matching users.
+	MaxSessions int `json:"maxSessions,omitempty"`
+}
+
+// Matches reports whether the override applies to the identity.
+func (o Override) Matches(user string, groups []string) bool {
+	for _, u := range o.Users {
+		if u == user || u == "*" {
+			return true
+		}
+	}
+	for _, g := range o.Groups {
+		for _, have := range groups {
+			if g == have {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SessionConfig controls session lifecycle.
+type SessionConfig struct {
+	// IdleTimeout closes sessions without queries (heartbeats do not count)
+	// for this long. 0 disables. Default 6h (Kyuubi: kyuubi.session.idle.timeout).
+	IdleTimeout Duration `json:"idleTimeout"`
+	// MaxLifetime closes sessions older than this. 0 disables.
+	MaxLifetime Duration `json:"maxLifetime"`
+	// MinHeartbeatTimeout / MaxHeartbeatTimeout clamp the heartbeat lease the
+	// client asks for (DuckDB default: 60s).
+	MinHeartbeatTimeout Duration `json:"minHeartbeatTimeout"`
+	MaxHeartbeatTimeout Duration `json:"maxHeartbeatTimeout"`
+	// HeartbeatGrace is added to the lease before the gateway declares a
+	// silent client dead and frees its engine connection.
+	HeartbeatGrace Duration `json:"heartbeatGrace"`
+	// BackendHeartbeatTimeout is the lease the gateway requests from the
+	// engine. The gateway answers client heartbeats itself (a hung engine can
+	// then never block a client's DETACH) and renews the engine lease every
+	// third of this duration for quiet sessions. Default 1h.
+	BackendHeartbeatTimeout Duration `json:"backendHeartbeatTimeout"`
+	// TombstoneTTL keeps closed sessions around so clients get a precise
+	// error message instead of "Invalid connection id".
+	TombstoneTTL Duration `json:"tombstoneTTL"`
+	// CheckInterval is the reaper period.
+	CheckInterval Duration `json:"checkInterval"`
+}
+
+// EngineConfig controls engine lifecycle. Profiles may override timeouts.
+type EngineConfig struct {
+	// StartupTimeout bounds launching an engine until it is ready
+	// (Kyuubi: kyuubi.session.engine.initialize.timeout).
+	StartupTimeout Duration `json:"startupTimeout"`
+	// IdleTimeout per share level: an engine without sessions for this long is
+	// terminated (Kyuubi: kyuubi.session.engine.idle.timeout). CONNECTION
+	// engines default to 0 = terminate as soon as their session ends.
+	IdleTimeout map[string]Duration `json:"idleTimeout"`
+	// MaxLifetime drains engines older than this (0 disables).
+	MaxLifetime Duration `json:"maxLifetime"`
+	// DrainTimeout force-closes sessions of a draining engine after this long.
+	DrainTimeout Duration `json:"drainTimeout"`
+	// RecoveryGrace keeps recovered engines alive after a gateway (re)start so
+	// that their sessions can re-attach with their next heartbeat.
+	RecoveryGrace Duration `json:"recoveryGrace"`
+	// CheckInterval is the reconcile period.
+	CheckInterval Duration `json:"checkInterval"`
+	// ReplaceOnSpecChange drains engines whose profile changed since launch.
+	ReplaceOnSpecChange *bool `json:"replaceOnSpecChange,omitempty"`
+	// FailedRetention keeps failed engines (pods) this long for debugging
+	// before deleting them.
+	FailedRetention Duration `json:"failedRetention"`
+}
+
+// LimitsConfig protects the cluster. 0 means unlimited.
+type LimitsConfig struct {
+	MaxSessions        int `json:"maxSessions"`
+	MaxSessionsPerUser int `json:"maxSessionsPerUser"`
+	MaxEngines         int `json:"maxEngines"`
+	MaxEnginesPerUser  int `json:"maxEnginesPerUser"`
+	// MaxStartingEngines bounds concurrent launches.
+	MaxStartingEngines int `json:"maxStartingEngines"`
+}
+
+// ProviderConfig selects where engines run.
+type ProviderConfig struct {
+	// Type is "kubernetes", "process" or "static".
+	Type       string                   `json:"type"`
+	Kubernetes KubernetesProviderConfig `json:"kubernetes"`
+	Process    ProcessProviderConfig    `json:"process"`
+	Static     StaticProviderConfig     `json:"static"`
+}
+
+// KubernetesProviderConfig configures engine pods.
+type KubernetesProviderConfig struct {
+	// Namespace for engine pods (default: the gateway's own namespace).
+	Namespace string `json:"namespace,omitempty"`
+	// Kubeconfig path; empty means in-cluster configuration.
+	Kubeconfig string `json:"kubeconfig,omitempty"`
+	// Instance separates several gateways in one namespace (label value).
+	Instance string `json:"instance,omitempty"`
+	// NamePrefix for engine pods (default "quack").
+	NamePrefix string `json:"namePrefix,omitempty"`
+	// DeleteGracePeriod for engine pods (default 30s).
+	DeleteGracePeriod Duration `json:"deleteGracePeriod,omitempty"`
+	// QPS/Burst for the API client.
+	QPS   float32 `json:"qps,omitempty"`
+	Burst int     `json:"burst,omitempty"`
+}
+
+// ProcessProviderConfig runs engines as local processes (development).
+type ProcessProviderConfig struct {
+	// DuckDBPath is the DuckDB CLI binary (default "duckdb" from PATH).
+	DuckDBPath string `json:"duckdbPath,omitempty"`
+	// WorkDir holds per-engine scratch directories.
+	WorkDir string `json:"workDir,omitempty"`
+	// BindHost for engines (default 127.0.0.1).
+	BindHost string `json:"bindHost,omitempty"`
+	// PortRangeStart/End for engines (default 19500-19999).
+	PortRangeStart int `json:"portRangeStart,omitempty"`
+	PortRangeEnd   int `json:"portRangeEnd,omitempty"`
+}
+
+// StaticProviderConfig routes to engines that are managed elsewhere.
+type StaticProviderConfig struct {
+	Engines []StaticEngine `json:"engines"`
+	// HealthInterval for GET / probes (default 10s).
+	HealthInterval Duration `json:"healthInterval,omitempty"`
+}
+
+// StaticEngine is a pre-existing Quack server.
+type StaticEngine struct {
+	Name string `json:"name"`
+	// URL like http://duckdb.example:9494 (without /quack).
+	URL       string `json:"url"`
+	Token     string `json:"token,omitempty"`
+	TokenFile string `json:"tokenFile,omitempty"`
+	// The engine key this server answers for.
+	ShareLevel string `json:"shareLevel"`
+	Owner      string `json:"owner,omitempty"`
+	Subdomain  string `json:"subdomain,omitempty"`
+	Profile    string `json:"profile,omitempty"`
+	PoolIndex  int    `json:"poolIndex,omitempty"`
+}
+
+// Profile describes one kind of engine.
+type Profile struct {
+	Description string `json:"description,omitempty"`
+	// Image is the engine container image (DuckDB 2.0 with quack).
+	Image           string            `json:"image,omitempty"`
+	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
+	// Database is the DuckDB database path inside the engine (":memory:").
+	Database string `json:"database,omitempty"`
+	// InitSQL runs before the Quack server starts (ATTACH, SET, secrets...).
+	InitSQL string `json:"initSQL,omitempty"`
+	// Settings are applied with SET before the server starts.
+	Settings map[string]string `json:"settings,omitempty"`
+	// Pool spreads sessions of one key over several engines.
+	Pool PoolConfig `json:"pool,omitempty"`
+	// WarmPool keeps idle engines ready for CONNECTION share level.
+	WarmPool WarmPoolConfig `json:"warmPool,omitempty"`
+	// Access control. Empty means unrestricted.
+	AllowedShareLevels []string `json:"allowedShareLevels,omitempty"`
+	AllowedUsers       []string `json:"allowedUsers,omitempty"`
+	AllowedGroups      []string `json:"allowedGroups,omitempty"`
+	// Lifecycle overrides (nil = engine.* defaults).
+	StartupTimeout *Duration `json:"startupTimeout,omitempty"`
+	IdleTimeout    *Duration `json:"idleTimeout,omitempty"`
+	MaxLifetime    *Duration `json:"maxLifetime,omitempty"`
+	// Kubernetes pod shaping.
+	Resources          corev1.ResourceRequirements   `json:"resources,omitempty"`
+	Env                []corev1.EnvVar               `json:"env,omitempty"`
+	NodeSelector       map[string]string             `json:"nodeSelector,omitempty"`
+	Tolerations        []corev1.Toleration           `json:"tolerations,omitempty"`
+	Affinity           *corev1.Affinity              `json:"affinity,omitempty"`
+	ServiceAccountName string                        `json:"serviceAccountName,omitempty"`
+	ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	PriorityClassName  string                        `json:"priorityClassName,omitempty"`
+	Labels             map[string]string             `json:"labels,omitempty"`
+	Annotations        map[string]string             `json:"annotations,omitempty"`
+	// PodTemplate is an optional base pod; the gateway adds everything it
+	// needs (labels, token, probes, the engine container) on top of it.
+	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
+}
+
+// PoolConfig mirrors kyuubi.engine.pool.size / selectPolicy.
+type PoolConfig struct {
+	Size int `json:"size,omitempty"`
+	// SelectPolicy is RANDOM or POLLING (round robin).
+	SelectPolicy string `json:"selectPolicy,omitempty"`
+}
+
+// WarmPoolConfig keeps pre-started engines for CONNECTION share level.
+type WarmPoolConfig struct {
+	Size int `json:"size,omitempty"`
+}
+
+// AuditConfig controls the query audit log.
+type AuditConfig struct {
+	// Enabled logs every PREPARE_REQUEST (user, session, engine, SQL).
+	Enabled bool `json:"enabled"`
+	// MaxQueryBytes truncates logged SQL (default 4096).
+	MaxQueryBytes int `json:"maxQueryBytes,omitempty"`
+}
+
+// HAConfig enables leader election (only the leader serves traffic).
+type HAConfig struct {
+	Enabled       bool     `json:"enabled"`
+	LeaseName     string   `json:"leaseName,omitempty"`
+	Namespace     string   `json:"namespace,omitempty"`
+	LeaseDuration Duration `json:"leaseDuration,omitempty"`
+	RenewDeadline Duration `json:"renewDeadline,omitempty"`
+	RetryPeriod   Duration `json:"retryPeriod,omitempty"`
+}
+
+// LogConfig controls logging.
+type LogConfig struct {
+	// Level is debug, info, warn or error.
+	Level string `json:"level,omitempty"`
+	// Format is "json" or "text".
+	Format string `json:"format,omitempty"`
+}
+
+// Load reads, defaults and validates a configuration file.
+func Load(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(raw)
+}
+
+// Parse decodes YAML, applies defaults and validates.
+func Parse(raw []byte) (*Config, error) {
+	var c Config
+	if err := yaml.UnmarshalStrict(raw, &c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	c.ApplyDefaults()
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// setDur applies a default unless the duration was configured explicitly
+// (an explicit 0 means "disabled" where the field documents it).
+func setDur(d *Duration, def time.Duration) {
+	if !d.IsSet() {
+		*d = D(def)
+	}
+}
+
+func setStr(s *string, def string) {
+	if *s == "" {
+		*s = def
+	}
+}
+
+func setInt(i *int, def int) {
+	if *i == 0 {
+		*i = def
+	}
+}
+
+// DefaultProfileName is used when no profile is configured or requested.
+const DefaultProfileName = "default"
+
+// DefaultEngineImage is the image built from images/engine.
+const DefaultEngineImage = "quackmux/duckdb-engine:2.0.0"
+
+// ApplyDefaults fills unset fields. Zero durations that mean "disabled" are
+// only defaulted where documented.
+func (c *Config) ApplyDefaults() {
+	s := &c.Server
+	setStr(&s.Listen, ":9494")
+	setInt(&s.MaxHandshakeBytes, 64<<10)
+	setDur(&s.ReadHeaderTimeout, 30*time.Second)
+	setDur(&s.IdleTimeout, 300*time.Second)
+	setDur(&s.ShutdownTimeout, 30*time.Second)
+	setStr(&s.Banner, "This is a quackmux gateway for DuckDB Quack. Use ATTACH 'quack:...' to connect here.\n")
+	if len(s.AllowedOrigins) == 0 {
+		s.AllowedOrigins = []string{"*"}
+	}
+	u := &s.Upstream
+	setDur(&u.DialTimeout, 5*time.Second)
+	setInt(&u.MaxIdleConnsPerEngine, 64)
+	setDur(&u.IdleConnTimeout, 90*time.Second)
+	setDur(&u.ControlTimeout, 10*time.Second)
+	if u.MaxBufferedRequestBytes == 0 {
+		u.MaxBufferedRequestBytes = 100 << 20
+	}
+	if u.MaxBufferedResponseBytes == 0 {
+		u.MaxBufferedResponseBytes = 64 << 20
+	}
+	if u.BufferBudgetBytes == 0 {
+		u.BufferBudgetBytes = 1 << 30
+	}
+	if u.MaxRequestBytes == 0 {
+		u.MaxRequestBytes = 100 << 20
+	}
+
+	setStr(&c.Admin.Listen, ":9495")
+
+	setStr(&c.Auth.Mode, "static")
+	setStr(&c.Auth.None.DefaultUser, "anonymous")
+	setDur(&c.Auth.Static.ReloadInterval, 10*time.Second)
+	j := &c.Auth.JWT
+	setStr(&j.UserClaim, "sub")
+	setStr(&j.GroupsClaim, "groups")
+	setDur(&j.Leeway, 30*time.Second)
+	setDur(&j.JWKSRefresh, 15*time.Minute)
+
+	d := &c.Defaults
+	setStr(&d.ShareLevel, "USER")
+	setStr(&d.Subdomain, "default")
+	setStr(&d.Profile, DefaultProfileName)
+
+	ss := &c.Session
+	setDur(&ss.IdleTimeout, 6*time.Hour)
+	setDur(&ss.MaxLifetime, 0)
+	setDur(&ss.MinHeartbeatTimeout, 5*time.Second)
+	setDur(&ss.MaxHeartbeatTimeout, 300*time.Second)
+	setDur(&ss.HeartbeatGrace, 15*time.Second)
+	setDur(&ss.BackendHeartbeatTimeout, time.Hour)
+	setDur(&ss.TombstoneTTL, time.Hour)
+	setDur(&ss.CheckInterval, 5*time.Second)
+
+	e := &c.Engine
+	setDur(&e.StartupTimeout, 180*time.Second)
+	if e.IdleTimeout == nil {
+		e.IdleTimeout = map[string]Duration{}
+	}
+	norm := map[string]Duration{}
+	for k, v := range e.IdleTimeout {
+		norm[strings.ToUpper(k)] = v
+	}
+	e.IdleTimeout = norm
+	for lvl, def := range map[string]time.Duration{"USER": 30 * time.Minute, "GROUP": 30 * time.Minute, "SERVER": 30 * time.Minute} {
+		if _, ok := e.IdleTimeout[lvl]; !ok {
+			e.IdleTimeout[lvl] = D(def)
+		}
+	}
+	if _, ok := e.IdleTimeout["CONNECTION"]; !ok {
+		e.IdleTimeout["CONNECTION"] = D(0)
+	}
+	setDur(&e.MaxLifetime, 0)
+	setDur(&e.DrainTimeout, time.Hour)
+	// Long enough for every client to send at least one heartbeat (DuckDB
+	// heartbeats every lease/3 with +-20% jitter).
+	setDur(&e.RecoveryGrace, ss.MaxHeartbeatTimeout.Duration/2+30*time.Second)
+	setDur(&e.CheckInterval, 5*time.Second)
+	if e.ReplaceOnSpecChange == nil {
+		t := true
+		e.ReplaceOnSpecChange = &t
+	}
+	setDur(&e.FailedRetention, 10*time.Minute)
+
+	l := &c.Limits
+	setInt(&l.MaxStartingEngines, 20)
+
+	p := &c.Provider
+	setStr(&p.Type, "kubernetes")
+	k := &p.Kubernetes
+	setStr(&k.Instance, "default")
+	setStr(&k.NamePrefix, "quack")
+	setDur(&k.DeleteGracePeriod, 30*time.Second)
+	if k.QPS == 0 {
+		k.QPS = 20
+	}
+	setInt(&k.Burst, 40)
+	pr := &p.Process
+	setStr(&pr.DuckDBPath, "duckdb")
+	setStr(&pr.BindHost, "127.0.0.1")
+	setInt(&pr.PortRangeStart, 19500)
+	setInt(&pr.PortRangeEnd, 19999)
+	setDur(&p.Static.HealthInterval, 10*time.Second)
+
+	if len(c.Profiles) == 0 {
+		c.Profiles = map[string]Profile{DefaultProfileName: {}}
+	}
+	for name, prof := range c.Profiles {
+		setStr(&prof.Image, DefaultEngineImage)
+		setStr(&prof.Database, ":memory:")
+		if prof.ImagePullPolicy == "" {
+			prof.ImagePullPolicy = corev1.PullIfNotPresent
+		}
+		setInt(&prof.Pool.Size, 1)
+		setStr(&prof.Pool.SelectPolicy, "RANDOM")
+		prof.Pool.SelectPolicy = strings.ToUpper(prof.Pool.SelectPolicy)
+		c.Profiles[name] = prof
+	}
+
+	setInt(&c.Audit.MaxQueryBytes, 4096)
+
+	h := &c.HA
+	setStr(&h.LeaseName, "quackmux-"+k.Instance)
+	setDur(&h.LeaseDuration, 15*time.Second)
+	setDur(&h.RenewDeadline, 10*time.Second)
+	setDur(&h.RetryPeriod, 2*time.Second)
+
+	setStr(&c.Log.Level, "info")
+	setStr(&c.Log.Format, "json")
+}
+
+var validShareLevels = map[string]bool{"CONNECTION": true, "USER": true, "GROUP": true, "SERVER": true}
+
+// Validate checks the configuration for consistency.
+func (c *Config) Validate() error {
+	var errs []error
+	add := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+
+	switch c.Auth.Mode {
+	case "none":
+	case "static":
+		if c.Auth.Static.File == "" {
+			add("auth.static.file is required for auth.mode=static")
+		}
+	case "jwt":
+		j := c.Auth.JWT
+		if j.HMACSecretFile == "" && len(j.PublicKeyFiles) == 0 && j.JWKSURL == "" {
+			add("auth.jwt needs hmacSecretFile, publicKeyFiles or jwksURL")
+		}
+	default:
+		add("auth.mode must be none, static or jwt, got %q", c.Auth.Mode)
+	}
+
+	checkLevel := func(field, v string) {
+		if !validShareLevels[strings.ToUpper(v)] {
+			add("%s: unknown share level %q", field, v)
+		}
+	}
+	checkLevel("defaults.shareLevel", c.Defaults.ShareLevel)
+	if _, ok := c.Profiles[c.Defaults.Profile]; !ok {
+		add("defaults.profile %q is not defined in profiles", c.Defaults.Profile)
+	}
+	for i, o := range c.Overrides {
+		if len(o.Users) == 0 && len(o.Groups) == 0 {
+			add("overrides[%d] matches nobody (set users or groups)", i)
+		}
+		if o.Defaults.ShareLevel != "" {
+			checkLevel(fmt.Sprintf("overrides[%d].defaults.shareLevel", i), o.Defaults.ShareLevel)
+		}
+		if o.Defaults.Profile != "" {
+			if _, ok := c.Profiles[o.Defaults.Profile]; !ok {
+				add("overrides[%d].defaults.profile %q is not defined", i, o.Defaults.Profile)
+			}
+		}
+		for _, l := range o.AllowedShareLevels {
+			checkLevel(fmt.Sprintf("overrides[%d].allowedShareLevels", i), l)
+		}
+		for _, p := range o.AllowedProfiles {
+			if _, ok := c.Profiles[p]; !ok {
+				add("overrides[%d].allowedProfiles: %q is not defined", i, p)
+			}
+		}
+	}
+	for lvl := range c.Engine.IdleTimeout {
+		checkLevel("engine.idleTimeout", lvl)
+	}
+
+	ss := c.Session
+	if ss.MinHeartbeatTimeout.Duration < time.Second {
+		add("session.minHeartbeatTimeout must be at least 1s")
+	}
+	if ss.MaxHeartbeatTimeout.Duration < ss.MinHeartbeatTimeout.Duration {
+		add("session.maxHeartbeatTimeout must be >= session.minHeartbeatTimeout")
+	}
+	if ss.MaxHeartbeatTimeout.Duration > 65535*time.Second {
+		add("session.maxHeartbeatTimeout must not exceed 65535s")
+	}
+	if ss.BackendHeartbeatTimeout.Duration < 30*time.Second {
+		add("session.backendHeartbeatTimeout must be at least 30s")
+	}
+	if ss.CheckInterval.Duration <= 0 || c.Engine.CheckInterval.Duration <= 0 {
+		add("session.checkInterval and engine.checkInterval must be positive")
+	}
+	if c.Engine.RecoveryGrace.Duration < ss.MaxHeartbeatTimeout.Duration*2/5 {
+		add("engine.recoveryGrace (%s) must cover at least one heartbeat interval (>= 0.4 * session.maxHeartbeatTimeout)", c.Engine.RecoveryGrace.Duration)
+	}
+
+	switch c.Provider.Type {
+	case "kubernetes":
+	case "process":
+		pr := c.Provider.Process
+		if pr.PortRangeStart <= 0 || pr.PortRangeEnd > 65535 || pr.PortRangeStart > pr.PortRangeEnd {
+			add("provider.process port range %d-%d is invalid", pr.PortRangeStart, pr.PortRangeEnd)
+		}
+	case "static":
+		if len(c.Provider.Static.Engines) == 0 {
+			add("provider.static.engines must not be empty")
+		}
+		seen := map[string]bool{}
+		for i, e := range c.Provider.Static.Engines {
+			if e.Name == "" || e.URL == "" {
+				add("provider.static.engines[%d] needs name and url", i)
+			}
+			if seen[e.Name] {
+				add("provider.static.engines[%d]: duplicate name %q", i, e.Name)
+			}
+			seen[e.Name] = true
+			if e.Token == "" && e.TokenFile == "" {
+				add("provider.static.engines[%d] needs token or tokenFile", i)
+			}
+			checkLevel(fmt.Sprintf("provider.static.engines[%d].shareLevel", i), e.ShareLevel)
+			if strings.EqualFold(e.ShareLevel, "CONNECTION") {
+				add("provider.static.engines[%d]: CONNECTION share level needs a provider that can launch engines", i)
+			}
+		}
+	default:
+		add("provider.type must be kubernetes, process or static, got %q", c.Provider.Type)
+	}
+
+	names := make([]string, 0, len(c.Profiles))
+	for name := range c.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := c.Profiles[name]
+		if name == "" || strings.ContainsAny(name, "/#?&= ") {
+			add("profile name %q is invalid", name)
+		}
+		if p.Pool.Size < 1 || p.Pool.Size > 64 {
+			add("profiles.%s.pool.size must be between 1 and 64", name)
+		}
+		if p.Pool.SelectPolicy != "RANDOM" && p.Pool.SelectPolicy != "POLLING" {
+			add("profiles.%s.pool.selectPolicy must be RANDOM or POLLING", name)
+		}
+		if p.WarmPool.Size < 0 || p.WarmPool.Size > 64 {
+			add("profiles.%s.warmPool.size must be between 0 and 64", name)
+		}
+		for _, l := range p.AllowedShareLevels {
+			checkLevel(fmt.Sprintf("profiles.%s.allowedShareLevels", name), l)
+		}
+		for k := range p.Settings {
+			if !isIdentifier(k) {
+				add("profiles.%s.settings: %q is not a valid setting name", name, k)
+			}
+		}
+	}
+
+	if c.HA.Enabled && c.Provider.Type != "kubernetes" {
+		add("ha.enabled requires provider.type=kubernetes")
+	}
+	if c.HA.Enabled && c.Server.SessionKeyFile == "" && os.Getenv("QUACKMUX_SESSION_KEY") == "" {
+		add("ha.enabled requires a shared session key (server.sessionKeyFile or QUACKMUX_SESSION_KEY)")
+	}
+	switch c.Log.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		add("log.level must be debug, info, warn or error")
+	}
+	return errors.Join(errs...)
+}
+
+func isIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (i > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// EngineIdleTimeout resolves the idle timeout for a share level and profile.
+func (c *Config) EngineIdleTimeout(level, profile string) time.Duration {
+	if p, ok := c.Profiles[profile]; ok && p.IdleTimeout != nil {
+		return p.IdleTimeout.Duration
+	}
+	return c.Engine.IdleTimeout[strings.ToUpper(level)].Duration
+}
+
+// EngineStartupTimeout resolves the startup timeout for a profile.
+func (c *Config) EngineStartupTimeout(profile string) time.Duration {
+	if p, ok := c.Profiles[profile]; ok && p.StartupTimeout != nil {
+		return p.StartupTimeout.Duration
+	}
+	return c.Engine.StartupTimeout.Duration
+}
+
+// EngineMaxLifetime resolves the max lifetime for a profile.
+func (c *Config) EngineMaxLifetime(profile string) time.Duration {
+	if p, ok := c.Profiles[profile]; ok && p.MaxLifetime != nil {
+		return p.MaxLifetime.Duration
+	}
+	return c.Engine.MaxLifetime.Duration
+}

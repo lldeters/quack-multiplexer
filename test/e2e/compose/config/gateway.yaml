@@ -1,0 +1,68 @@
+# quackmux configuration of the docker compose end-to-end test (service
+# "gateway"). gateway-idle.yaml is the same apart from the session timeouts;
+# config_test.go keeps the two in sync.
+#
+# The engines are real DuckDB 2.0 Quack servers run by docker compose. The
+# static provider routes to them; it never starts or stops engines. All tokens
+# are test values from ../e2e.env (users.yaml stores only their sha256).
+
+server:
+  listen: ":9494"
+  # The session key comes from QUACKMUX_SESSION_KEY (docker-compose.yaml).
+
+admin:
+  listen: ":9495"
+  tokenFile: /etc/quackmux/admin.token
+
+auth:
+  mode: static
+  static:
+    file: /etc/quackmux/users.yaml
+    reloadInterval: 5s
+
+defaults:
+  # The static provider cannot launch per-user engines, so the default share
+  # level is one that always has an engine.
+  shareLevel: SERVER
+  subdomain: default
+  profile: default
+
+session:
+  # The default idle timeout (6h) never interferes with the scenarios.
+  checkInterval: 2s
+
+engine:
+  checkInterval: 2s
+
+provider:
+  type: static
+  static:
+    healthInterval: 2s
+    engines:
+      # SERVER share level: every user (scenarios a, e, g).
+      - name: shared
+        url: http://engine-shared:9494
+        token: e2e-engine-shared-6b2d8f4a0c1e3957
+        shareLevel: SERVER
+        subdomain: default
+        profile: default
+      # GROUP share level of group "analytics" (scenarios b, c).
+      - name: analytics
+        url: http://engine-analytics:9494
+        token: e2e-engine-analytics-9e4a2c6b8d0f1735
+        shareLevel: GROUP
+        owner: analytics
+        subdomain: default
+        profile: default
+
+profiles:
+  default:
+    description: DuckDB 2.0 engines run by docker compose (engine-shared, engine-analytics)
+
+audit:
+  # Exercise the audit log with real PREPARE requests.
+  enabled: true
+
+log:
+  level: debug
+  format: text

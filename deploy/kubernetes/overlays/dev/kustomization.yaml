@@ -1,0 +1,34 @@
+# Development on a local kind cluster: no authentication, small resources,
+# locally built images (loaded with "kind load docker-image", never pulled).
+#
+#   kubectl apply -k deploy/kubernetes/overlays/dev
+#
+# Never use this overlay on a shared cluster: every client may pick any user
+# name, and the admin API has no token.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: quackmux
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: quackmux
+    includeSelectors: false
+
+resources:
+  - ../../base
+
+# auth.mode: none and small engines; replaces the base config.
+configMapGenerator:
+  - name: quackmux-config
+    behavior: replace
+    files:
+      - config.yaml
+
+# The locally built gateway image (see README.md, "Entwicklung mit kind").
+images:
+  - name: quackmux/quackmux
+    newTag: dev
+
+patches:
+  - path: deployment-patch.yaml

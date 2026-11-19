@@ -1,0 +1,57 @@
+# quackmux base deployment: one gateway, engines as pods in the same namespace.
+#
+#   kubectl apply -k deploy/kubernetes/base
+#
+# Overlays: ../overlays/ha (two replicas, leader election), ../overlays/dev
+# (kind, no authentication). Replace the placeholder secrets first (README.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: quackmux
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: quackmux
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - rbac.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+
+generatorOptions:
+  labels:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+
+# The gateway configuration. A changed config.yaml gets a new name (hash
+# suffix), so the Deployment rolls out with it.
+configMapGenerator:
+  - name: quackmux-config
+    files:
+      - config.yaml
+
+# PLACEHOLDERS: replace all three before production use and never commit real
+# secrets (README.md, "Echte Secrets erzeugen"). Overlays replace them with
+# "behavior: replace".
+secretGenerator:
+  # server.sessionKeyFile: seals gateway connection ids. Identical on all
+  # replicas; changing it ends all sessions.
+  - name: quackmux-session-key
+    files:
+      - key=secrets/session-key
+  # admin.tokenFile: bearer token of the admin API.
+  - name: quackmux-admin-token
+    files:
+      - token=secrets/admin-token
+  # auth.static.file: users, groups and token hashes. Without a hash suffix the
+  # Secret is updated in place, and the gateway picks up the change without a
+  # restart (kubelet sync plus auth.static.reloadInterval, about a minute).
+  - name: quackmux-users
+    files:
+      - users.yaml=secrets/users.yaml
+    options:
+      disableNameSuffixHash: true

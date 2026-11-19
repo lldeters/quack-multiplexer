@@ -1,0 +1,43 @@
+# Example users file for auth.mode=static (auth.static.file).
+#
+# Create a token and its hash:   quackmux token
+# Hash an existing token:        quackmux hash-token TOKEN
+#
+# Clients send the token itself (optionally followed by options, e.g.
+# TOKEN?share_level=connection); the file only stores its sha256, so tokens
+# must not contain '?'. Every token may appear only once in the whole file.
+#
+# The file is re-read when its modification time or size changes
+# (auth.static.reloadInterval, default 10s). An invalid file is rejected and
+# the previous users stay active. Replace the file atomically (write a
+# temporary file and rename it) so that no half-written file is read.
+#
+# Unknown fields are errors: a typo like "disable: true" does not silently
+# leave a user enabled.
+users:
+  - name: alice
+    # The first group is the default for share_level=group.
+    groups: [analytics, admins]
+    tokens:
+      # sha256 of "example-alice-laptop"
+      - sha256: "315733a91d3f3fc927ac952a57c5734db2698d3c95881f561e0ff5ad4c3ea372"
+        description: "laptop"
+        expires: "2027-01-01T00:00:00Z"   # optional RFC 3339 timestamp
+      # Plain-text tokens work, but every load logs a warning. Development only.
+      - plain: "dev-only-token"
+        description: "local development"
+    disabled: false
+
+  - name: bob
+    groups: [analytics]
+    tokens:
+      # sha256 of "example-bob-ci"
+      - sha256: "2f6efeb994af5f4ad92aadafbb31fc55958deb7b281a834d89dc4d11fd36f8f9"
+        description: "CI pipeline"
+
+  # A disabled user keeps its tokens, but every one of them is rejected.
+  - name: mallory
+    disabled: true
+    tokens:
+      # sha256 of "example-mallory"
+      - sha256: "6210200e96e28bb35e04834c7417ede7e1ddc666353b3eb6f61824450c998208"

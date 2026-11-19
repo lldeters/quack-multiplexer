@@ -1,0 +1,78 @@
+# Local development: engines are DuckDB CLI processes on this machine
+# (provider "process"), clients are not authenticated.
+#
+#   go build -o bin/quackmux.exe ./cmd/quackmux
+#   bin/quackmux.exe serve -config examples/config.local.yaml
+#
+# Then, in a DuckDB 2.0 shell (more in examples/client.sql):
+#   CREATE SECRET (TYPE quack, TOKEN 'dev?user=alice', SCOPE 'quack:localhost:9494');
+#   ATTACH 'quack:localhost:9494' AS lake;
+#   FROM lake.query('SELECT 42');
+#
+# The DuckDB CLI must have the quack extension installed or be able to install
+# it (INSTALL quack). Engines end when the gateway stops.
+
+server:
+  # Loopback only: with auth.mode none everybody who reaches the port may
+  # pick any user name.
+  listen: "127.0.0.1:9494"
+  # No session key needed: engine processes end with the gateway, so sessions
+  # never survive a gateway restart with this provider anyway (the gateway
+  # generates a random key and logs a warning).
+
+admin:
+  listen: "127.0.0.1:9495"
+  # No tokenFile: the admin API is open on the loopback interface.
+
+auth:
+  mode: none
+  none:
+    # User of clients that do not send the token option "user".
+    defaultUser: dev
+    defaultGroups: [dev]
+
+provider:
+  type: process
+  process:
+    # DuckDB 2.0 CLI binary, looked up in PATH (duckdb.exe on Windows).
+    duckdbPath: duckdb
+    # Parent of the per-engine scratch directories (default: in the system's
+    # temporary directory). Relative database paths live there and are
+    # deleted with the engine.
+    # workDir: .quackmux/engines
+    # Engines listen on the loopback interface, one port per engine.
+    bindHost: 127.0.0.1
+    portRangeStart: 19500
+    portRangeEnd: 19999
+
+defaults:
+  shareLevel: USER
+  subdomain: default
+  profile: default
+
+engine:
+  # Stop idle engine processes quickly on a workstation.
+  idleTimeout:
+    CONNECTION: 0s
+    USER: 10m
+    GROUP: 10m
+    SERVER: 10m
+
+limits:
+  maxEngines: 8
+  maxStartingEngines: 4
+
+profiles:
+  default:
+    description: "Local DuckDB process"
+    # Container settings (image, resources, ...) do not apply to processes.
+    settings:
+      memory_limit: 2GB
+      threads: "2"
+
+audit:
+  enabled: true
+
+log:
+  level: debug
+  format: text

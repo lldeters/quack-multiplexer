@@ -1,0 +1,156 @@
+# The quackmux gateway.
+#
+# Without leader election (ha.enabled: false) exactly one gateway process may
+# manage the engines. Hence one replica and the Recreate strategy: a rolling
+# update would briefly run two gateways that both launch and reap engines.
+# Sessions survive the restart (sealed connection ids, shared session key);
+# only requests that are running at that moment fail. overlays/ha runs two
+# replicas with leader election instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quackmux
+  labels:
+    app.kubernetes.io/name: quackmux
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quackmux
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quackmux
+        app.kubernetes.io/component: gateway
+      annotations:
+        # For Prometheus setups that discover targets by annotation.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9495"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: quackmux-gateway
+      # The gateway talks to the Kubernetes API (engine pods, token Secrets,
+      # leader lease); the service account itself does not automount.
+      automountServiceAccountToken: true
+      # The Service "quackmux" would otherwise inject QUACKMUX_SERVICE_* and
+      # QUACKMUX_PORT* variables into the container.
+      enableServiceLinks: false
+      # server.shutdownTimeout (30s) drains in-flight requests, plus margin.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Makes the mounted Secrets (mode 0440) readable for the gateway.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: quackmux/quackmux:0.1.0
+          imagePullPolicy: IfNotPresent
+          # The image's entrypoint is the quackmux binary.
+          args: ["serve", "-config", "/etc/quackmux/config.yaml"]
+          env:
+            # Leader election identity (ha.enabled).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Default namespace for engine pods and the lease.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Keep the Go heap about 10 % below limits.memory. The largest
+            # consumer is the message buffer (server.upstream.bufferBudgetBytes,
+            # 1 GiB by default).
+            - name: GOMEMLIMIT
+              value: 1800MiB
+          ports:
+            - name: quack
+              containerPort: 9494
+              protocol: TCP
+            - name: admin
+              containerPort: 9495
+              protocol: TCP
+          # Ready once the engine registry is synced and, with ha.enabled,
+          # only while this replica is the leader: the Service routes to the
+          # leader alone.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 3
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # The configuration is read once at start-up. A changed config.yaml
+            # gets a new ConfigMap name (kustomize hash suffix) and therefore a
+            # new pod, so a subPath mount (which never updates) is fine here.
+            - name: config
+              mountPath: /etc/quackmux/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            # auth.static.file: /etc/quackmux/users/users.yaml. Mounted as a
+            # directory so that Secret updates reach the pod; the gateway
+            # reloads the file without a restart.
+            - name: users
+              mountPath: /etc/quackmux/users
+              readOnly: true
+            # admin.tokenFile: /etc/quackmux/admin/token
+            - name: admin-token
+              mountPath: /etc/quackmux/admin
+              readOnly: true
+            # server.sessionKeyFile: /etc/quackmux/session/key
+            - name: session-key
+              mountPath: /etc/quackmux/session
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: quackmux-config
+        - name: users
+          secret:
+            secretName: quackmux-users
+            defaultMode: 0440
+        - name: admin-token
+          secret:
+            secretName: quackmux-admin-token
+            defaultMode: 0440
+        - name: session-key
+          secret:
+            secretName: quackmux-session-key
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

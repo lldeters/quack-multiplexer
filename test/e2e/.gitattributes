@@ -1,0 +1,6 @@
+# The e2e scripts and fixtures run in bash and inside Linux containers: keep LF
+# line endings even in checkouts on Windows.
+*.sh text eol=lf
+*.env text eol=lf
+*.yaml text eol=lf
+*.token text eol=lf

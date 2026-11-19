@@ -1,0 +1,83 @@
+// Package process is an engine provider for local development: every engine
+// is a DuckDB CLI process on the gateway's machine, no Kubernetes needed.
+//
+// # Starting an engine
+//
+// Launch picks a free TCP port from provider.process.portRangeStart..End
+// (probing it with net.Listen on bindHost and releasing it again), creates
+// the scratch directory <workDir>/<engine id> and runs
+//
+//	<duckdbPath> -bail <database>
+//
+// in it, with the child's standard input connected to a pipe that the
+// provider keeps open for the whole lifetime of the engine. All SQL travels
+// through that pipe and never through the command line or the environment,
+// where other local users or processes could read it (the token and the
+// profile's init SQL may carry credentials):
+//
+//	<engine.RenderInitSQL(profile)>
+//	.output NUL                      (/dev/null outside Windows)
+//	CALL quack_serve('quack:<bindHost>:<port>', token = '<token>',
+//	                 disable_ssl = true, allow_other_hostname = <bool>);
+//	.output stdout
+//
+// The .output commands send the row that quack_serve returns (it contains the
+// token) nowhere. allow_other_hostname is false only for localhost, 127.0.0.1
+// and ::1, the addresses quack_serve accepts by default. quack_serve returns
+// at once and serves from a background thread, while the CLI waits for more
+// input. -bail makes the CLI exit on the first failing statement, so a broken
+// init SQL or an unavailable port ends the process instead of leaving a
+// half-initialized engine behind. Like every DuckDB CLI started without
+// -init, the engine also runs the user's ~/.duckdbrc first.
+//
+// A relative database path is resolved against the scratch directory and is
+// therefore deleted together with the engine; use an absolute path for data
+// that must survive it (a database file can only be opened by one engine
+// process at a time). The defaults of DuckDB itself are left alone, including
+// extension auto-installation: the quack extension must be installed or
+// installable on the machine.
+//
+// # Environment
+//
+// The child inherits the gateway's environment except QUACK_TOKEN and every
+// QUACKMUX_* variable: an engine executes whatever SQL its users send, and
+// getenv() would otherwise reveal gateway secrets such as
+// QUACKMUX_SESSION_KEY. Plain-value entries of the profile's env follow
+// (entries with valueFrom cannot be resolved outside Kubernetes and are
+// skipped with a warning), then the engine container contract of package
+// engine: QUACK_TOKEN, QUACKMUX_DATABASE, QUACKMUX_PORT, QUACKMUX_ENGINE_ID,
+// QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER, QUACKMUX_SUBDOMAIN and
+// QUACKMUX_PROFILE. QUACKMUX_INIT_SQL is deliberately not set: the init SQL
+// goes through standard input.
+//
+// # Readiness and failure
+//
+// Every 200ms the provider sends GET / to the engine, which the Quack server
+// answers with its banner and HTTP 200 without authentication. The first
+// success reports PhaseReady with the endpoint. If the process exits first,
+// or later without being asked to, the provider reports PhaseFailed with the
+// exit status and the last 2 KiB of the engine's combined stdout and stderr
+// (the token redacted). A failed engine keeps its scratch directory for
+// inspection until the manager terminates it (engine.failedRetention).
+//
+// # Termination
+//
+// Terminate closes the engine's standard input; the CLI exits on end of
+// input, which stops the Quack server. A process that is still running after
+// the stop timeout (5s) is killed: on Unix its whole process group, on other
+// systems the process itself (so duckdbPath should name the DuckDB binary,
+// not a wrapper script). Then the scratch directory is removed and
+// PhaseGone is reported. Run terminates all engines when its context ends.
+//
+// # Limitations
+//
+// Engines never survive the gateway, and the provider does not recover
+// anything across gateway restarts: List only returns engines started by this
+// provider instance. Even a crashed gateway leaves no engines behind, because
+// the operating system closes the input pipes and every CLI exits on end of
+// input. The scratch directories of engines that were not terminated
+// properly remain under workDir (by default in the system's temporary
+// directory). engine.Manager does not wait for Run to return when the gateway
+// shuts down; callers that want the scratch directories removed can wait for
+// Done.
+package process

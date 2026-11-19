@@ -1,0 +1,21 @@
+# Users of the docker compose end-to-end test (auth.mode=static).
+#
+# The tokens are the test values E2E_ALICE_TOKEN and E2E_BOB_TOKEN from
+# ../e2e.env. Only their sha256 is stored (hex encoded, computed with Go's
+# crypto/sha256 like "quackmux hash-token TOKEN"); config_test.go checks that
+# they match.
+users:
+  - name: alice
+    # alice belongs to "analytics", so share_level=group&group=analytics
+    # routes her to engine-analytics (scenario c).
+    groups: [analytics, engineering]
+    tokens:
+      - sha256: "b943014dd52f85b07f9b17234c7f017b2408026f749ed89473c29b553b70ad04"
+        description: "e2e alice (E2E_ALICE_TOKEN)"
+
+  - name: bob
+    # bob is not a member of "analytics" (scenario b expects "not a member").
+    groups: [reporting]
+    tokens:
+      - sha256: "be58e25e5794213b299551b2477eb5309fbe452e87351e05fa3f131caac4cc10"
+        description: "e2e bob (E2E_BOB_TOKEN)"

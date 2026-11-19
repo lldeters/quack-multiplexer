@@ -1,0 +1,10 @@
+# Build outputs
+bin/
+dist/
+*.exe
+*.test
+
+# Test and coverage outputs
+coverage.out
+*.coverprofile
+_output/

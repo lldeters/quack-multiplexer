@@ -1,0 +1,84 @@
+# Static engines: quackmux routes sessions to Quack servers that run
+# elsewhere (started by hand, systemd, another orchestrator). The gateway
+# never starts, drains or stops them; a failed health probe (GET /) takes an
+# engine out of rotation and a successful one brings it back. CONNECTION
+# share level is not possible (it needs a new engine per session).
+#
+#   bin/quackmux.exe serve -config examples/config.static.yaml
+#
+# Each engine serves Quack over plain HTTP on an address the gateway can
+# reach, with the token configured below, e.g. in the DuckDB 2.0 CLI (with
+# QUACK_TOKEN in its environment; the CLI must keep running):
+#   CALL quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
+#                    allow_other_hostname = true, disable_ssl = true);
+# The engine image (images/engine) does exactly this. Shield the engines so
+# that only the gateway can reach them.
+
+server:
+  listen: ":9494"
+  # Keeps sessions alive across gateway restarts:
+  # sessionKeyFile: /etc/quackmux/session/key
+
+admin:
+  listen: "127.0.0.1:9495"
+  # tokenFile: /etc/quackmux/admin/token
+
+auth:
+  mode: static
+  static:
+    # Relative to the working directory of the gateway (here: the
+    # repository root).
+    file: examples/users.yaml
+    reloadInterval: 10s
+
+# Everybody lands on the shared engine ...
+defaults:
+  shareLevel: SERVER
+  subdomain: default
+  profile: default
+
+# ... except members of the group "analytics", who get their group's engine.
+# GROUP uses the first group of a user (or the token option "group"), so a
+# user whose first group has no engine below gets an error.
+overrides:
+  - groups: [analytics]
+    defaults:
+      shareLevel: GROUP
+
+provider:
+  type: static
+  static:
+    # Period of the GET / health probes.
+    healthInterval: 10s
+    engines:
+      # One engine for all users (share level SERVER).
+      - name: shared
+        url: http://duckdb-shared.internal.example:9494
+        # The engine's token (QUACK_TOKEN of quack_serve). "token" works as
+        # well, but keeps the secret in this file.
+        tokenFile: /etc/quackmux/engines/shared.token
+        shareLevel: SERVER
+        subdomain: default
+        profile: default
+      # The engine of the group "analytics" (share level GROUP).
+      - name: analytics
+        url: http://duckdb-analytics.internal.example:9494
+        tokenFile: /etc/quackmux/engines/analytics.token
+        shareLevel: GROUP
+        owner: analytics
+        subdomain: default
+        profile: default
+
+profiles:
+  default:
+    description: "Externally managed DuckDB servers"
+    # Only the share levels that have engines above; other requests are
+    # rejected with a clear message instead of "no engine is available".
+    allowedShareLevels: [SERVER, GROUP]
+
+audit:
+  enabled: true
+
+log:
+  level: info
+  format: json

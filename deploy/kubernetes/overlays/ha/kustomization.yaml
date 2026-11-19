@@ -1,0 +1,30 @@
+# High availability: two gateway replicas with leader election on a
+# Kubernetes Lease. Only the leader is ready and receives traffic; the
+# follower takes over when the leader goes away (sessions survive, running
+# requests fail). Read README.md, "Hochverfügbarkeit", before the first
+# rollout: a rollout needs a controlled failover to complete.
+#
+#   kubectl apply -k deploy/kubernetes/overlays/ha
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: quackmux
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: quackmux
+    includeSelectors: false
+
+resources:
+  - ../../base
+  - pdb.yaml
+
+# The complete configuration with ha.enabled: true replaces the base config.
+configMapGenerator:
+  - name: quackmux-config
+    behavior: replace
+    files:
+      - config.yaml
+
+patches:
+  - path: deployment-patch.yaml
