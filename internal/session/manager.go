@@ -142,6 +142,8 @@ type Manager struct {
 	pending    map[string]int // connects in progress per user
 	total      int
 	wg         sync.WaitGroup // background control requests
+	bgMu       sync.Mutex     // orders spawn against Shutdown
+	bgClosed   bool
 
 	// adoptions confirms each adopted session with the engine once, also
 	// when many requests of it arrive at the same time.
@@ -490,9 +492,7 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 
 	if mode.Disconnect || mode.Cancel {
 		if target, ok := m.engines.Lookup(s.EngineID); ok {
-			m.wg.Add(1)
-			go func() {
-				defer m.wg.Done()
+			m.spawn(func() {
 				ctx := context.Background()
 				if mode.Cancel {
 					if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil {
@@ -504,14 +504,39 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 						m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
 					}
 				}
-			}()
+			})
 		}
 	}
 	return true
 }
 
-// Wait blocks until background control requests finished (tests, shutdown).
+// spawn runs f in the background unless the manager is shutting down.
+func (m *Manager) spawn(f func()) bool {
+	m.bgMu.Lock()
+	defer m.bgMu.Unlock()
+	if m.bgClosed {
+		return false
+	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		f()
+	}()
+	return true
+}
+
+// Wait blocks until background control requests finished (tests).
 func (m *Manager) Wait() { m.wg.Wait() }
+
+// Shutdown starts no more background control requests and waits for the
+// running ones. Handlers may still be running (the HTTP shutdown can time
+// out), so starting new ones must stop before the wait.
+func (m *Manager) Shutdown() {
+	m.bgMu.Lock()
+	m.bgClosed = true
+	m.bgMu.Unlock()
+	m.wg.Wait()
+}
 
 func reasonLabel(reason string) string {
 	for _, p := range []string{"client disconnect", "idle timeout", "max lifetime", "heartbeat lease expired",
@@ -628,9 +653,7 @@ func (m *Manager) keepAlive(s *Session, now time.Time) {
 	if !ok || !s.keepalive.CompareAndSwap(false, true) {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	if !m.spawn(func() {
 		defer s.keepalive.Store(false)
 		err := m.backend.Heartbeat(context.Background(), target.Endpoint, s.BackendConnID)
 		var ee *upstream.EngineError
@@ -642,7 +665,9 @@ func (m *Manager) keepAlive(s *Session, now time.Time) {
 		default:
 			m.log.Debug("backend keep-alive failed", "session", s.ID, "engine", s.EngineID, "err", err)
 		}
-	}()
+	}) {
+		s.keepalive.Store(false)
+	}
 }
 
 // Run reaps sessions until ctx is cancelled.

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -271,7 +272,7 @@ func cmdServe(args []string) error {
 		Addr: cfg.Server.Listen, Handler: gw,
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration,
 		IdleTimeout:       cfg.Server.IdleTimeout.Duration,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+		ErrorLog:          serverErrorLog(log),
 		BaseContext:       func(net.Listener) context.Context { return context.Background() },
 	}
 	go func() { errc <- serve(quackSrv, cfg.Server.TLS, "quack", log) }()
@@ -296,6 +297,11 @@ func cmdServe(args []string) error {
 					if err := run(lctx); err != nil {
 						errc <- err
 					}
+					// The leader context ended (lease lost or released): stop
+					// reporting ready at once, not only once client-go has tried
+					// to release the lease, which can take another renewDeadline.
+					leading.Store(false)
+					met.IsLeader.Set(0)
 				},
 				func() {
 					leading.Store(false)
@@ -329,18 +335,44 @@ func cmdServe(args []string) error {
 
 	// Graceful shutdown: stop accepting, let in-flight requests finish. Engines
 	// keep running; sessions are adopted by the next gateway process.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration)
+	timeout := cfg.Server.ShutdownTimeout.Duration
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	// Shortly before the deadline, queries that still wait for their engine
+	// are answered with an error: a request that ends unanswered when the
+	// process exits can be sent again by libcurl, and the query would run
+	// twice. Fetches and uploads in flight may be repeated safely.
+	abort := time.AfterFunc(timeout-min(timeout/4, 5*time.Second), gw.AbortQueries)
+	defer abort.Stop()
 	_ = quackSrv.Shutdown(shutdownCtx)
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
 	cancelRun()
-	sessions.Wait()
+	sessions.Shutdown()
 	if errors.Is(runErr, http.ErrServerClosed) {
 		runErr = nil
 	}
 	return runErr
+}
+
+// serverErrorLog is the error log of the Quack listener. Most of its lines
+// (TLS handshake errors of scanners, closed connections) are noise, but a
+// recovered handler panic means a request went unanswered: that is an error.
+func serverErrorLog(log *slog.Logger) *stdlog.Logger {
+	return stdlog.New(errorLogWriter{log: log}, "", 0)
+}
+
+type errorLogWriter struct{ log *slog.Logger }
+
+func (w errorLogWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimRight(string(p), "\n")
+	if strings.Contains(msg, "panic serving") {
+		w.log.Error("request handler panicked", "listener", "quack", "msg", msg)
+	} else {
+		w.log.Debug(msg, "listener", "quack")
+	}
+	return len(p), nil
 }
 
 func serve(srv *http.Server, t *config.TLSConfig, name string, log *slog.Logger) error {

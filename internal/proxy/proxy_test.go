@@ -743,7 +743,7 @@ func TestEngineGetsGatewayLease(t *testing.T) {
 }
 
 func TestBannerAndCORS(t *testing.T) {
-	h := newHarness(t, "", nil)
+	h := newHarness(t, "server: {allowedOrigins: [\"*\"]}\n", nil)
 	resp, err := http.Get(h.srv.URL + "/")
 	if err != nil {
 		t.Fatal(err)

@@ -38,6 +38,8 @@ server:
   # Text returned on GET / (without authentication).
   banner: "This is a quackmux gateway for DuckDB Quack. Use ATTACH 'quack:...' to connect here.\n"
   # CORS origins for DuckDB-Wasm clients, like the stock Quack server.
+  # Browser requests (they carry an Origin header) from other origins are
+  # refused. Default ["*"], but none ([]) with auth.mode none.
   allowedOrigins: ["*"]
   # Upper bound for the body of a CONNECTION_REQUEST (bytes, default 64 KiB).
   maxHandshakeBytes: 65536

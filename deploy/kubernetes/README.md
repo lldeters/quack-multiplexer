@@ -372,8 +372,9 @@ kubectl apply -k deploy/kubernetes/overlays/ha     # bzw. Ihr Overlay auf dieser
 * Fällt der Leader aus, übernimmt der Follower spätestens nach `ha.leaseDuration` (15 s); fährt der Leader
   geordnet herunter, gibt er die Lease frei und die Übernahme dauert nur Sekunden. Kann ein Leader die Lease
   nicht verlängern, beendet sich sein Prozess und startet als Follower neu. Der neue Leader findet die Engines
-  wieder und übernimmt die Sessions mit deren nächstem Heartbeat. Laufende Requests scheitern mit einem
-  Transportfehler, die Sessions überleben.
+  wieder und übernimmt die Sessions mit deren nächstem Heartbeat. Die Sessions überleben. Queries, die beim
+  Herunterfahren noch laufen, bekommen kurz vor `server.shutdownTimeout` einen Fehler und werden auf der Engine
+  abgebrochen, damit libcurl sie nicht unbemerkt ein zweites Mal sendet.
 * Eine bevorzugte `podAntiAffinity` verteilt die Replikas auf verschiedene Nodes.
 * `overlays/ha/config.yaml` ersetzt `base/config.yaml` vollständig. Halten Sie beide Dateien bis auf den
   Abschnitt `ha` gleich.

@@ -217,8 +217,13 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   drained die anderen.
 * **HA (optional, `ha.enabled`):** Mehrere Replikas machen Leader-Election über eine Kubernetes-`Lease`. Nur der
   Leader ist `ready` und bekommt über den Service Traffic. Verliert er die Lease, beendet sich der Prozess und
-  startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Laufende Requests während des
-  Failovers scheitern mit einem Transportfehler. Die Sessions selbst überleben.
+  startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Die Sessions überleben.
+* **Laufende Requests beim Shutdown:** Das Gateway wartet bis zu `server.shutdownTimeout` auf laufende Requests.
+  Kurz vor Ablauf (spätestens 5 s davor) beantwortet es Queries, die noch auf ihre Engine warten, mit einem
+  Fehler („the gateway is shutting down“) und bricht sie auf der Engine per CANCEL ab. Ein Request, der beim
+  Prozessende unbeantwortet bliebe, könnte libcurl auf einer neuen Verbindung erneut senden; die Query liefe
+  dann ein zweites Mal. Offene FETCHes und Uploads dürfen dagegen abbrechen: libcurl wiederholt sie beim nächsten
+  Gateway, und die Engine liefert denselben Batch noch einmal bzw. verwirft doppelte Uploads.
 * Das Gateway beendet beim eigenen Shutdown **keine** Engines.
 
 ## 7. Engines in Kubernetes
@@ -309,12 +314,15 @@ Weitere Provider:
   * `quackmux_auth_failures_total{reason}`
 * **Audit-Log** (optional): jede Query (`PREPARE_REQUEST`) mit User, Session, Engine, `client_query_id` und
   gekürztem SQL als strukturierte Logzeile.
-* **CORS**: wie der Stock-Server (`OPTIONS /quack`, `Access-Control-Allow-Origin`), für DuckDB-Wasm.
+* **CORS**: wie der Stock-Server (`OPTIONS /quack`, `Access-Control-Allow-Origin`), für DuckDB-Wasm. Requests mit
+  einem `Origin`-Header (Browser senden ihn bei jedem POST, die DuckDB-Clients nie) aus nicht erlaubten Origins
+  lehnt das Gateway ab. Default ist `["*"]`, mit `auth.mode: none` aber keiner: Sonst könnte jede Webseite über
+  den Browser eines Benutzers, der das Gateway erreicht, Queries ausführen.
 
 ## 10. Bekannte Grenzen
 
-* Läuft eine Query während eines Gateway-Restarts oder -Failovers, bricht der laufende Request mit Transportfehler
-  ab. Die Session bleibt erhalten.
+* Läuft eine Query während eines Gateway-Restarts oder -Failovers, bekommt der Client einen Fehler, und die Query
+  wird auf der Engine abgebrochen (siehe 6). Die Session bleibt erhalten.
 * Optionen per Header funktionieren nicht mit `ssl_fingerprint`-Pinning. Dieser Client-Pfad sendet keine
   Extra-Header. Dort Token-Optionen nutzen.
 * Das Gateway prüft kein SQL. Autorisierung innerhalb geteilter Engines bleibt Sache der Engine (Init-SQL,
