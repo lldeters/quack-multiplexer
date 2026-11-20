@@ -187,3 +187,85 @@ func TestWarmPoolBacksOffAfterFailedStarts(t *testing.T) {
 	m.Reconcile()
 	waitFor(t, "warm launch retried after the back-off", func() bool { return prov.attempts.Load() == 2 })
 }
+
+// claimRecorder is a provider whose Claim honours the context, like the
+// Kubernetes provider's PATCH, and that records terminations.
+type claimRecorder struct {
+	*fake.Provider
+	claims     atomic.Int64
+	fail       atomic.Bool
+	terminated sync.Map
+}
+
+func (p *claimRecorder) Claim(ctx context.Context, id string, key engine.Key) error {
+	p.claims.Add(1)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.fail.Load() {
+		return errors.New("the API server is unavailable")
+	}
+	return p.Provider.Claim(ctx, id, key)
+}
+
+func (p *claimRecorder) Terminate(ctx context.Context, id, reason string) error {
+	p.terminated.Store(id, reason)
+	return p.Provider.Terminate(ctx, id, reason)
+}
+
+func (p *claimRecorder) terminations() int {
+	n := 0
+	p.terminated.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// A client that gives up during a warm claim does not cost the warm engine,
+// and a failing claim costs at most one warm engine per connect.
+func TestWarmClaimFailuresAreBounded(t *testing.T) {
+	prov := &claimRecorder{Provider: fake.New()}
+	m := startManager(t, "profiles:\n  default:\n    warmPool: {size: 5}\n", prov, nil)
+	t.Cleanup(func() {
+		for _, id := range prov.IDs() {
+			_ = prov.Provider.Terminate(context.Background(), id, "cleanup")
+		}
+	})
+	m.Reconcile()
+	warmReady := func() int {
+		n := 0
+		for _, v := range m.List() {
+			if v.Warm && v.State == engine.StateReady {
+				n++
+			}
+		}
+		return n
+	}
+	waitFor(t, "5 warm engines ready", func() bool { return warmReady() == 5 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client went away, e.g. while the PATCH was rate limited
+	key := engine.Key{ShareLevel: engine.ShareConnection, Owner: "sess-1", Subdomain: "default", Profile: "default"}
+	lease, err := m.Acquire(ctx, key, "alice")
+	if err == nil {
+		lease.Release()
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := prov.terminations(); n != 0 {
+		t.Fatalf("a cancelled connect terminated %d warm engines", n)
+	}
+
+	prov.fail.Store(true)
+	key.Owner = "sess-2"
+	launches := prov.Launches()
+	lease, err = m.Acquire(context.Background(), key, "alice")
+	if err != nil {
+		t.Fatalf("connect with a failing claim: %v", err)
+	}
+	lease.Release()
+	time.Sleep(100 * time.Millisecond)
+	if n := prov.terminations(); n != 1 {
+		t.Fatalf("a failing claim terminated %d warm engines, want 1", n)
+	}
+	if prov.Launches() != launches+1 {
+		t.Fatalf("launches %d -> %d: want one cold engine instead", launches, prov.Launches())
+	}
+}

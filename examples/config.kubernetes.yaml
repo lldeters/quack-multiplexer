@@ -253,7 +253,9 @@ limits:
   maxSessionsPerUser: 0
   # Engines in total (starting, ready and draining).
   maxEngines: 0
-  # USER and CONNECTION engines per user.
+  # Engines a user caused to be started or claimed (a warm engine), of any
+  # share level: also a SERVER or GROUP engine (e.g. for a new subdomain)
+  # counts against the user whose session started it.
   maxEnginesPerUser: 0
   # Engines launching at the same time (0 means the default, 20).
   maxStartingEngines: 20

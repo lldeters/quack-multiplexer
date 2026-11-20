@@ -409,6 +409,9 @@ func leaveStartingLocked(e *engine) {
 	}
 }
 
+// claimTimeout bounds persisting a warm engine claim (a PATCH of the pod).
+const claimTimeout = 30 * time.Second
+
 // Back-off of warm pool refills after warm engines failed to start.
 const (
 	warmRetryBase = 30 * time.Second
@@ -477,6 +480,7 @@ var errRetry = errors.New("engine left service while waiting")
 
 // reserve finds, claims or launches the engine for key and reserves it.
 func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config.Profile) (*engine, error) {
+	claimFailed := false
 	for {
 		m.mu.Lock()
 		if e := m.findLocked(key); e != nil {
@@ -484,18 +488,32 @@ func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config
 			m.mu.Unlock()
 			return e, nil
 		}
-		if key.ShareLevel == ShareConnection {
+		if key.ShareLevel == ShareConnection && !claimFailed {
+			if err := m.checkUserLimitLocked(user); err != nil {
+				m.mu.Unlock()
+				return nil, err
+			}
 			if w := m.claimWarmLocked(key, user); w != nil {
 				w.Reserved++
 				m.mu.Unlock()
-				if err := m.prov.Claim(ctx, w.ID, key); err != nil {
+				// Persist the claim even if the client gives up meanwhile: a
+				// cancelled claim would cost the warm engine.
+				cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
+				err := m.prov.Claim(cctx, w.ID, key)
+				cancel()
+				if err != nil {
 					// The claim could not be persisted, so a restarted gateway could
-					// hand the engine out again: never use it.
+					// hand the engine out again: never use it. One attempt per
+					// connect: a failing API must not cost the whole warm pool.
 					m.log.Warn("warm engine claim failed, terminating it", "engine", w.ID, "err", err)
 					m.mu.Lock()
 					w.Reserved--
 					m.terminateLocked(w, "warm claim failed")
 					m.mu.Unlock()
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					claimFailed = true
 					continue
 				}
 				return w, nil
@@ -555,9 +573,13 @@ func olderEngine(a, b *engine) bool {
 func (m *Manager) claimWarmLocked(key Key, user string) *engine {
 	var pick *engine
 	inRecovery := m.now().Before(m.recoveryUntil)
+	now := m.now()
 	for _, e := range m.engines {
 		if !e.Warm || e.ProfileName != key.Profile || e.State != StateReady {
 			continue
+		}
+		if max := m.cfg.EngineMaxLifetime(e.ProfileName); max > 0 && now.Sub(e.CreatedAt) > max {
+			continue // recycled by maintainWarmPoolsLocked
 		}
 		if e.Recovered && inRecovery {
 			// A claim that was in flight when the previous gateway process
@@ -620,9 +642,11 @@ func (m *Manager) specCurrentLocked(e *engine) bool {
 	return e.SpecHash == "" || e.SpecHash == h
 }
 
+// checkLimitsLocked checks the limits before an engine is launched for key
+// on behalf of user (empty for warm pool refills).
 func (m *Manager) checkLimitsLocked(key Key, user string) error {
 	l := m.cfg.Limits
-	var total, starting, perUser int
+	var total, starting int
 	for _, e := range m.engines {
 		if e.State == StateFailed || e.State == StateTerminating {
 			continue
@@ -631,9 +655,6 @@ func (m *Manager) checkLimitsLocked(key Key, user string) error {
 		if e.State == StateStarting {
 			starting++
 		}
-		if !e.Warm && user != "" && e.User == user && (e.Key.ShareLevel == ShareUser || e.Key.ShareLevel == ShareConnection) {
-			perUser++
-		}
 	}
 	if l.MaxEngines > 0 && total >= l.MaxEngines {
 		return fmt.Errorf("%w: %d engines running (limits.maxEngines)", ErrLimit, total)
@@ -641,8 +662,26 @@ func (m *Manager) checkLimitsLocked(key Key, user string) error {
 	if l.MaxStartingEngines > 0 && starting >= l.MaxStartingEngines {
 		return fmt.Errorf("%w: %d engines starting (limits.maxStartingEngines), try again shortly", ErrLimit, starting)
 	}
-	if l.MaxEnginesPerUser > 0 && user != "" && (key.ShareLevel == ShareUser || key.ShareLevel == ShareConnection) && perUser >= l.MaxEnginesPerUser {
-		return fmt.Errorf("%w: user %q already has %d engines (limits.maxEnginesPerUser)", ErrLimit, user, perUser)
+	return m.checkUserLimitLocked(user)
+}
+
+// checkUserLimitLocked enforces limits.maxEnginesPerUser: the engines a
+// user caused to be started or claimed, whatever their share level. Shared
+// engines count too: otherwise any user could start engines for arbitrary
+// SERVER or GROUP subdomains until limits.maxEngines locks everybody out.
+func (m *Manager) checkUserLimitLocked(user string) error {
+	max := m.cfg.Limits.MaxEnginesPerUser
+	if max <= 0 || user == "" {
+		return nil
+	}
+	n := 0
+	for _, e := range m.engines {
+		if !e.Warm && e.User == user && e.State != StateFailed && e.State != StateTerminating {
+			n++
+		}
+	}
+	if n >= max {
+		return fmt.Errorf("%w: user %q already has %d engines (limits.maxEnginesPerUser)", ErrLimit, user, n)
 	}
 	return nil
 }
@@ -1084,6 +1123,11 @@ func (m *Manager) maintainWarmPoolsLocked() {
 			}
 			if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
 				m.terminateLocked(e, "warm engine outdated")
+				continue
+			}
+			if max := m.cfg.EngineMaxLifetime(name); max > 0 && e.State == StateReady && m.now().Sub(e.CreatedAt) > max {
+				// Never hand out an engine that would be drained right away.
+				m.terminateLocked(e, fmt.Sprintf("warm engine reached max lifetime %s", max))
 				continue
 			}
 			warm = append(warm, e)

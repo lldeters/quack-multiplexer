@@ -283,7 +283,9 @@ Weitere Provider:
     * `maxSessions`
     * `maxSessionsPerUser`
     * `maxEngines`
-    * `maxEnginesPerUser`
+    * `maxEnginesPerUser`: Engines, die Sessions des Benutzers gestartet oder (aus dem Warm-Pool) übernommen
+      haben, über alle Share-Levels. Sonst könnte jeder Benutzer SERVER- oder GROUP-Engines für beliebige
+      Subdomains starten, bis `maxEngines` alle anderen aussperrt.
     * `maxStartingEngines`
 * Isolation: Bei `GROUP`/`SERVER` teilen sich Benutzer denselben Datenbankzustand und dieselben Rechte der
   Engine. Wer Mandantentrennung braucht, nutzt `USER` oder `CONNECTION`.
