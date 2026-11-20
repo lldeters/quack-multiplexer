@@ -186,6 +186,9 @@ func (p *Provider) Terminate(_ context.Context, id, reason string) error {
 	delete(p.instances, id)
 	p.mu.Unlock()
 	if e == nil {
+		// Like the real providers: an engine without an instance (a failed
+		// launch, or one deleted already) is reported gone.
+		p.events <- engine.Instance{ID: id, Phase: engine.PhaseGone, Message: reason}
 		return nil
 	}
 	e.server.Close()

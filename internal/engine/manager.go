@@ -79,6 +79,16 @@ func (e *engine) touch(now time.Time) { e.lastUsed.Store(now.UnixNano()) }
 
 func (e *engine) idleSince() time.Time { return time.Unix(0, e.lastUsed.Load()) }
 
+// startedAt is when the engine's startup budget began: its creation, or, for
+// an engine this process found while it was not ready (perhaps only for a
+// moment), the moment it was found.
+func (e *engine) startedAt() time.Time {
+	if e.Recovered && e.StateSince.After(e.CreatedAt) {
+		return e.StateSince
+	}
+	return e.CreatedAt
+}
+
 func (e *engine) target() Target {
 	return Target{ID: e.ID, Endpoint: e.Endpoint, Token: e.Token, State: e.State, Key: e.Key}
 }
@@ -163,6 +173,10 @@ type Manager struct {
 	specHashes    map[string]string
 	recoveryUntil time.Time
 	closer        SessionCloser
+	// warmFailures counts warm engines of a profile that failed in a row;
+	// refills back off while warmRetryAt lies ahead.
+	warmFailures map[string]int
+	warmRetryAt  map[string]time.Time
 
 	synced   chan struct{}
 	syncOnce sync.Once
@@ -171,16 +185,18 @@ type Manager struct {
 // NewManager creates a manager. Call SetSessionCloser and Start before use.
 func NewManager(cfg *config.Config, prov Provider, log *slog.Logger, met *metrics.Metrics) *Manager {
 	return &Manager{
-		cfg:        cfg,
-		prov:       prov,
-		log:        log.With("component", "engines"),
-		met:        met,
-		now:        time.Now,
-		engines:    map[string]*engine{},
-		byUID:      map[UID]string{},
-		polling:    map[Key]uint64{},
-		specHashes: map[string]string{},
-		synced:     make(chan struct{}),
+		cfg:          cfg,
+		prov:         prov,
+		log:          log.With("component", "engines"),
+		met:          met,
+		now:          time.Now,
+		engines:      map[string]*engine{},
+		byUID:        map[UID]string{},
+		polling:      map[Key]uint64{},
+		specHashes:   map[string]string{},
+		warmFailures: map[string]int{},
+		warmRetryAt:  map[string]time.Time{},
+		synced:       make(chan struct{}),
 	}
 }
 
@@ -305,12 +321,22 @@ func (m *Manager) eventLoop(ctx context.Context) {
 	}
 }
 
-func (m *Manager) handleEvent(inst Instance) {
+func (m *Manager) handleEvent(inst Instance) { m.applyEvent(inst, nil) }
+
+// applyEvent applies a provider event. With only set (the result of a
+// launch), it applies inst to that engine alone: if the engine is no longer
+// registered - its pod was deleted and the Gone event came first - the
+// result is dropped instead of registering the engine again.
+func (m *Manager) applyEvent(inst Instance, only *engine) {
 	now := m.now()
 	var notify bool
 	var reason string
 	m.mu.Lock()
 	e, known := m.engines[inst.ID]
+	if only != nil && e != only {
+		m.mu.Unlock()
+		return
+	}
 	if !known {
 		// Instances created by an earlier gateway process arrive through the
 		// initial List; instances that show up later are adopted as well,
@@ -340,6 +366,10 @@ func (m *Manager) handleEvent(inst Instance) {
 			e.State, e.ReadyAt, e.StateSince = StateReady, now, now
 			e.touch(now)
 			close(e.ready)
+			if e.Warm {
+				delete(m.warmFailures, e.ProfileName)
+				delete(m.warmRetryAt, e.ProfileName)
+			}
 			if m.met != nil {
 				m.met.EngineStarts.WithLabelValues(e.ProfileName, "ready").Inc()
 				m.met.EngineStartTime.WithLabelValues(e.ProfileName).Observe(now.Sub(e.CreatedAt).Seconds())
@@ -379,9 +409,22 @@ func leaveStartingLocked(e *engine) {
 	}
 }
 
+// Back-off of warm pool refills after warm engines failed to start.
+const (
+	warmRetryBase = 30 * time.Second
+	warmRetryMax  = 10 * time.Minute
+)
+
 func (m *Manager) setFailedLocked(e *engine, now time.Time, msg string) {
 	if e.State == StateStarting && m.met != nil {
 		m.met.EngineStarts.WithLabelValues(e.ProfileName, "failed").Inc()
+	}
+	if e.State == StateStarting && e.Warm {
+		// A warm pool whose engines cannot start (quota, admission, image)
+		// would otherwise launch a new one on every reconcile.
+		n := m.warmFailures[e.ProfileName] + 1
+		m.warmFailures[e.ProfileName] = n
+		m.warmRetryAt[e.ProfileName] = now.Add(min(warmRetryBase<<min(n-1, 5), warmRetryMax))
 	}
 	leaveStartingLocked(e)
 	e.State, e.StateSince = StateFailed, now
@@ -650,7 +693,7 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 			m.mu.Unlock()
 			return
 		}
-		m.handleEvent(inst)
+		m.applyEvent(inst, e)
 	}()
 }
 
@@ -658,7 +701,7 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 // dropped. errRetry asks Acquire to pick another engine.
 func (m *Manager) wait(ctx context.Context, e *engine) (*Lease, error) {
 	timeout := m.cfg.EngineStartupTimeout(e.ProfileName)
-	remaining := timeout - m.now().Sub(e.CreatedAt)
+	remaining := timeout - m.now().Sub(e.startedAt())
 	if remaining < time.Second {
 		remaining = time.Second
 	}
@@ -944,7 +987,7 @@ func (m *Manager) Reconcile() {
 		protected := e.Recovered && inRecovery
 		switch e.State {
 		case StateStarting:
-			if limit := m.cfg.EngineStartupTimeout(e.ProfileName); now.Sub(e.CreatedAt) > limit {
+			if limit := m.cfg.EngineStartupTimeout(e.ProfileName); now.Sub(e.startedAt()) > limit {
 				msg := fmt.Sprintf("startup timeout after %s", limit)
 				if e.Message != "" {
 					msg += ": " + e.Message
@@ -1022,6 +1065,9 @@ func (m *Manager) maintainWarmPoolsLocked() {
 		for len(warm) > prof.WarmPool.Size {
 			m.terminateLocked(warm[len(warm)-1], "warm pool shrunk")
 			warm = warm[:len(warm)-1]
+		}
+		if now := m.now(); len(warm) < prof.WarmPool.Size && now.Before(m.warmRetryAt[name]) {
+			continue // the last warm engines of this profile failed: back off
 		}
 		for i := len(warm); i < prof.WarmPool.Size; i++ {
 			key := Key{ShareLevel: ShareConnection, Profile: name}

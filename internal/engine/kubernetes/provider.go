@@ -114,6 +114,11 @@ type Provider struct {
 	// deleted concurrently (see replay).
 	emitMu sync.Mutex
 
+	// closeMu guards the events channel against senders outside the
+	// informer (Terminate), which may run after Run has closed it.
+	closeMu      sync.RWMutex
+	eventsClosed bool
+
 	replayMu  sync.Mutex
 	replayIDs map[string]struct{}
 	replayCh  chan struct{}
@@ -271,7 +276,10 @@ func (p *Provider) Run(ctx context.Context) error {
 		}
 		wg.Wait()
 		close(p.stopped)
+		p.closeMu.Lock()
+		p.eventsClosed = true
 		close(p.events)
+		p.closeMu.Unlock()
 	}()
 
 	selector := p.selector.String()
@@ -529,10 +537,15 @@ func (p *Provider) Terminate(ctx context.Context, id string, reason string) erro
 	}
 	grace := ceilSeconds(p.grace)
 	err := pods.Delete(ctx, id, metav1.DeleteOptions{GracePeriodSeconds: &grace})
+	gone := false
 	switch {
 	case err == nil:
 		p.log.Debug("deleting engine pod", "engine", id, "reason", reason)
 	case apierrors.IsNotFound(err):
+		// No pod (any more), for example after a create that the API server
+		// rejected. The informer reports nothing for a pod that never
+		// existed, and the manager forgets an engine only on Gone.
+		gone = true
 	default:
 		return fmt.Errorf("delete engine pod %s: %w", id, err)
 	}
@@ -543,7 +556,21 @@ func (p *Provider) Terminate(ctx context.Context, id string, reason string) erro
 		// The owner reference or the orphan collector removes it later.
 		p.log.Warn("deleting the token secret of an engine failed", "engine", id, "secret", secretName, "err", err)
 	}
+	if gone {
+		p.emitGone(ctx, id, "no engine pod")
+	}
 	return nil
+}
+
+// emitGone reports that an engine has no pod. A second Gone for the same pod
+// (from the informer) is harmless.
+func (p *Provider) emitGone(ctx context.Context, id, msg string) {
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+	if p.eventsClosed {
+		return
+	}
+	p.emit(ctx, engine.Instance{ID: id, Phase: engine.PhaseGone, Message: msg})
 }
 
 // recordEvent records a Kubernetes event about the termination on the pod,
