@@ -197,7 +197,7 @@ prepare_workdir() {
 # with -bail it never gets there if an earlier statement fails.
 build_bootstrap() {
 	local nl=$'\n'
-	bootstrap="SET extension_directory = $(sql_string "$extension_dir");$nl"
+	bootstrap="SET extension_directories = [$(sql_string "$extension_dir")];$nl"
 	bootstrap+="SET autoinstall_known_extensions = false;$nl"
 	bootstrap+="SET autoload_known_extensions = true;$nl"
 	bootstrap+="LOAD quack;$nl"

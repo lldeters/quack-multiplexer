@@ -95,7 +95,7 @@ cd test/e2e/compose
 E2E_KEEP=1 bash run.sh        # oder: docker compose --env-file e2e.env up -d (nach dem Build)
 curl -H "Authorization: Bearer $(cat config/admin.token)" http://127.0.0.1:19495/api/v1/sessions
 docker compose -p quackmux-e2e --env-file e2e.env run --rm -T --no-deps client <<'SQL'
-SET extension_directory = '/opt/duckdb/extensions';
+SET extension_directories = ['/opt/duckdb/extensions'];
 LOAD quack;
 CREATE SECRET (TYPE quack, TOKEN 'e2e-alice-3f9c2b7d1a8e4c60?share_level=server', SCOPE 'quack:gateway:9494');
 ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true);

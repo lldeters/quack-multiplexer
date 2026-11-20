@@ -72,7 +72,7 @@ RUN set -eu; \
 RUN set -eu; \
     dir=/opt/duckdb/extensions; \
     mkdir -p "$dir"; \
-    sql="SET extension_directory = '$dir';"; \
+    sql="SET extension_directories = ['$dir'];"; \
     if [ -n "${DUCKDB_EXTENSION_REPOSITORY:-}" ]; then \
         case "$DUCKDB_EXTENSION_REPOSITORY" in *"'"*) echo "DUCKDB_EXTENSION_REPOSITORY must not contain quotes" >&2; exit 1 ;; esac; \
         sql="$sql SET custom_extension_repository = '$DUCKDB_EXTENSION_REPOSITORY';"; \

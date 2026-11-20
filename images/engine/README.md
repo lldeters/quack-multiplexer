@@ -44,7 +44,7 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 3. Über die FIFO bekommt DuckDB:
 
    ```sql
-   SET extension_directory = '/opt/duckdb/extensions';
+   SET extension_directories = ['/opt/duckdb/extensions'];
    SET autoinstall_known_extensions = false;
    SET autoload_known_extensions = true;
    LOAD quack;
@@ -173,7 +173,7 @@ Oder als abgeleitetes Image:
 ```dockerfile
 FROM quackmux/duckdb-engine:2.0.0
 USER 0
-RUN HOME=/root duckdb -init /dev/null -bail -c "SET extension_directory = '/opt/duckdb/extensions'; \
+RUN HOME=/root duckdb -init /dev/null -bail -c "SET extension_directories = ['/opt/duckdb/extensions']; \
       INSTALL aws; INSTALL ducklake; INSTALL postgres_scanner; LOAD aws; LOAD ducklake; LOAD postgres_scanner;" \
  && chmod -R a+rX,go-w /opt/duckdb
 USER 1000:1000

@@ -232,7 +232,7 @@ E2E_EXTENSION_DIR=${E2E_EXTENSION_DIR-/opt/duckdb/extensions}
 client_preamble() {
 	echo ".mode list"
 	if [ -n "$E2E_EXTENSION_DIR" ]; then
-		printf "SET extension_directory = '%s';\n" "$E2E_EXTENSION_DIR"
+		printf "SET extension_directories = ['%s'];\n" "$E2E_EXTENSION_DIR"
 	fi
 	echo "SET autoinstall_known_extensions = false;"
 	echo "LOAD httpfs;"
