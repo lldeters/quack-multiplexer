@@ -155,6 +155,7 @@ Port 9494, Platz für mindestens zwei gleichzeitige Engines (`limits.maxEngines`
 | `SKIP_BUILD` | – | `1`: Images nicht bauen, nur laden (setup.sh) |
 | `DOCKER_BUILD_FLAGS` | – | zusätzliche Flags für beide `docker build` (setup.sh), wie beim Compose-Test |
 | `KIND_NODE_IMAGE` | kind-Default | Node-Image für `kind create cluster` |
+| `KIND_CONFIG` | – | Cluster-Konfiguration für `kind create cluster --config`. Auf Hosts mit cgroup v1 startet das Kubelet ab Kubernetes 1.35 nur mit `failCgroupV1: false` (siehe Fehlersuche). |
 | `ADMIN_TOKEN` | – | Bearer-Token, falls die Admin-API einen verlangt |
 | `ADMIN_LOCAL_PORT` | 19695 | lokaler Port des Port-Forwards |
 | `CLIENT_UID` | 1000 | Benutzer des Client-Pods (der Benutzer des Engine-Images) |
@@ -193,6 +194,28 @@ den Wert in `config/admin.token` oder `config/gateway*.yaml` nachziehen. Die Tes
   `kubectl --context kind-quackmux -n quackmux get pods -l app.kubernetes.io/component=engine`. Bei einem Fehler gibt
   `test.sh` Pods, Events und das Gateway-Log selbst aus.
 * **`LOAD quack` scheitert:** Das Extension-Verzeichnis des Images passt nicht zu `E2E_EXTENSION_DIR`.
+* **kind: Control-Plane startet nicht, Kubelet meldet „configured to not run on a host using cgroup v1“:** Ab
+  Kubernetes 1.35 verweigert das Kubelet cgroup v1. Auf solchen Hosts (ältere Distributionen, manche CI-Runner)
+  hilft eine Cluster-Konfiguration, die `KIND_CONFIG` an `setup.sh` übergibt:
+
+  ```yaml
+  kind: Cluster
+  apiVersion: kind.x-k8s.io/v1alpha4
+  kubeadmConfigPatches:
+    - |
+      kind: KubeletConfiguration
+      failCgroupV1: false
+  ```
+* **kind: Pods bleiben in `ContainerCreating`, containerd meldet „failed to update /proc/self/oom_score_adj:
+  Permission denied“:** Der Host erlaubt kein negatives `oom_score_adj` (fehlende Capability `CAP_SYS_RESOURCE`,
+  etwa in manchen Sandboxen). Dann gehören in dieselbe Konfiguration zusätzlich:
+
+  ```yaml
+  containerdConfigPatches:
+    - |-
+      [plugins."io.containerd.cri.v1.runtime"]
+        restrict_oom_score_adj = true
+  ```
 * **SELinux (Fedora, RHEL):** Bind-Mounts der Konfiguration brauchen eventuell eine Relabel-Option (`:z`).
 * **Wie die Skripte mit DuckDB sprechen:** Kurze Szenarien geben der CLI ein SQL-Skript mit `-bail` auf stdin.
   Szenarien mit lange offenem Attachment schreiben über eine FIFO nach und nach in die CLI. Die CLI leert ihre
