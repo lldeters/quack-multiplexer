@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -703,12 +704,31 @@ func (g *Gateway) auditQuery(br *bufio.Reader, hlen int, h wire.Header, sess *se
 	if err != nil {
 		return
 	}
-	attrs := []any{"user", sess.User, "session", sess.ID, "engine", target.ID, "key", target.Key.String(),
-		"sql", strings.ToValidUTF8(sql, "?"), "truncated", truncated}
+	attrs := []any{"user", sess.User, "session", sess.ID, "engine", target.ID, "key", target.Key.String()}
+	if mayHoldCredentials(sql) {
+		attrs = append(attrs, "sql", redactedSQL, "redacted", true)
+	} else {
+		attrs = append(attrs, "sql", strings.ToValidUTF8(sql, "?"), "truncated", truncated)
+	}
 	if h.ClientQueryID.Valid {
 		attrs = append(attrs, "clientQueryId", h.ClientQueryID.Value)
 	}
 	g.audit.Info("query", attrs...)
+}
+
+// redactedSQL replaces, in the audit log, the text of a statement that may
+// hold credentials.
+const redactedSQL = "[redacted: the statement may contain credentials]"
+
+// credentialPattern finds SQL that may hold credentials: CREATE SECRET and
+// every other statement that names a secret, password or token (also inside
+// identifiers such as s3_secret_access_key or motherduck_token), Azure
+// account keys and SAS signatures, and URLs with a user and password (also
+// when the logged text ends inside one). It errs on the side of redacting.
+var credentialPattern = regexp.MustCompile(`(?i)secret|passw|\bpwd\b|token|accountkey|[?&;]sig=|://[^/\s'"@]*:[^/\s'"@]*(@|$)`)
+
+func mayHoldCredentials(sql string) bool {
+	return credentialPattern.MatchString(sql)
 }
 
 // releasingReader is a request body that runs release once the transport

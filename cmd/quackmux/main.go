@@ -3,7 +3,7 @@
 //	quackmux serve -config /etc/quackmux/config.yaml
 //	quackmux validate -config config.yaml
 //	quackmux token            # generate a token and print its sha256 for users.yaml
-//	quackmux hash-token TOKEN # print the sha256 of an existing token
+//	quackmux hash-token [TOKEN] # print the sha256 of an existing token (read from stdin without TOKEN)
 //	quackmux version
 package main
 
@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	stdlog "log"
 	"log/slog"
 	"net"
@@ -58,11 +59,7 @@ func main() {
 	case "token":
 		err = cmdToken()
 	case "hash-token":
-		if len(os.Args) != 3 {
-			err = errors.New("usage: quackmux hash-token TOKEN")
-		} else {
-			fmt.Println(auth.HashToken(os.Args[2]))
-		}
+		err = cmdHashToken(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("quackmux", version)
 	case "help", "-h", "--help":
@@ -84,7 +81,9 @@ Usage:
   quackmux serve -config FILE      run the gateway
   quackmux validate -config FILE   check a configuration file
   quackmux token                   generate a client token and its sha256
-  quackmux hash-token TOKEN        print the sha256 of a token (for users.yaml)
+  quackmux hash-token [TOKEN]      print the sha256 of a token (for users.yaml); without
+                                   TOKEN it is read from stdin, which keeps it out of
+                                   the process list and the shell history
   quackmux version
 `)
 }
@@ -140,6 +139,33 @@ func sessionKey(cfg *config.Config, log *slog.Logger) ([]byte, error) {
 		return nil, err
 	}
 	return k, nil
+}
+
+// cmdHashToken prints the sha256 of a token given as the argument or, to
+// keep it out of process listings and shell histories, on stdin.
+func cmdHashToken(args []string) error {
+	var tok string
+	switch len(args) {
+	case 1:
+		tok = args[0]
+	case 0:
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 64<<10))
+		if err != nil {
+			return err
+		}
+		tok = strings.TrimSpace(string(b))
+		if tok == "" {
+			return errors.New("hash-token: no token on stdin")
+		}
+	default:
+		return errors.New("usage: quackmux hash-token [TOKEN]")
+	}
+	if strings.Contains(tok, "?") {
+		// The gateway hashes only the part before '?' (client options).
+		return errors.New("hash-token: a token must not contain '?'")
+	}
+	fmt.Println(auth.HashToken(tok))
+	return nil
 }
 
 // placeholderMarker marks the example secrets shipped in

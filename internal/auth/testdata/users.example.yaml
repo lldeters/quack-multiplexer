@@ -1,7 +1,7 @@
 # Example users file for auth.mode=static (auth.static.file).
 #
 # Create a token and its hash:   quackmux token
-# Hash an existing token:        quackmux hash-token TOKEN
+# Hash an existing token:        quackmux hash-token < FILE   (or: hash-token TOKEN)
 #
 # Clients send the token itself (optionally followed by options, e.g.
 # TOKEN?share_level=connection); the file only stores its sha256, so tokens

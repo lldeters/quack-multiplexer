@@ -76,7 +76,8 @@ Die Werkzeuge stecken im Binary (`go build -o bin/quackmux ./cmd/quackmux`):
 quackmux token                            # neues Token und sein sha256
 # token:  …43 Zeichen…   -> bekommt der Benutzer
 # sha256: …64 Hex…       -> kommt in users.yaml
-quackmux hash-token 'vorhandenes-token'   # sha256 eines bestehenden Tokens
+quackmux hash-token < token.txt           # sha256 eines bestehenden Tokens; von stdin gelesen,
+                                          # erscheint es weder in der Prozessliste noch in der Shell-History
 ```
 
 Legen Sie ein eigenes Overlay außerhalb dieses Repositorys an und checken Sie echte Secrets nirgends ein
@@ -351,7 +352,10 @@ Läuft Prometheus in einem anderen Namespace, braucht die Policy `quackmux-gatew
 | `quackmux_requests_in_flight`, `quackmux_is_leader` | laufende Requests; 1 auf der Replika, die bedient |
 
 Das Audit-Log (`audit.enabled`, in der Base an) schreibt jede Query als JSON-Zeile mit Benutzer, Session,
-Engine und gekürztem SQL ins Gateway-Log:
+Engine und gekürztem SQL ins Gateway-Log. Statements, die Zugangsdaten enthalten können, stehen dort ohne ihren
+Text (`"sql":"[redacted: …]"`, `"redacted":true`): `CREATE SECRET` und alles, was `secret`, `passw`, `pwd`,
+`token`, `AccountKey` oder eine SAS-Signatur (`sig=`) enthält, auch in Namen wie `s3_secret_access_key`, sowie URLs
+mit Benutzer und Passwort. Das ist eine Heuristik: Behandeln Sie das Audit-Log trotzdem als vertraulich.
 
 ```sh
 kubectl -n quackmux logs deployment/quackmux | grep '"component":"audit"'
