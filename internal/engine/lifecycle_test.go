@@ -197,7 +197,7 @@ type claimRecorder struct {
 	terminated sync.Map
 }
 
-func (p *claimRecorder) Claim(ctx context.Context, id string, key engine.Key) error {
+func (p *claimRecorder) Claim(ctx context.Context, id string, key engine.Key, user string) error {
 	p.claims.Add(1)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -205,7 +205,7 @@ func (p *claimRecorder) Claim(ctx context.Context, id string, key engine.Key) er
 	if p.fail.Load() {
 		return errors.New("the API server is unavailable")
 	}
-	return p.Provider.Claim(ctx, id, key)
+	return p.Provider.Claim(ctx, id, key, user)
 }
 
 func (p *claimRecorder) Terminate(ctx context.Context, id, reason string) error {

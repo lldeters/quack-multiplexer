@@ -655,14 +655,14 @@ func removeAll(dir string) error {
 }
 
 // Claim implements engine.Provider. Keys only live in memory.
-func (p *Provider) Claim(_ context.Context, id string, key engine.Key) error {
+func (p *Provider) Claim(_ context.Context, id string, key engine.Key, user string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pr := p.engines[id]
 	if pr == nil {
 		return fmt.Errorf("engine %s not found", id)
 	}
-	pr.inst.Key, pr.inst.Warm = key, false
+	pr.inst.Key, pr.inst.Warm, pr.inst.User = key, false, user
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"quackmux/internal/engine"
+	"quackmux/internal/engine/fake"
 	"quackmux/internal/wire"
 )
 
@@ -96,4 +97,43 @@ profiles:
 		h.sessions.Wait()
 	}
 	mustType(t, h.query(c, "SELECT 1"), wire.TypePrepareResponse)
+}
+
+// A claimed warm engine still counts for its user after a gateway restart:
+// the claim records the user like a launch does.
+func TestClaimedWarmEngineCountsForItsUserAfterRestart(t *testing.T) {
+	const cfg = `
+limits:
+  maxEnginesPerUser: 1
+profiles:
+  default:
+    warmPool: {size: 1}
+`
+	h1 := newHarness(t, cfg, nil)
+	h1.engines.Reconcile()
+	var warm string
+	eventually(t, "warm engine ready", func() bool {
+		for _, v := range h1.engines.List() {
+			if v.Warm && v.State == engine.StateReady {
+				warm = v.ID
+				return true
+			}
+		}
+		return false
+	})
+	c := h1.connect("tok?user=alice&share_level=connection", nil)
+	if got := h1.sessionEngine(c); got != warm {
+		t.Fatalf("the session got engine %s, not the warm engine %s", got, warm)
+	}
+
+	prov2 := fake.New()
+	prov2.Adopt(h1.prov)
+	h1.cancel()
+	h2 := newHarness(t, cfg, prov2)
+	if v, ok := h2.engines.Get(warm); !ok || v.Warm || v.User != "alice" {
+		t.Fatalf("recovered claimed engine: %+v (found %v)", v, ok)
+	}
+	if e := h2.connectErr("tok?user=alice&share_level=connection", nil); !strings.Contains(e.Message, "maxEnginesPerUser") {
+		t.Fatalf("second CONNECTION engine of alice after the restart: %q", e.Message)
+	}
 }

@@ -739,14 +739,14 @@ func TestWarmEngineClaim(t *testing.T) {
 		Profile: config.Profile{Database: ":memory:"}, Token: newToken(t)})
 	h.rec.wait(t, id, engine.PhaseReady)
 	claimed := engine.Key{ShareLevel: engine.ShareConnection, Owner: "session-1", Profile: "default"}
-	if err := h.p.Claim(context.Background(), id, claimed); err != nil {
+	if err := h.p.Claim(context.Background(), id, claimed, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	list, _ := h.p.List(context.Background())
-	if len(list) != 1 || list[0].Key != claimed || list[0].Warm {
+	if len(list) != 1 || list[0].Key != claimed || list[0].Warm || list[0].User != "alice" {
 		t.Fatalf("after claim: %+v", list)
 	}
-	if err := h.p.Claim(context.Background(), "proc-unknown-aaaaa", claimed); err == nil {
+	if err := h.p.Claim(context.Background(), "proc-unknown-aaaaa", claimed, "alice"); err == nil {
 		t.Fatal("claiming an unknown engine must fail")
 	}
 }

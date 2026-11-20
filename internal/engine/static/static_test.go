@@ -440,7 +440,7 @@ func TestNotSupported(t *testing.T) {
 	if _, err := p.Launch(context.Background(), engine.LaunchRequest{ID: "x"}); !errors.Is(err, engine.ErrNotSupported) {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := p.Claim(context.Background(), "e", engine.Key{}); !errors.Is(err, engine.ErrNotSupported) {
+	if err := p.Claim(context.Background(), "e", engine.Key{}, "alice"); !errors.Is(err, engine.ErrNotSupported) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := p.Terminate(context.Background(), "e", "admin"); err != nil {

@@ -551,7 +551,7 @@ func (p *Provider) Launch(context.Context, engine.LaunchRequest) (engine.Instanc
 }
 
 // Claim implements engine.Provider: not supported (there are no warm pools).
-func (p *Provider) Claim(context.Context, string, engine.Key) error {
+func (p *Provider) Claim(context.Context, string, engine.Key, string) error {
 	return engine.ErrNotSupported
 }
 

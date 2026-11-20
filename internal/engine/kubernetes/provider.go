@@ -498,16 +498,16 @@ func (p *Provider) attachSecret(ctx context.Context, secretName string, pod *cor
 }
 
 // Claim implements engine.Provider: it re-keys a warm-pool pod for a
-// session (labels key-hash, share-level, warm=false and the key annotation)
-// and gives it its activeDeadlineSeconds backstop.
-func (p *Provider) Claim(ctx context.Context, id string, key engine.Key) error {
+// session (labels key-hash, share-level, warm=false, the key and user
+// annotations) and gives it its activeDeadlineSeconds backstop.
+func (p *Provider) Claim(ctx context.Context, id string, key engine.Key, user string) error {
 	patch := map[string]any{"metadata": map[string]any{
 		"labels": map[string]string{
 			LabelKeyHash:    key.Hash(),
 			LabelShareLevel: strings.ToLower(string(key.ShareLevel)),
 			LabelWarm:       "false",
 		},
-		"annotations": map[string]string{AnnotationKey: key.String()},
+		"annotations": map[string]string{AnnotationKey: key.String(), AnnotationUser: user},
 	}}
 	if d := p.claimDeadline(id); d > 0 {
 		patch["spec"] = map[string]any{"activeDeadlineSeconds": d}

@@ -165,14 +165,14 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 }
 
 // Claim implements engine.Provider.
-func (p *Provider) Claim(_ context.Context, id string, key engine.Key) error {
+func (p *Provider) Claim(_ context.Context, id string, key engine.Key, user string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := p.instances[id]
 	if e == nil {
 		return fmt.Errorf("unknown engine %s", id)
 	}
-	e.inst.Key, e.inst.Warm = key, false
+	e.inst.Key, e.inst.Warm, e.inst.User = key, false, user
 	p.claims[id] = key
 	return nil
 }

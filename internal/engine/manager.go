@@ -499,7 +499,7 @@ func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config
 				// Persist the claim even if the client gives up meanwhile: a
 				// cancelled claim would cost the warm engine.
 				cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
-				err := m.prov.Claim(cctx, w.ID, key)
+				err := m.prov.Claim(cctx, w.ID, key, user)
 				cancel()
 				if err != nil {
 					// The claim could not be persisted, so a restarted gateway could
@@ -837,7 +837,7 @@ func (m *Manager) AttachAdopted(id, sessionID, user string) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := m.prov.Claim(ctx, id, claimKey); err != nil {
+			if err := m.prov.Claim(ctx, id, claimKey, user); err != nil {
 				m.log.Warn("re-claiming adopted warm engine failed", "engine", id, "err", err)
 			}
 		}()
