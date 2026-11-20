@@ -441,11 +441,15 @@ summary() {
 
 # build_images ENGINE_IMAGE GATEWAY_IMAGE builds the engine image from
 # images/engine and the gateway image from the root Dockerfile.
+# DOCKER_BUILD_FLAGS (split at spaces, as in the Makefile) are passed to both
+# builds, e.g. "--network host --build-arg GOPROXY=..." behind a proxy.
 build_images() {
 	[ -f "$REPO_ROOT/images/engine/Dockerfile" ] || die "$REPO_ROOT/images/engine/Dockerfile not found"
 	[ -f "$REPO_ROOT/Dockerfile" ] || die "$REPO_ROOT/Dockerfile not found"
 	say "building engine image $1 (images/engine)"
-	docker build -t "$1" "$REPO_ROOT/images/engine"
+	# shellcheck disable=SC2086 # DOCKER_BUILD_FLAGS is a list of flags
+	docker build ${DOCKER_BUILD_FLAGS:-} -t "$1" "$REPO_ROOT/images/engine"
 	say "building gateway image $2 (Dockerfile)"
-	docker build -t "$2" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+	# shellcheck disable=SC2086
+	docker build ${DOCKER_BUILD_FLAGS:-} -t "$2" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
 }

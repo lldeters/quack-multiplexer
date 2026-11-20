@@ -80,6 +80,7 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | Variable | Default | Bedeutung |
 |---|---|---|
 | `E2E_SKIP_BUILD` | – | `1`: vorhandene Images verwenden, nicht bauen |
+| `DOCKER_BUILD_FLAGS` | – | zusätzliche Flags für beide `docker build`, durch Leerzeichen getrennt wie im Makefile, z. B. `--network host --build-arg GOPROXY=…` hinter einem Proxy |
 | `E2E_KEEP` | – | `1`: Container nach dem Lauf weiterlaufen lassen (zum Untersuchen) |
 | `E2E_ENGINE_IMAGE` | `quackmux/duckdb-engine:2.0.0` | Engine- und Client-Image |
 | `E2E_GATEWAY_IMAGE` | `quackmux/quackmux:e2e` | Gateway-Image |
@@ -152,6 +153,7 @@ Port 9494, Platz für mindestens zwei gleichzeitige Engines (`limits.maxEngines`
 | `QMX_NAMESPACE`, `QMX_DEPLOYMENT` | aus dem Overlay | Namespace und Deployment des Gateways |
 | `QMX_SERVICE`, `QMX_SERVICE_PORT` | Service mit Port 9494 | Ziel der Clients |
 | `SKIP_BUILD` | – | `1`: Images nicht bauen, nur laden (setup.sh) |
+| `DOCKER_BUILD_FLAGS` | – | zusätzliche Flags für beide `docker build` (setup.sh), wie beim Compose-Test |
 | `KIND_NODE_IMAGE` | kind-Default | Node-Image für `kind create cluster` |
 | `ADMIN_TOKEN` | – | Bearer-Token, falls die Admin-API einen verlangt |
 | `ADMIN_LOCAL_PORT` | 19695 | lokaler Port des Port-Forwards |

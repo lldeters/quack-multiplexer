@@ -39,9 +39,9 @@ docker_platform     = $(if $(PLATFORM),--platform $(PLATFORM))
 
 # End-to-end test scripts.
 E2E_COMPOSE ?= test/e2e/compose/run.sh
-KIND_UP     ?= test/e2e/kind/up.sh
+KIND_UP     ?= test/e2e/kind/setup.sh
 KIND_TEST   ?= test/e2e/kind/test.sh
-KIND_DOWN   ?= test/e2e/kind/down.sh
+KIND_DOWN   ?= test/e2e/kind/teardown.sh
 
 .DEFAULT_GOAL := build
 .PHONY: build test vet fmt-check check docker docker-gateway docker-engine \
