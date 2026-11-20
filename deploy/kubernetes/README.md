@@ -34,7 +34,9 @@ Alle Konfigurationsoptionen mit ihren Defaults stehen in
 ## Installation
 
 1. Echte Secrets erzeugen (nächster Abschnitt). Die Dateien unter `base/secrets/` sind öffentlich bekannte
-   Platzhalter.
+   Platzhalter. Solange Session-Key oder Admin-Token Platzhalter sind, startet das Gateway nicht (außer mit
+   `auth.mode: none`, etwa im Overlay `dev`). Den Beispiel-Token der Platzhalter-`users.yaml` ignoriert es immer.
+   Eine leere Tokendatei (etwa nach einem fehlgeschlagenen `quackmux token > …`) ist ebenfalls ein Startfehler.
 2. Anwenden und warten:
 
    ```sh

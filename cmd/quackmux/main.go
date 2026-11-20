@@ -142,6 +142,24 @@ func sessionKey(cfg *config.Config, log *slog.Logger) ([]byte, error) {
 	return k, nil
 }
 
+// placeholderMarker marks the example secrets shipped in
+// deploy/kubernetes/base/secrets; they are public.
+const placeholderMarker = "CHANGE-ME-INSECURE-PLACEHOLDER"
+
+// refusePlaceholder fails for a secret that still is one of the shipped,
+// public examples, except with auth.mode none (development), where it only
+// warns.
+func refusePlaceholder(cfg *config.Config, log *slog.Logger, what, value string) error {
+	if !strings.Contains(value, placeholderMarker) {
+		return nil
+	}
+	if cfg.Auth.Mode == "none" {
+		log.Warn("the " + what + " is the public example from the repository; replace it outside development")
+		return nil
+	}
+	return fmt.Errorf("the %s is the public example from the repository (%s...): generate one with \"quackmux token\"", what, placeholderMarker)
+}
+
 func readTokenFile(path string) (string, error) {
 	if path == "" {
 		return "", nil
@@ -170,6 +188,9 @@ func cmdServe(args []string) error {
 
 	met := metrics.New()
 	key, err := sessionKey(cfg, log)
+	if err == nil {
+		err = refusePlaceholder(cfg, log, "session key", string(key))
+	}
 	if err != nil {
 		return err
 	}
@@ -246,6 +267,14 @@ func cmdServe(args []string) error {
 	adminToken, err := readTokenFile(cfg.Admin.TokenFile)
 	if err != nil {
 		return fmt.Errorf("admin token: %w", err)
+	}
+	if cfg.Admin.TokenFile != "" && adminToken == "" {
+		// An empty file (a failed "quackmux token > file") must not
+		// silently open the admin API.
+		return fmt.Errorf("admin token file %s is empty", cfg.Admin.TokenFile)
+	}
+	if err := refusePlaceholder(cfg, log, "admin token", adminToken); err != nil {
+		return err
 	}
 	if cfg.Admin.Listen != "" && adminToken == "" {
 		log.Warn("admin API has no token (admin.tokenFile): anyone who can reach it can manage sessions and engines")

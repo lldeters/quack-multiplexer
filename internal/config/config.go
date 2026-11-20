@@ -481,7 +481,14 @@ func (c *Config) ApplyDefaults() {
 		u.MaxRequestBytes = 100 << 20
 	}
 
-	setStr(&c.Admin.Listen, ":9495")
+	if c.Admin.TokenFile == "" {
+		// Without a token the admin API (which can close sessions and stop
+		// engines) is only reachable from this machine unless configured
+		// otherwise.
+		setStr(&c.Admin.Listen, "127.0.0.1:9495")
+	} else {
+		setStr(&c.Admin.Listen, ":9495")
+	}
 
 	setStr(&c.Auth.Mode, "static")
 	setStr(&c.Auth.None.DefaultUser, "anonymous")
