@@ -131,9 +131,11 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 
    `HEARTBEAT_REQUEST` und `DISCONNECT_MESSAGE` beantwortet das Gateway **selbst**:
    * **Heartbeats:** Das Gateway besitzt die Client-Lease. Von der Engine fordert es eine längere Lease an
-     (`session.backendHeartbeatTimeout`, Default 1 h) und erneuert sie bei ruhigen Sessions selbst per
-     Keepalive. Eine hängende Engine kann so nie den Heartbeat-Thread des Clients blockieren, und damit auch
-     nicht sein `DETACH`.
+     (`session.backendHeartbeatTimeout`, Default 1 h) und erneuert sie selbst per Keepalive, spätestens nach
+     einem Drittel davon. Das gilt auch, während ein Request läuft: Die Engine erneuert die Lease nur beim
+     Eingang einer Nachricht, und eine lange Query bringt währenddessen keine. Gezählt wird ab dem Senden
+     eines Requests, nicht ab seiner Antwort. Eine hängende Engine kann so nie den Heartbeat-Thread des
+     Clients blockieren, und damit auch nicht sein `DETACH`.
    * **DISCONNECT:** Das Gateway bestätigt sofort, denn der Client wartet nur 2 s. Der Abbau der
      Engine-Verbindung läuft im Hintergrund.
 5. Header neu schreiben (Backend-Connection-ID einsetzen, `client_query_id` übernehmen). Den Rest des Bodys

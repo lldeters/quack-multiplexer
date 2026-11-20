@@ -480,6 +480,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		writeError(w, "quackmux: "+err.Error(), wire.ExceptionConnection, false)
 		return "internal"
 	}
+	sentAt := g.now()
 	resp, err := g.up.HTTP.Do(upReq)
 	if g.met != nil {
 		g.met.Bytes.WithLabelValues("in").Add(float64(sent()))
@@ -498,7 +499,9 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		return "engine_unreachable"
 	}
 	defer resp.Body.Close()
-	sess.TouchBackend(g.now())
+	// The engine answered, so it received the message - and renewed its
+	// lease - at or after sentAt (not when the answer came back).
+	sess.TouchBackend(sentAt)
 	if resp.StatusCode != http.StatusOK {
 		writeError(w, fmt.Sprintf("quackmux: engine %s answered HTTP %d", target.ID, resp.StatusCode), wire.ExceptionConnection, false)
 		return "engine_status"

@@ -330,7 +330,9 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	}
 	s.lastSeen.Store(now.UnixNano())
 	s.lastActive.Store(now.UnixNano())
-	s.lastBackend.Store(now.UnixNano())
+	// When the engine last saw this connection is unknown (the gateway was
+	// away): the next reap sends a keep-alive unless a request does first.
+	s.lastBackend.Store(0)
 	m.mu.Lock()
 	if existing := m.sessions[s.ID]; existing != nil { // lost a race with a concurrent adoption
 		m.mu.Unlock()
@@ -372,9 +374,19 @@ func (s *Session) Begin(now time.Time, t wire.MessageType) (*Closed, bool) {
 	return nil, true
 }
 
-// TouchBackend records that a request of this session reached the engine
-// (which renews the engine-side lease).
-func (s *Session) TouchBackend(now time.Time) { s.lastBackend.Store(now.UnixNano()) }
+// TouchBackend records that a message of this session reached the engine at
+// or after t: the engine renews its lease when a message arrives, so t is the
+// time the message was sent, not when it was answered. The stamp only moves
+// forward (a long request may be answered after a later keep-alive).
+func (s *Session) TouchBackend(t time.Time) {
+	n := t.UnixNano()
+	for {
+		old := s.lastBackend.Load()
+		if n <= old || s.lastBackend.CompareAndSwap(old, n) {
+			return
+		}
+	}
+}
 
 // End marks the end of a request started with Begin.
 func (s *Session) End(now time.Time, t wire.MessageType) {
@@ -546,10 +558,14 @@ func (m *Manager) Reap() {
 				continue
 			}
 		}
-		// The gateway answers client heartbeats itself; keep the engine-side
-		// lease (session.backendHeartbeatTimeout) alive for quiet sessions.
+		// The gateway answers client heartbeats itself, so it keeps the
+		// engine-side lease (session.backendHeartbeatTimeout) alive. The
+		// engine renews the lease only when a message arrives, and a long
+		// PREPARE or FETCH carries none while it runs: keep-alives go out
+		// with requests in flight as well, like the stock client's
+		// heartbeats.
 		if every := sc.BackendHeartbeatTimeout.Duration / 3; every > 0 &&
-			now.Sub(time.Unix(0, s.lastBackend.Load())) > every && s.InFlight() == 0 {
+			now.Sub(time.Unix(0, s.lastBackend.Load())) > every {
 			m.keepAlive(s, now)
 		}
 	}
