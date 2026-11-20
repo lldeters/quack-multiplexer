@@ -141,11 +141,12 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 	}
 	p.mu.Lock()
 	p.instances[req.ID] = &entry{inst: inst, server: srv}
+	delay := p.StartDelay
 	p.mu.Unlock()
 	if !p.NeverReady {
 		go func() {
-			if p.StartDelay > 0 {
-				time.Sleep(p.StartDelay)
+			if delay > 0 {
+				time.Sleep(delay)
 			}
 			p.mu.Lock()
 			e := p.instances[req.ID]
@@ -202,6 +203,13 @@ func (p *Provider) Terminate(_ context.Context, id, reason string) error {
 func (p *Provider) Events() <-chan engine.Instance { return p.events }
 
 // Server returns the fake server behind an engine (tests).
+// SetStartDelay changes StartDelay while engines may be launching.
+func (p *Provider) SetStartDelay(d time.Duration) {
+	p.mu.Lock()
+	p.StartDelay = d
+	p.mu.Unlock()
+}
+
 func (p *Provider) Server(id string) *quacktest.Server {
 	p.mu.Lock()
 	defer p.mu.Unlock()

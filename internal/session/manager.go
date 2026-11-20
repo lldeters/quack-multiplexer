@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"quackmux/internal/config"
 	"quackmux/internal/engine"
 	"quackmux/internal/metrics"
@@ -140,6 +142,10 @@ type Manager struct {
 	pending    map[string]int // connects in progress per user
 	total      int
 	wg         sync.WaitGroup // background control requests
+
+	// adoptions confirms each adopted session with the engine once, also
+	// when many requests of it arrive at the same time.
+	adoptions singleflight.Group
 }
 
 // NewManager creates a session manager.
@@ -313,6 +319,30 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 		}
 		return nil, &Closed{Reason: fmt.Sprintf("engine is %s", st), MustInvalidate: true, ClosedAt: m.now()}, nil
 	}
+	// Adopt only connections the engine still has. The gateway disconnects
+	// every session it closes, so this keeps a closed session from coming
+	// back once its tombstone expired or a restart forgot it (DuckDB clients
+	// keep heartbeating while attached). It also renews the engine lease.
+	v, err, _ := m.adoptions.Do(route.SessionID, func() (any, error) {
+		at := m.now()
+		return at, m.backend.Heartbeat(context.Background(), target.Endpoint, route.BackendConnID)
+	})
+	if err != nil {
+		var ee *upstream.EngineError
+		if errors.As(err, &ee) && upstream.IsSessionGone(ee.Response.Message) {
+			c := Closed{Reason: "the engine no longer knows this connection", ClosedAt: m.now()}
+			m.mu.Lock()
+			if m.sessions[route.SessionID] == nil {
+				m.tombstones[route.SessionID] = tombstone{Closed: c, user: route.User}
+			}
+			m.mu.Unlock()
+			return nil, &c, nil
+		}
+		m.log.Warn("cannot confirm a session with its engine", "session", route.SessionID, "engine", engineID, "err", err)
+		return nil, &Closed{Reason: "engine " + engineID + " is not reachable, try again shortly",
+			Transient: true, ClosedAt: m.now()}, nil
+	}
+	confirmedAt := v.(time.Time)
 	now := m.now()
 	key := target.Key
 	if key.ShareLevel == engine.ShareConnection && key.Owner == "" {
@@ -330,16 +360,19 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	}
 	s.lastSeen.Store(now.UnixNano())
 	s.lastActive.Store(now.UnixNano())
-	// When the engine last saw this connection is unknown (the gateway was
-	// away): the next reap sends a keep-alive unless a request does first.
-	s.lastBackend.Store(0)
+	s.lastBackend.Store(confirmedAt.UnixNano()) // the confirming heartbeat renewed the engine lease
+	// Attach to the engine before the session becomes visible: a close right
+	// after (engine gone, admin) detaches it, which must not come first.
+	m.engines.AttachAdopted(s.EngineID, s.ID, s.User)
 	m.mu.Lock()
 	if existing := m.sessions[s.ID]; existing != nil { // lost a race with a concurrent adoption
 		m.mu.Unlock()
+		m.engines.DetachSession(s.EngineID)
 		return existing, nil, nil
 	}
 	if t, dead := m.tombstones[s.ID]; dead {
 		m.mu.Unlock()
+		m.engines.DetachSession(s.EngineID)
 		c := t.Closed
 		return nil, &c, nil
 	}
@@ -347,7 +380,6 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	m.perUser[s.User]++
 	m.total++
 	m.mu.Unlock()
-	m.engines.AttachAdopted(s.EngineID, s.ID, s.User)
 	m.metricOpened(s)
 	m.log.Info("session adopted", "session", s.ID, "user", s.User, "engine", s.EngineID)
 	return s, nil, nil
@@ -497,8 +529,10 @@ func (m *Manager) ClosedByClient(s *Session) {
 }
 
 // ClosedByBackend records that the engine no longer knows the connection.
+// The DISCONNECT is best effort: should the engine still have the
+// connection after all, it is not left behind.
 func (m *Manager) ClosedByBackend(s *Session, msg string) {
-	m.close(s, "backend closed the connection: "+msg, CloseMode{Force: true}, nil)
+	m.close(s, "backend closed the connection: "+msg, CloseMode{Force: true, Disconnect: true}, nil)
 }
 
 // EngineGone implements engine.SessionCloser.

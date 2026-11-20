@@ -79,6 +79,11 @@ type UpstreamConfig struct {
 	// ControlTimeout bounds requests the gateway sends on its own
 	// (DISCONNECT, CANCEL on behalf of a closed session).
 	ControlTimeout Duration `json:"controlTimeout,omitempty"`
+	// HandshakeTimeout bounds the handshake with an engine (the
+	// CONNECTION_REQUEST of a client), which a healthy engine answers at
+	// once. It is independent of the client: a client that gives up does
+	// not leave a half-created backend connection behind.
+	HandshakeTimeout Duration `json:"handshakeTimeout,omitempty"`
 	// The engine's HTTP server (cpp-httplib) aborts a connection when the
 	// peer stalls for 5s and rejects bodies over 100 MiB. Like nginx, the
 	// gateway therefore buffers messages in memory so that slow clients never
@@ -454,6 +459,7 @@ func (c *Config) ApplyDefaults() {
 	setInt(&u.MaxIdleConnsPerEngine, 64)
 	setDur(&u.IdleConnTimeout, 90*time.Second)
 	setDur(&u.ControlTimeout, 10*time.Second)
+	setDur(&u.HandshakeTimeout, 30*time.Second)
 	if u.MaxBufferedRequestBytes == 0 {
 		u.MaxBufferedRequestBytes = 100 << 20
 	}

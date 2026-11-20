@@ -121,9 +121,12 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
    * offen: weiter;
    * Tombstone, also vom Gateway geschlossen: präziser Fehler, z. B. „quackmux: session closed: idle timeout
      (6h0m0s) – DETACH and ATTACH again“;
-   * unbekannt: adoptieren, wenn die Engine existiert. Ist die wiedergefundene Engine gerade nicht ready, folgt
-     ein vorübergehender Fehler ohne Invalidierung. Fehlt die Engine ganz, gibt es einen `must_invalidate`-Fehler
-     „engine no longer exists“.
+   * unbekannt: adoptieren, wenn die Engine existiert und die Backend-Verbindung noch kennt. Das prüft das
+     Gateway einmal per HEARTBEAT an die Engine, was zugleich die Engine-Lease erneuert. Weil das Gateway jede
+     Session, die es schließt, bei der Engine abmeldet, kommen geschlossene Sessions so auch nach Ablauf ihres
+     Tombstones oder nach einem Neustart nicht zurück (DuckDB-Clients senden weiter Heartbeats). Ist die
+     wiedergefundene Engine gerade nicht ready oder nicht erreichbar, folgt ein vorübergehender Fehler ohne
+     Invalidierung. Fehlt die Engine ganz, gibt es einen `must_invalidate`-Fehler „engine no longer exists“.
 4. Aktivität verbuchen:
    * `lastSeen`: jede Nachricht.
    * `lastActive`: alle außer `HEARTBEAT_REQUEST`.
@@ -207,8 +210,11 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   quackmux.io/instance=<instance>`. Key, Profil und Spec-Hash rekonstruiert es aus Labels und Annotationen, das
   Token aus dem Pod-Secret.
 * **Session-Adoption:** Die Clients senden spätestens nach `timeout/3 · 1,2` einen Heartbeat. Die versiegelte ID
-  enthält alles, um die Session neu anzulegen. Während `engine.recoveryGrace` (Default `maxHeartbeatTimeout/2 +
-  30 s`) werden wiedergefundene Engines nicht als idle beendet.
+  enthält alles, um die Session neu anzulegen; vorher bestätigt die Engine, dass sie die Verbindung noch hat
+  (siehe 4.3). Während `engine.recoveryGrace` (Default `maxHeartbeatTimeout/2 + 30 s`) werden wiedergefundene
+  Engines nicht als idle beendet. Findet das Gateway mehrere READY-Engines für denselben Key (eine Engine, die
+  ihren Startup-Timeout verpasst hat, neben ihrem Ersatz), nimmt es für neue Sessions immer die älteste und
+  drained die anderen.
 * **HA (optional, `ha.enabled`):** Mehrere Replikas machen Leader-Election über eine Kubernetes-`Lease`. Nur der
   Leader ist `ready` und bekommt über den Service Traffic. Verliert er die Lease, beendet sich der Prozess und
   startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Laufende Requests während des

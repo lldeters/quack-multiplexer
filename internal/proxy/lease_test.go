@@ -69,8 +69,9 @@ func TestKeepaliveCountsFromRequestStart(t *testing.T) {
 	mustType(t, h.query(c, "SELECT 1"), wire.TypePrepareResponse)
 }
 
-// After a gateway restart, the engine lease of an adopted session is renewed
-// at the next reap, even if the client only heartbeats.
+// After a gateway restart, adopting a session confirms its connection with
+// the engine, which also renews the engine lease at once (even if the client
+// only heartbeats).
 func TestAdoptedSessionRenewsEngineLeaseAtOnce(t *testing.T) {
 	h1 := newHarness(t, "", nil)
 	c := h1.connect("tok?user=alice", nil)
@@ -83,11 +84,18 @@ func TestAdoptedSessionRenewsEngineLeaseAtOnce(t *testing.T) {
 	h2 := newHarness(t, "", prov2)
 	srv.Now = h2.clock.Now
 	h2.clock.Advance(30 * time.Minute) // the gateway was away for a while
-	mustType(t, h2.heartbeat(c), wire.TypeSuccessResponse)
 	before := srv.CountType(wire.TypeHeartbeatRequest)
-	h2.sessions.Reap()
-	h2.sessions.Wait()
-	if after := srv.CountType(wire.TypeHeartbeatRequest); after == before {
-		t.Fatal("no engine heartbeat for an adopted session at the next reap")
+	mustType(t, h2.heartbeat(c), wire.TypeSuccessResponse)
+	if after := srv.CountType(wire.TypeHeartbeatRequest); after != before+1 {
+		t.Fatalf("adoption sent %d engine heartbeats, want 1", after-before)
 	}
+	// 59 more minutes of client heartbeats only: the engine lease, renewed
+	// by the adoption, is kept alive by keep-alives.
+	for i := 0; i < 59; i++ {
+		h2.clock.Advance(time.Minute)
+		mustType(t, h2.heartbeat(c), wire.TypeSuccessResponse)
+		h2.sessions.Reap()
+		h2.sessions.Wait()
+	}
+	mustType(t, h2.query(c, "SELECT 1"), wire.TypePrepareResponse)
 }

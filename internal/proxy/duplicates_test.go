@@ -28,7 +28,7 @@ func TestRestartWithDuplicateEnginesConverges(t *testing.T) {
 		slow = v.ID
 	}
 	time.Sleep(time.Second) // the slow engine becomes ready after all
-	prov.StartDelay = 0
+	prov.SetStartDelay(0)
 	replacement := h1.sessionEngine(h1.connect("tok?user=alice", nil))
 
 	prov2 := fake.New()

@@ -65,6 +65,10 @@ server:
     # CANCEL on behalf of a closed session, heartbeats to the engine,
     # health probes).
     controlTimeout: 10s
+    # Timeout of the handshake with an engine (a client's ATTACH once the
+    # engine is ready). It does not depend on the client, so a client that
+    # gives up leaves no half-created engine connection behind.
+    handshakeTimeout: 30s
     # The engine's HTTP server aborts a connection whose peer stalls for 5s.
     # The gateway therefore buffers messages completely in memory, so that a
     # slow client never stalls an engine: requests up to

@@ -303,9 +303,14 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, br *bufi
 	backendReq.HeartbeatTimeoutSeconds = uint64(sc.BackendHeartbeatTimeout.Duration / time.Second)
 	msg := backendReq.Encode(wire.Header{Type: wire.TypeConnectionRequest, ClientQueryID: h.ClientQueryID})
 
+	// The handshake has a deadline of its own and does not end with the
+	// client: a client that gives up after the engine created the connection
+	// would otherwise leave it behind (the stock server never expires it).
+	hsCtx, hsCancel := context.WithTimeout(context.WithoutCancel(r.Context()), g.cfg.Server.Upstream.HandshakeTimeout.Duration)
 	g.engines.BeginRequest(lease.ID)
-	respBody, err := g.up.RoundTrip(r.Context(), lease.Endpoint, msg)
+	respBody, err := g.up.RoundTrip(hsCtx, lease.Endpoint, msg)
 	g.engines.EndRequest(lease.ID)
+	hsCancel()
 	if err != nil {
 		if r.Context().Err() != nil {
 			return "client_gone"
@@ -316,6 +321,10 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, br *bufi
 	rh, _, err := wire.ParseHeader(respBody)
 	if err != nil {
 		return g.connectFailed(w, "engine", "quackmux: undecodable engine response: "+err.Error(), wire.ExceptionConnection)
+	}
+	if rh.Type == wire.TypeConnectionResponse && rh.ConnectionID != "" && r.Context().Err() != nil {
+		g.disconnectBackend(lease.Endpoint, rh.ConnectionID)
+		return "client_gone"
 	}
 	if rh.Type == wire.TypeErrorResponse {
 		if e, derr := wire.DecodeErrorResponse(respBody); derr == nil {
@@ -335,6 +344,7 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, br *bufi
 	}
 	_, cr, err := wire.DecodeConnectionResponse(respBody)
 	if err != nil {
+		g.disconnectBackend(lease.Endpoint, rh.ConnectionID)
 		return g.connectFailed(w, "engine", "quackmux: undecodable engine response: "+err.Error(), wire.ExceptionConnection)
 	}
 	if cr.QuackVersion != wire.ProtocolVersion || cr.HeartbeatTimeoutSeconds == 0 {
@@ -343,6 +353,11 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, br *bufi
 			cr.QuackVersion, cr.HeartbeatTimeoutSeconds, wire.ProtocolVersion), wire.ExceptionConnection)
 	}
 
+	// Attach the session to the engine before it becomes visible: a close
+	// right after Open (admin, engine gone) detaches it, which must not come
+	// first.
+	lease.Commit()
+	committed = true
 	_, gatewayID, err := resv.Open(session.OpenParams{
 		SessionID: sessionID, User: id.User, Groups: id.Groups, EngineID: lease.ID, EngineKey: lease.Key,
 		BackendConnID: rh.ConnectionID, HeartbeatTimeout: hb,
@@ -350,11 +365,10 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, br *bufi
 		RemoteAddr: r.RemoteAddr,
 	})
 	if err != nil {
+		g.engines.DetachSession(lease.ID)
 		g.disconnectBackend(lease.Endpoint, rh.ConnectionID)
 		return g.connectFailed(w, "internal", "quackmux: "+err.Error(), wire.ExceptionConnection)
 	}
-	lease.Commit()
-	committed = true
 	// The client gets the gateway id and the lease the gateway enforces.
 	cr.HeartbeatTimeoutSeconds = uint64(hb / time.Second)
 	writeBody(w, cr.Encode(wire.Header{Type: wire.TypeConnectionResponse, ConnectionID: gatewayID, ClientQueryID: rh.ClientQueryID}))
