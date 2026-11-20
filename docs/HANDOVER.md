@@ -1,4 +1,4 @@
-# Übergabe: quackmux weiterbauen (Stand 2026-11-19)
+# Übergabe: quackmux weiterbauen (Stand 2026-11-20)
 
 Diese Datei ist der Übergabeprompt für eine neue Claude-Code-Session in der Cloud. Sie ist vollständig und
 braucht keinen weiteren Kontext.
@@ -18,32 +18,42 @@ Kyuubi) auf Engine-Pods mit DuckDB und `quack_serve`. Diese Pods startet und bee
 
 **Zuerst lesen:** [README.md](../README.md), [docs/design.md](design.md), [docs/protocol.md](protocol.md),
 [docs/research-notes.md](research-notes.md). Die verifizierten Fakten, auf denen das Design beruht, stehen in
-den Research-Notes.
+den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified against the released DuckDB v2.0.0“.
 
 ## Stand
 
-**Fertig:**
-* Alle Pakete kompilieren für windows/386, linux/amd64 und linux/arm64.
-* `go vet ./...` und `gofmt -l .` sind sauber, `go test ./... -count=1` ist komplett grün.
-* Getestet wurde nur unter Windows (32-bit Go). Der Race-Detector lief noch nie.
+**Verifiziert am 2026-11-20 unter linux/amd64** (Cloud-Sandbox mit Docker und kind):
+
+* `go build ./...`, `go vet ./...` und `gofmt -l .` sind sauber. `go test ./... -count=1` und
+  `go test -race ./...` sind grün; drei Race-Läufe hintereinander ohne Befund.
+* Gegen das veröffentlichte DuckDB v2.0.0 (`d54cbbe3df`, quack `f96420ed46`):
+  * Engine- und Gateway-Image gebaut (`make docker-engine docker-gateway`), der Selbsttest des Engine-Images
+    besteht.
+  * `test/e2e/compose/run.sh`: alle 8 Szenarien grün.
+  * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle 4 Szenarien grün, auch der
+    Gateway-Neustart mit Session-Adoption.
+  * Wire-Codec: 400 mitgeschnittene Nachrichten (Client ↔ Server, Client ↔ Gateway, Gateway ↔ Engine) dekodieren
+    und kodieren byte-genau (`internal/wire/testdata/duckdb-v2.0.0`, `realtraffic_test.go`).
+  * Der `process`-Provider läuft mit der echten CLI.
+* Adversariales Gesamt-Review aus fünf Blickwinkeln (Protokoll, Nebenläufigkeit, Fehlerfälle, Security,
+  Kubernetes): 36 Funde nach Deduplizierung. Jeder Fund wurde mit einem PoC-Test (meist gegen den Code, teils
+  gegen echtes DuckDB) gegengeprüft. Alle sind behoben oder als Grenze dokumentiert, jeder Fix hat einen
+  Regressionstest. Kurzfassung unten.
 
 | Bereich | Pfad | Status |
 |---|---|---|
-| Wire-Codec (Header, Handshake, Fehler, Kontrollnachrichten) | `internal/wire` | fertig. Golden-Byte-Tests sind aus dem DuckDB-Serializer-Quellcode abgeleitet und nicht gegen echtes DuckDB geprüft. |
-| Proxy (Handshake, Routing, Header-Rewrite, Puffern/Streaming, lokale Heartbeats/DISCONNECT, Audit) | `internal/proxy` | fertig, ca. 30 Integrationstests gegen den Fake-Server `internal/quacktest` |
+| Wire-Codec (Header, Handshake, Fehler, Kontrollnachrichten) | `internal/wire` | fertig, gegen Mitschnitte von DuckDB v2.0.0 geprüft |
+| Proxy (Handshake, Routing, Header-Rewrite, Puffern/Streaming, lokale Heartbeats/DISCONNECT, Audit) | `internal/proxy` | fertig, Integrationstests gegen den Fake-Server `internal/quacktest`, E2E gegen DuckDB v2.0.0 |
 | Sessions (versiegelte IDs ≤ 140 Zeichen, Timeouts, Lease, Keepalive, Adoption, Tombstones) | `internal/session` | fertig |
 | Engine-Manager (Single-Flight-Start, Pools, Warm-Pool, Drain, Spec-Drift, Recovery-Grace, permanente Static-Engines) | `internal/engine` | fertig |
-| Provider: Kubernetes, process (lokal), static, fake | `internal/engine/*` | fertig mit Unit-Tests (k8s über die fake clientset) |
+| Provider: Kubernetes, process (lokal), static, fake | `internal/engine/*` | fertig; Kubernetes in kind, process mit echter CLI geprüft |
 | Auth: static (SHA-256-Token-Datei, Hot-Reload, SIGHUP), jwt (HS/RS/ES/EdDSA, JWKS), none | `internal/auth` | fertig |
 | Policy (Optionen, Defaults, Overrides, Rechte), Config (YAML-Schema, Defaults, Validierung) | `internal/policy`, `internal/config` | fertig |
-| Admin-API, Metriken, Leader-Election | `internal/admin`, `internal/metrics`, `internal/ha` | fertig |
+| Admin-API, Metriken, Leader-Election | `internal/admin`, `internal/metrics`, `internal/ha` | fertig; Leader-Election nur mit der fake clientset getestet |
 | Binary | `cmd/quackmux` (`serve`, `validate`, `token`, `hash-token`, `version`) | fertig |
-| Engine-Image (tini, FIFO-Entrypoint, quack/httpfs vorinstalliert), Gateway-Image | `images/engine`, `Dockerfile` | geschrieben, **nie gebaut** |
-| Kustomize (base, overlays `dev` und `ha`), Beispielkonfigurationen | `deploy/kubernetes`, `examples` | geschrieben, Konfigurationen per `config.Parse` validiert, **nie deployt** |
-| E2E-Tests (Docker Compose, kind) | `test/e2e` | geschrieben, **nie ausgeführt** |
-
-In der lokalen Umgebung konnten weder Docker noch DuckDB-Binaries laufen. Alle Tests nutzen den
-protokolltreuen Fake-Server.
+| Engine-Image (tini, FIFO-Entrypoint, quack/httpfs vorinstalliert), Gateway-Image | `images/engine`, `Dockerfile` | gebaut und mit DuckDB v2.0.0 geprüft |
+| Kustomize (base, overlays `dev` und `ha`), Beispielkonfigurationen | `deploy/kubernetes`, `examples` | `dev` in kind deployt und getestet; `base` und `ha` per `kubectl apply --dry-run=server` geprüft, **`ha` nie wirklich ausgerollt** |
+| E2E-Tests (Docker Compose, kind) | `test/e2e` | ausgeführt und grün (siehe oben) |
 
 ## Harte Randbedingungen
 
@@ -51,73 +61,121 @@ Diese Regeln nicht brechen:
 
 1. **Gateway-Connection-IDs ≤ 156 Bytes.** Sonst wirft der DuckDB-Client beim INSERT eine `InternalException` und
    invalidiert seine gesamte Datenbank (`quack_send_data.cpp:99`). `session.MaxIDLength` ist auf 140 gesetzt,
-   ein Test sichert das ab.
+   ein Test sichert das ab. Beobachtet wurden 88 bis 90 Zeichen.
 2. **Fehler immer als HTTP 200 mit `ERROR_RESPONSE`.** Ein schon gelesener Request bekommt immer eine Antwort.
    Ein Verbindungsabbruch ohne Antwort kann libcurl einen POST wiederholen lassen, dann läuft eine Query doppelt.
+   Das gilt auch beim Herunterfahren (`Gateway.AbortQueries`).
 3. **Routing nur über die `connection_id` im Header**, nie über TCP-Verbindungen. Clients schicken bis zu 256
    parallele FETCH-Long-Polls pro Session.
 4. **Keine kurzen Timeouts auf PREPARE, FETCH oder SEND_DATA.** Sie blockieren serverseitig beliebig lange, der
-   Client wartet bis zu 24 h.
+   Client wartet bis zu 24 h. Kurze Deadlines gelten nur vor der Authentifizierung
+   (`server.readHeaderTimeout`) und für den Handshake zur Engine (`server.upstream.handshakeTimeout`).
 5. **Puffern statt durchstreamen** (bis 100 MiB Request, 64 MiB Response, Budget 1 GiB). Die Engine bricht
    Verbindungen ab, die 5 s stocken.
 6. **Client-Heartbeats und DISCONNECT beantwortet das Gateway lokal.** Die Engine-Lease (1 h) erhält es selbst
-   per Keepalive.
+   per Keepalive, auch während langer Requests.
 7. **Fremde oder unbekannte Connection-IDs nie weiterleiten.** Nur versiegelte IDs (AES-GCM) werden geroutet.
 8. Doku für Nutzer und Betreiber auf Deutsch, Code-Kommentare auf Englisch.
 
+## Was das Review geändert hat
+
+Die Commits auf dem Branch erklären jeden Fix im Detail; hier die Übersicht:
+
+* **Engine-Lease:** Das Gateway hält die Lease der Backend-Verbindung auch während langer Requests am Leben
+  (vorher lief sie nach 1 h ab, und die Session war tot).
+* **Engine-Lebenszyklus:** Nach einem Neustart wiedergefundene Engines starten nicht neu in den Startup-Timeout,
+  gescheiterte Launches bleiben nicht ewig TERMINATING, der Warm-Pool füllt mit Backoff nach. Gibt es nach einem
+  Neustart zwei Engines für einen Schlüssel, bekommen neue Sessions deterministisch die ältere, die andere geht
+  auf DRAINING.
+* **Sessions:** Eine adoptierte Session gilt erst nach einem bestätigenden Heartbeat bei der Engine als
+  übernommen. Vom Gateway geschlossene Sessions kehren nicht als Geister zurück. Backend-Verbindungen werden auch
+  dann mit DISCONNECT geschlossen, wenn der Client mitten im Handshake verschwindet.
+* **Limits:** `limits.maxEnginesPerUser` zählt jede Engine, die ein Benutzer verursacht hat: auch `SERVER`- und
+  `GROUP`-Engines für neue Subdomains, Warm-Claims und geclaimte Warm-Engines nach einem Neustart.
+* **HTTP-Seite:** Nicht authentifizierte Requests haben eine Read-Deadline. Requests mit einem `Origin` außerhalb
+  von `server.allowedOrigins` werden abgelehnt; mit `auth.mode: none` ist standardmäßig kein Origin erlaubt.
+  Fehlerantworten der Engine zählen zum Puffer-Budget. Beim Herunterfahren bekommen wartende Queries eine
+  Fehlerantwort und werden auf der Engine abgebrochen.
+* **Kubernetes:**
+  * Das Init-SQL liegt im Engine-Secret statt in der Pod-Spec.
+  * Literale Env-Werte sind gegen die `$(VAR)`-Expansion des Kubelets escaped.
+  * Engines tolerieren einen verlorenen Node 60 s statt 300 s.
+  * Die NetworkPolicy sperrt den Metadaten-Endpunkt, und Engines erreichen den Admin-Port nicht.
+  * Engine-Container starten nie in place neu.
+  * `QUACKMUX_STOP_TIMEOUT` folgt der Grace Period.
+  * Image und Pull-Policy aus dem `podTemplate` wirken.
+* **Security und Betrieb:**
+  * Die öffentlichen Beispiel-Secrets werden abgelehnt.
+  * Die Admin-API lauscht ohne Token nur auf Loopback, eine leere Token-Datei ist ein Fehler.
+  * Das Audit-Log schwärzt Statements mit Zugangsdaten.
+  * `hash-token` liest von stdin.
+  * Der static-Provider nimmt eine Engine erst nach `failureThreshold` Fehlschlägen aus der Rotation.
+  * `quackmux validate` prüft Provider und Leader-Election ohne Cluster.
+
+## Bekannte Grenzen
+
+1. **Zombie-Backend-Verbindungen nach einem Gateway-Neustart** bei geteilten Engines: Clients, die während der
+   Downtime gestorben sind, werden nie adoptiert. Der Quack-Server räumt Verbindungen nicht selbst auf (Leases
+   laufen nur beim nächsten Zugriff ab). Bis zum Ende der Engine bleiben sie offen; `engine.maxLifetime` begrenzt
+   das.
+2. **Ein PVC im `podTemplate` teilen sich alle Engines eines Profils.** Eine DuckDB-Datei darauf kann nur eine
+   davon schreibend öffnen. Nur für read-only angehängte Daten oder ein Profil mit genau einer Engine geeignet
+   (`deploy/kubernetes/README.md`, „Persistente Daten“).
+3. **HA: Nur der Leader ist ready.** `kubectl rollout status` meldet nie Erfolg. Ein Rollout braucht einen
+   kontrollierten Failover. Die PDB verhindert den Drain des Leader-Nodes. Alles dokumentiert in
+   `deploy/kubernetes/README.md`, „Hochverfügbarkeit“.
+4. **Innerhalb einer Engine sieht jede Session das Init-SQL** (`/proc/1/environ`) und das Engine-Token
+   (`getenv`). Für Zugangsdaten `PROVIDER credential_chain` mit Workload Identity verwenden. `quack_stop(…)`
+   bleibt für jede Session aufrufbar, dagegen hilft nur eine `quack_authorization_function`.
+5. **Die Schwärzung im Audit-Log ist eine Heuristik** (Schlüsselwörter wie `secret`, `passw`, `token`, URLs mit
+   Passwort). Das Audit-Log bleibt vertraulich.
+6. **Spill-Platz** begrenzt nur die Konfiguration (`settings.max_temp_directory_size` plus
+   `resources.limits.ephemeral-storage`); die Beispiele setzen keine Defaults.
+
 ## Nächste Schritte (priorisiert)
 
-1. **Mit echtem DuckDB 2.0 verifizieren.** In der Cloud sind Docker und Downloads hoffentlich erlaubt.
-   * `make docker-engine docker-gateway`, dann `test/e2e/compose/run.sh`. Gefundene Probleme beheben.
-   * Typische Kandidaten:
-     * Entrypoint-Annahmen in `images/engine/entrypoint.sh` (`.read`/`-bail`, `getenv`, Parameternamen von
-       `quack_serve`, SIGTERM-Pfad)
-     * die genauen Fehlertexte, nach denen die E2E-Skripte greppen
-     * die Byte-Layouts in `internal/wire`: mit echtem Traffic gegenprüfen, z. B. mit einem Mitschnitt zwischen
-       DuckDB-Client und Gateway
-   * Danach `test/e2e/kind/setup.sh` und `test.sh`.
-2. **`go test -race ./...`** auf linux/amd64 laufen lassen. Unter windows/386 ging das nicht.
-3. **Adversariales Gesamt-Review** mit getrennten Blickwinkeln:
-   * Protokoll und Client-Kompatibilität
-   * Nebenläufigkeit und Lebenszyklen (Engine-/Session-Manager, Lock-Reihenfolge, Zähler)
-   * Fehlerfälle (Neustart, HA-Failover, Pod-Crash, halbe Launches)
-   * Security und Mandantentrennung
-   * Kubernetes-Provider und Manifeste
-
-   Funde gegenprüfen, dann beheben.
-4. **Bekannte Lücken und Ideen:**
-   * **Zombie-Backend-Verbindungen nach einem Gateway-Neustart** bei geteilten Engines: Clients, die während der
-     Downtime gestorben sind, werden nie adoptiert. Abhilfe wäre `quack_active_connections()` abzufragen. Das
-     verlangt das Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`. Bis dahin hilft
-     `engine.maxLifetime`.
-   * Eine Warm-Engine, die geclaimt und nach einem Neustart wiedergefunden wurde, hat einen leeren `User`.
-     Per-User-Engine-Limits zählen sie dann nicht.
-   * Optional:
-     * Query-/Request-Timeout (CANCEL nach X)
-     * Helm-Chart
-     * Härtung geteilter Engines (`quack_authorization_function`-Makro gegen `quack_stop` und Co.)
-     * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)
-5. Danach: README und Doku nachziehen, Release-Workflow (GitHub Actions: build, vet, test, race, Images)
-   ergänzen.
+1. **CI und Release:** GitHub Actions mit build, vet, gofmt, test, race und den Images, optional dem Compose-E2E.
+2. **HA im Cluster erproben:** Overlay `ha` in kind ausrollen, Failover mit angehängtem Client (Leader löschen,
+   Query weiterlaufen lassen) und den dokumentierten Rollout-Ablauf durchspielen.
+3. **PVCs pro Engine-Schlüssel** (etwa pro Benutzer): ein Volume-Template je Profil, das Gateway legt PVCs pro
+   Schlüssel an. Eine Ersatz-Engine darf erst starten, wenn die alte die Datei freigegeben hat.
+4. **HA ohne „nur der Leader ist ready“:** Follower werden ready und leiten an den Leader weiter, oder ein
+   Leader-Label steuert den Service. Dann funktionieren `rollout status` und die PDB normal.
+5. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
+   Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`.
+6. **Engine-Image:** ein Haken für SQL nach dem Serverstart (etwa `SET enable_external_access = false`) und eine
+   Vorlage für `quack_authorization_function` gegen `quack_stop` und Co.
+7. Optional:
+   * Query-/Request-Timeout (CANCEL nach X)
+   * Helm-Chart
+   * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)
+   * Spill-Defaults in den Beispielprofilen
 
 ## Arbeiten im Repo
 
 ```bash
 go build ./... && go vet ./... && go test ./... -count=1
+go test -race ./...
 go run ./cmd/quackmux validate -config examples/config.local.yaml
 make help   # oder Makefile ansehen: build, test, docker-engine, docker-gateway, e2e-compose, kind-up/test/down
 ```
 
-* Die Tests brauchen weder Docker noch DuckDB. `internal/proxy/harness_test.go` baut ein komplettes Gateway mit
-  Fake-Engines und Fake-Uhr.
-* Während der Entwicklung lag der Quellcode von duckdb-quack unter
-  `https://github.com/duckdb/duckdb-quack` (Commit `02c9d4a`). Der Serializer von DuckDB liegt in
-  `duckdb/duckdb@181615215e5e/src/common/serializer/`.
+* Die Unit- und Integrationstests brauchen weder Docker noch DuckDB. `internal/proxy/harness_test.go` baut ein
+  komplettes Gateway mit Fake-Engines und Fake-Uhr.
+* E2E: `test/e2e/compose/run.sh` und `test/e2e/kind/setup.sh` plus `test.sh`; Voraussetzungen und Variablen in
+  [test/e2e/README.md](../test/e2e/README.md).
+  * Hinter einem Proxy oder mit Mirrors reicht `DOCKER_BUILD_FLAGS` Flags an beide `docker build` durch (etwa
+    `--network host --build-arg GOPROXY=…`). Das Engine-Image nimmt `DUCKDB_EXTENSION_REPOSITORY` als Build-Arg.
+  * Auf Hosts mit cgroup v1 braucht kind eine eigene Clusterkonfiguration (`KIND_CONFIG`, siehe die
+    Fehlersuche in test/e2e/README.md).
+* Der Quellcode von duckdb-quack liegt unter `https://github.com/duckdb/duckdb-quack`. DuckDB v2.0.0 enthält
+  `f96420ed46`; recherchiert wurde an `02c9d4a`, die Nachrichten sind identisch. Der Serializer von DuckDB liegt
+  in `duckdb/duckdb@181615215e5e/src/common/serializer/`.
 
 ---
 
-**Prompt für die Cloud-Session** (zum Einfügen):
+**Prompt für die nächste Cloud-Session** (zum Einfügen):
 
 > Lies `docs/HANDOVER.md` und die dort verlinkten Dokumente. Arbeite dann die „Nächsten Schritte“ in der
-> angegebenen Reihenfolge ab und beginne mit der Verifikation gegen echtes DuckDB 2.0 (Docker-Images bauen,
-> `test/e2e/compose/run.sh`). Halte dich an die „Harten Randbedingungen“. Antworte mir auf Deutsch.
+> angegebenen Reihenfolge ab, beginnend mit CI und Release. Halte dich strikt an die „Harten Randbedingungen“.
+> Committe in kleinen Schritten auf einem Feature-Branch und antworte mir auf Deutsch.
