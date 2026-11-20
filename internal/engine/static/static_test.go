@@ -312,6 +312,7 @@ func TestProbeTransitions(t *testing.T) {
 		config.StaticEngine{Name: "a", URL: a.URL, Token: "ta", ShareLevel: "SERVER"},
 		config.StaticEngine{Name: "b", URL: b.URL + "/", Token: "tb", ShareLevel: "USER", Owner: "bob"},
 	)
+	cfg.Provider.Static.FailureThreshold = 1 // every probe decides
 	p, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -392,6 +393,7 @@ func TestProbeTimeoutAndUnreachable(t *testing.T) {
 		config.StaticEngine{Name: "slow", URL: slow.URL, Token: "t", ShareLevel: "SERVER"},
 		config.StaticEngine{Name: "dead", URL: dead, Token: "t", ShareLevel: "SERVER", Subdomain: "other"},
 	)
+	cfg.Provider.Static.FailureThreshold = 1
 	p, err := New(cfg, nil, WithProbeTimeout(100*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
@@ -575,3 +577,36 @@ func TestCoverageWarnings(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
+
+// A single failed probe does not take an engine (and every session on it)
+// out of rotation: only provider.static.failureThreshold failures in a row do.
+func TestProbeFailureThreshold(t *testing.T) {
+	cfg := baseConfig(t, config.StaticEngine{Name: "a", URL: "http://127.0.0.1:1", Token: "ta", ShareLevel: "SERVER"})
+	p, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := p.engines[0]
+	fail := errors.New("GET /: connection refused")
+	apply := func(err error) (engine.Phase, bool) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		ev, sent := p.applyLocked(e, err)
+		return ev.Phase, sent
+	}
+	if ph, _ := apply(nil); ph != engine.PhaseReady {
+		t.Fatalf("healthy probe: %s", ph)
+	}
+	for i := 0; i < 2; i++ { // a hiccup
+		if _, sent := apply(fail); sent || e.inst.Phase != engine.PhaseReady {
+			t.Fatalf("failed probe %d took the engine out of rotation (%s)", i+1, e.inst.Phase)
+		}
+	}
+	apply(nil) // healthy again: the count starts over
+	for i := 0; i < 2; i++ {
+		apply(fail)
+	}
+	if ph, sent := apply(fail); !sent || ph != engine.PhaseFailed {
+		t.Fatalf("third failed probe in a row: %s (sent %v)", ph, sent)
+	}
+}

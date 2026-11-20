@@ -302,6 +302,11 @@ type StaticProviderConfig struct {
 	Engines []StaticEngine `json:"engines"`
 	// HealthInterval for GET / probes (default 10s).
 	HealthInterval Duration `json:"healthInterval,omitempty"`
+	// FailureThreshold is the number of probes in a row that must fail
+	// before an engine is taken out of rotation (default 3). Its sessions
+	// are closed then, so a single lost probe (a busy engine that sheds a
+	// connection) must not count.
+	FailureThreshold int `json:"failureThreshold,omitempty"`
 }
 
 // StaticEngine is a pre-existing Quack server.
@@ -563,6 +568,7 @@ func (c *Config) ApplyDefaults() {
 	setInt(&pr.PortRangeStart, 19500)
 	setInt(&pr.PortRangeEnd, 19999)
 	setDur(&p.Static.HealthInterval, 10*time.Second)
+	setInt(&p.Static.FailureThreshold, 3)
 
 	if len(c.Profiles) == 0 {
 		c.Profiles = map[string]Profile{DefaultProfileName: {}}

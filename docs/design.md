@@ -253,8 +253,9 @@ Weitere Provider:
 
 * `process` startet lokale DuckDB-CLI-Prozesse für die Entwicklung.
 * `static` routet auf extern betriebene Quack-Server. Diese Engines sind *permanent*: Das Gateway beendet und
-  drained sie nie. Ein fehlgeschlagener Health-Probe nimmt sie aus dem Verkehr, ein erfolgreicher holt sie
-  zurück. `CONNECTION` ist mit `static` nicht möglich.
+  drained sie nie. Schlagen `provider.static.failureThreshold` Health-Probes in Folge fehl (Default 3), nimmt
+  das Gateway sie aus dem Verkehr und schließt ihre Sessions; ein erfolgreicher Probe holt sie zurück.
+  `CONNECTION` ist mit `static` nicht möglich.
 
 ## 8. Authentifizierung, Optionen, Policy
 

@@ -88,6 +88,7 @@ func WithHTTPClient(c *http.Client) Option {
 type Provider struct {
 	log      *slog.Logger
 	interval time.Duration
+	failures int // failed probes in a row that take an engine out of rotation
 	timeout  time.Duration
 	client   *http.Client
 
@@ -106,6 +107,7 @@ type Provider struct {
 type entry struct {
 	probeURL string
 	inst     engine.Instance
+	failures int // probes failed in a row
 }
 
 var _ engine.Provider = (*Provider)(nil)
@@ -125,12 +127,16 @@ func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Provider, error
 	p := &Provider{
 		log:      log.With("component", "static-engines"),
 		interval: sc.HealthInterval.Duration,
+		failures: sc.FailureThreshold,
 		timeout:  DefaultProbeTimeout,
 		synced:   make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 	if p.interval <= 0 {
 		p.interval = DefaultHealthInterval
+	}
+	if p.failures <= 0 {
+		p.failures = 1
 	}
 	for _, o := range opts {
 		o(p)
@@ -424,6 +430,7 @@ func (p *Provider) probeRound(ctx context.Context) ([]engine.Instance, bool) {
 func (p *Provider) applyLocked(e *entry, probeErr error) (engine.Instance, bool) {
 	prev := e.inst.Phase
 	if probeErr == nil {
+		e.failures = 0
 		e.inst.Phase, e.inst.Message = engine.PhaseReady, MessageHealthy
 		switch prev {
 		case engine.PhaseStarting:
@@ -432,6 +439,14 @@ func (p *Provider) applyLocked(e *entry, probeErr error) (engine.Instance, bool)
 			p.log.Info("static engine recovered", "engine", e.inst.ID, "endpoint", e.inst.Endpoint)
 		}
 		return e.inst, true // see the package documentation
+	}
+	e.failures++
+	if prev != engine.PhaseFailed && e.failures < p.failures {
+		// Not yet: a single failed probe does not take the engine (and all
+		// its sessions) out of rotation.
+		p.log.Warn("static engine missed a health check", "engine", e.inst.ID, "endpoint", e.inst.Endpoint,
+			"failures", e.failures, "threshold", p.failures, "err", probeErr)
+		return engine.Instance{}, false
 	}
 	e.inst.Phase, e.inst.Message = engine.PhaseFailed, "health check failed: "+probeErr.Error()
 	if prev == engine.PhaseFailed {

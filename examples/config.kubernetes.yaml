@@ -321,6 +321,9 @@ provider:
     #     poolIndex: 0
     # Period of the GET / health probes.
     healthInterval: 10s
+    # Probes that must fail in a row before an engine (and every session on
+    # it) is taken out of rotation.
+    failureThreshold: 3
 
 # -----------------------------------------------------------------------------
 # Engine profiles: what an engine looks like. Names must not be empty or

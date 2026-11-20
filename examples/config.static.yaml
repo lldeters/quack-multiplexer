@@ -50,6 +50,9 @@ provider:
   static:
     # Period of the GET / health probes.
     healthInterval: 10s
+    # Probes that must fail in a row before an engine (and every session on
+    # it) is taken out of rotation.
+    failureThreshold: 3
     engines:
       # One engine for all users (share level SERVER).
       - name: shared
