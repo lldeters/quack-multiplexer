@@ -448,7 +448,12 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	if r.ContentLength >= 0 {
 		contentLength = r.ContentLength - int64(hlen) + int64(len(newHeader))
 	}
-	var in *countingReader
+	// The transport may still read the body after Do has returned (it probes
+	// for bytes beyond the content length in its own goroutine), so the body
+	// must never reach past the client's message and the byte count is
+	// atomic.
+	var in io.Reader
+	var sent func() int64
 	if contentLength >= 0 && uc.MaxBufferedRequestBytes > 0 && contentLength <= uc.MaxBufferedRequestBytes && g.buffers.TryAcquire(contentLength) {
 		// Read the whole message before talking to the engine, so that a slow
 		// client cannot stall the engine's socket (it gives up after 5s).
@@ -460,9 +465,15 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 			return "client_error"
 		}
 		defer g.buffers.Release(contentLength)
-		in = &countingReader{r: bytes.NewReader(buf)}
+		in = bytes.NewReader(buf)
+		sent = func() int64 { return contentLength }
 	} else {
-		in = &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), br)}
+		var rest io.Reader = br
+		if r.ContentLength >= 0 {
+			rest = io.LimitReader(br, r.ContentLength-int64(hlen))
+		}
+		cr := &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest)}
+		in, sent = cr, cr.n.Load
 	}
 	upReq, err := upstream.NewRequest(r.Context(), target.Endpoint, in, contentLength)
 	if err != nil {
@@ -471,7 +482,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	}
 	resp, err := g.up.HTTP.Do(upReq)
 	if g.met != nil {
-		g.met.Bytes.WithLabelValues("in").Add(float64(in.n))
+		g.met.Bytes.WithLabelValues("in").Add(float64(sent()))
 	}
 	if err != nil {
 		if r.Context().Err() != nil {
@@ -578,13 +589,15 @@ func (g *Gateway) auditQuery(br *bufio.Reader, hlen int, h wire.Header, sess *se
 	g.audit.Info("query", attrs...)
 }
 
+// countingReader counts the bytes read through it. The count is atomic: the
+// HTTP transport reads in its own goroutine.
 type countingReader struct {
 	r io.Reader
-	n int64
+	n atomic.Int64
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }

@@ -175,9 +175,11 @@ func noEvent(t *testing.T, p *Provider, d time.Duration, match func(engine.Insta
 	}
 }
 
+// waitFor polls cond until it holds. The deadline is generous: under the
+// race detector and a loaded machine a few goroutine hops can take seconds.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
