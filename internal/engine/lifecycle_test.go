@@ -22,7 +22,9 @@ type testClock struct {
 	now time.Time
 }
 
-func newTestClock() *testClock { return &testClock{now: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)} }
+func newTestClock() *testClock {
+	return &testClock{now: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
+}
 
 func (c *testClock) Now() time.Time {
 	c.mu.Lock()

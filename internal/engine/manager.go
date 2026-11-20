@@ -518,25 +518,38 @@ func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config
 }
 
 // findLocked returns the engine that serves key: a READY or STARTING engine
-// with exactly that key and a current spec. Draining engines take no new
-// sessions.
+// with exactly that key and a current spec, READY first. Draining engines
+// take no new sessions. Normally there is at most one; after a restart there
+// can be more (an engine that failed its startup timeout but became ready
+// later, next to its replacement): then the oldest serves, every time, and
+// Reconcile drains the others, so that the sessions of a key do not spread
+// over engines with different database state.
 func (m *Manager) findLocked(key Key) *engine {
 	var best *engine
 	for _, e := range m.engines {
-		if e.Warm || e.Key != key {
+		if !m.servesNewLocked(e, key) {
 			continue
 		}
-		if e.State != StateReady && e.State != StateStarting {
-			continue
-		}
-		if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
-			continue
-		}
-		if best == nil || (best.State == StateStarting && e.State == StateReady) {
+		if best == nil || (best.State == StateStarting && e.State == StateReady) ||
+			(best.State == e.State && olderEngine(e, best)) {
 			best = e
 		}
 	}
 	return best
+}
+
+// servesNewLocked reports whether e may take new sessions of key.
+func (m *Manager) servesNewLocked(e *engine, key Key) bool {
+	return !e.Warm && e.Key == key && (e.State == StateReady || e.State == StateStarting) &&
+		(m.specCurrentLocked(e) || !m.replaceOnSpecChange())
+}
+
+// olderEngine orders engines by creation, then by id.
+func olderEngine(a, b *engine) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
 }
 
 func (m *Manager) claimWarmLocked(key Key, user string) *engine {
@@ -976,6 +989,15 @@ func (m *Manager) Reconcile() {
 	m.mu.Lock()
 	inRecovery := now.Before(m.recoveryUntil)
 	permanent := !m.prov.CanLaunch()
+	// The READY engine that serves each key (see findLocked).
+	serving := map[Key]*engine{}
+	for _, e := range m.engines {
+		if e.State == StateReady && m.servesNewLocked(e, e.Key) {
+			if cur := serving[e.Key]; cur == nil || olderEngine(e, cur) {
+				serving[e.Key] = e
+			}
+		}
+	}
 	for _, e := range m.engines {
 		if permanent {
 			// Externally managed engines: only the provider's health probes
@@ -1004,6 +1026,10 @@ func (m *Manager) Reconcile() {
 			}
 			if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
 				m.drainLocked(e, "profile changed")
+				continue
+			}
+			if s := serving[e.Key]; s != nil && s != e {
+				m.drainLocked(e, "duplicate engine: "+s.ID+" serves "+e.Key.String())
 				continue
 			}
 			if idle && !protected {
