@@ -1,6 +1,8 @@
 package kubernetes
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -148,6 +150,10 @@ func (r *renderer) podAnnotations(in podInput) map[string]string {
 	if in.SpecHash != "" {
 		a[AnnotationSpecHash] = in.SpecHash
 	}
+	if sql := engine.RenderInitSQL(in.Profile); sql != "" {
+		sum := sha256.Sum256([]byte(sql))
+		a[AnnotationInitSQLHash] = hex.EncodeToString(sum[:])
+	}
 	return a
 }
 
@@ -167,7 +173,7 @@ func (r *renderer) shapeSpec(spec *corev1.PodSpec, in podInput) {
 	}
 	spec.TerminationGracePeriodSeconds = ptrTo(ceilSeconds(r.grace))
 	spec.NodeSelector = mergeMaps(spec.NodeSelector, prof.NodeSelector)
-	spec.Tolerations = appendTolerations(spec.Tolerations, prof.Tolerations)
+	spec.Tolerations = addNodeLossTolerations(appendTolerations(spec.Tolerations, prof.Tolerations))
 	spec.Affinity = mergeAffinity(spec.Affinity, prof.Affinity)
 	if prof.ServiceAccountName != "" {
 		spec.ServiceAccountName = prof.ServiceAccountName
@@ -295,16 +301,26 @@ func (r *renderer) env(base []corev1.EnvVar, in podInput) []corev1.EnvVar {
 			LocalObjectReference: corev1.LocalObjectReference{Name: tokenSecretName(in.Name)},
 			Key:                  tokenDataKey,
 		}}},
-		{Name: engine.EnvDatabase, Value: database},
-		{Name: engine.EnvInitSQL, Value: engine.RenderInitSQL(in.Profile)},
-		{Name: engine.EnvPort, Value: strconv.Itoa(engine.EnginePort)},
-		{Name: engine.EnvEngineID, Value: in.Name},
-		{Name: engine.EnvShareLevel, Value: string(in.Key.ShareLevel)},
-		{Name: engine.EnvOwner, Value: in.Key.Owner},
-		{Name: engine.EnvSubdomain, Value: in.Key.Subdomain},
-		{Name: engine.EnvProfile, Value: in.ProfileName},
+		// Literal values are escaped: the kubelet expands $(VAR) and $$ in
+		// them, and the owner is a user or group name (a user called
+		// "$(QUACK_TOKEN)" would get the token into the engine's log).
+		literalEnv(engine.EnvDatabase, database),
+		literalEnv(engine.EnvPort, strconv.Itoa(engine.EnginePort)),
+		literalEnv(engine.EnvEngineID, in.Name),
+		literalEnv(engine.EnvShareLevel, string(in.Key.ShareLevel)),
+		literalEnv(engine.EnvOwner, in.Key.Owner),
+		literalEnv(engine.EnvSubdomain, in.Key.Subdomain),
+		literalEnv(engine.EnvProfile, in.ProfileName),
 		// The root file system is read-only; DuckDB keeps ~/.duckdb in HOME.
-		{Name: homeEnv, Value: tmpMountPath},
+		literalEnv(homeEnv, tmpMountPath),
+	}
+	if engine.RenderInitSQL(in.Profile) != "" {
+		// From the engine's secret, not as a literal: the init SQL may hold
+		// credentials. (Values from secrets are not expanded either.)
+		out = append(out, corev1.EnvVar{Name: engine.EnvInitSQL, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: tokenSecretName(in.Name)},
+			Key:                  initSQLDataKey,
+		}}})
 	}
 	for _, e := range mergeEnv(base, in.Profile.Env) {
 		if !contractEnvNames[e.Name] {
@@ -312,6 +328,12 @@ func (r *renderer) env(base []corev1.EnvVar, in podInput) []corev1.EnvVar {
 		}
 	}
 	return out
+}
+
+// literalEnv is an environment variable with a literal value, escaped
+// against the kubelet's $(VAR) expansion.
+func literalEnv(name, value string) corev1.EnvVar {
+	return corev1.EnvVar{Name: name, Value: strings.ReplaceAll(value, "$", "$$")}
 }
 
 // mergeEnv returns base with overrides applied: an override replaces the
@@ -493,6 +515,32 @@ func mergeMaps(maps ...map[string]string) map[string]string {
 	return out
 }
 
+// nodeLossTolerations replace the 300s that admission adds by default: an
+// engine on a node that is not ready or unreachable is evicted after a
+// minute, so that the gateway stops sending its sessions to a dead address
+// (its in-memory state is lost with the node anyway). A template or profile
+// toleration for the same key wins.
+var nodeLossTolerations = []corev1.Toleration{
+	{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: ptrTo(int64(60))},
+	{Key: "node.kubernetes.io/unreachable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute, TolerationSeconds: ptrTo(int64(60))},
+}
+
+// addNodeLossTolerations adds nodeLossTolerations for the keys ts does not
+// tolerate yet.
+func addNodeLossTolerations(ts []corev1.Toleration) []corev1.Toleration {
+	out := ts
+next:
+	for _, t := range nodeLossTolerations {
+		for _, have := range ts {
+			if have.Key == t.Key {
+				continue next
+			}
+		}
+		out = append(out, *t.DeepCopy())
+	}
+	return out
+}
+
 // appendTolerations adds the tolerations of extra that base lacks.
 func appendTolerations(base, extra []corev1.Toleration) []corev1.Toleration {
 	out := base
@@ -549,7 +597,11 @@ func mergeAffinity(base, prof *corev1.Affinity) *corev1.Affinity {
 
 // secret renders the token secret of an engine pod. It is immutable: the
 // token of an engine never changes.
-func (r *renderer) secret(podName, token string) *corev1.Secret {
+func (r *renderer) secret(podName, token, initSQL string) *corev1.Secret {
+	data := map[string][]byte{tokenDataKey: []byte(token)}
+	if initSQL != "" {
+		data[initSQLDataKey] = []byte(initSQL)
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      tokenSecretName(podName),
@@ -565,7 +617,7 @@ func (r *renderer) secret(podName, token string) *corev1.Secret {
 		},
 		Type:      corev1.SecretTypeOpaque,
 		Immutable: ptrTo(true),
-		Data:      map[string][]byte{tokenDataKey: []byte(token)},
+		Data:      data,
 	}
 }
 

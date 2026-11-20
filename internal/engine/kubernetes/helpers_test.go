@@ -98,7 +98,7 @@ func (e *testEnv) enginePod(name string, key engine.Key, warm bool, token string
 		Name: name, Key: key, Warm: warm, User: key.Owner, ProfileName: key.Profile, Profile: prof,
 		SpecHash: e.p.SpecHash(key.Profile, prof),
 	})
-	return pod, e.p.secret(name, token)
+	return pod, e.p.secret(name, token, engine.RenderInitSQL(prof))
 }
 
 // add stores objects in the fake cluster.

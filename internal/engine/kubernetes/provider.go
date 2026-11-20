@@ -413,7 +413,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		Name: req.ID, Key: req.Key, Warm: req.Warm, User: req.User,
 		ProfileName: req.ProfileName, Profile: req.Profile, SpecHash: hash,
 	})
-	secret := p.secret(req.ID, req.Token)
+	secret := p.secret(req.ID, req.Token, engine.RenderInitSQL(req.Profile))
 	secrets := p.client.CoreV1().Secrets(p.namespace)
 
 	// Known before the pod exists, so that its first events carry the token.

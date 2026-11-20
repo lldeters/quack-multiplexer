@@ -24,6 +24,9 @@ const (
 	AnnotationProfile     = "quackmux.io/profile"
 	AnnotationSpecHash    = "quackmux.io/spec-hash"
 	AnnotationTokenSecret = "quackmux.io/token-secret"
+	// AnnotationInitSQLHash is the SHA-256 of the init SQL, which lives in
+	// the engine's secret: a changed init SQL changes the spec hash.
+	AnnotationInitSQLHash = "quackmux.io/init-sql-sha256"
 
 	// annotationDefaultContainer makes kubectl logs/exec pick the engine
 	// container when a pod template adds sidecars.
@@ -50,6 +53,10 @@ const (
 	tokenSecretSuffix = "-token"
 	// tokenDataKey is the key of the token inside the secret.
 	tokenDataKey = "token"
+	// initSQLDataKey holds the rendered init SQL in the same secret: it may
+	// carry credentials (CREATE SECRET), which must not show up in the pod
+	// spec for everybody allowed to read pods.
+	initSQLDataKey = "init.sql"
 
 	// eventComponent is the source of the Kubernetes events we record and
 	// the field manager of the objects we write.

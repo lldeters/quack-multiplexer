@@ -478,6 +478,10 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   oder mit `quack_serve(…)` weitere Server öffnen, und mit `getenv('QUACK_TOKEN')` das Engine-Token lesen. Die
   NetworkPolicy lässt nur das Gateway an Port 9494 der Engines; ein ausgelesenes Token oder ein zusätzlicher
   Server nützt deshalb von außen nichts. Gegen `quack_stop` hilft sie nicht.
+* **Init-SQL:** Es steht im Secret der Engine (`<pod>-token`, Schlüssel `init.sql`), nicht in der Pod-Spec; wer
+  nur Pods lesen darf, sieht es nicht. In der Engine selbst kann es aber jede Session aus der Umgebung lesen
+  (`read_text('/proc/1/environ')`). Schlüssel im `initSQL` sind also für alle Benutzer der Engine sichtbar;
+  besser `PROVIDER credential_chain` mit Workload Identity.
 * **Gegenmittel im `initSQL`** des Profils (läuft nach den `settings`, bevor der Server startet):
   * `quack_authorization_function`: Die Quack-Extension kann vor der Ausführung von Anfragen eine eigene
     SQL-Funktion zur Autorisierung aufrufen. Damit lassen sich etwa `quack_stop`, `quack_serve` oder

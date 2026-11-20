@@ -245,11 +245,14 @@ PVC auf `/data` (mit `fsGroup: 1000`) ins `podTemplate` und `database: /data/eng
 
 ## Sicherheit
 
-* Das Token steht nie in Prozessargumenten oder Logs. Das Init-SQL liegt nur in privaten Dateien. Sie werden
-  gelöscht, sobald der Server läuft. `QUACKMUX_INIT_SQL` entfernt der Entrypoint aus der Umgebung von DuckDB.
+* Token und Init-SQL stehen nie in Prozessargumenten oder Logs. Der Entrypoint kopiert das Init-SQL in private
+  Dateien, die er löscht, sobald der Server läuft, und hält `QUACKMUX_INIT_SQL` aus der Umgebung von DuckDB
+  heraus. Der Kubernetes-Provider liefert beide aus dem Secret der Engine, nicht als Klartext in der Pod-Spec.
 * Clients einer Engine führen beliebiges SQL als Engine-Benutzer aus. Mit External Access, dem DuckDB-Default,
-  können sie Dateien und Umgebungsvariablen des Engine-Prozesses lesen, auch `QUACK_TOKEN`. Deshalb darf nur das
-  Gateway Port 9494 erreichen (NetworkPolicy). In geteilten Engines (`GROUP`, `SERVER`) gehören ins Init-SQL nur
-  Secrets, die alle Benutzer der Engine verwenden dürfen.
+  können sie Dateien und die Umgebung der Prozesse im Container lesen, also `QUACK_TOKEN` und auch das Init-SQL
+  (die Umgebung von tini, etwa per `read_text('/proc/1/environ')`). Deshalb darf nur das Gateway Port 9494
+  erreichen (NetworkPolicy). Zugangsdaten im Init-SQL kann jeder Benutzer der Engine auslesen: In geteilten
+  Engines (`GROUP`, `SERVER`) gehören dorthin nur Secrets, die alle Benutzer verwenden dürfen. Besser sind
+  Provider ohne Schlüssel im SQL, etwa `CREATE SECRET (TYPE s3, PROVIDER credential_chain)` mit Workload Identity.
 * Das Extension-Verzeichnis ist schreibgeschützt und Autoinstall ist aus. Engines brauchen deshalb keinen
   Internetzugang.
