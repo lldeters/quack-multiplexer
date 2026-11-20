@@ -155,31 +155,17 @@ func New(cfg *config.Config, client kclient.Interface, log *slog.Logger) (*Provi
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	kc := cfg.Provider.Kubernetes
-	ns := resolveNamespace(kc.Namespace, os.Getenv, os.ReadFile)
-	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
-		return nil, fmt.Errorf("kubernetes provider: invalid namespace %q: %s", ns, strings.Join(errs, "; "))
+	ns := resolveNamespace(cfg.Provider.Kubernetes.Namespace, os.Getenv, os.ReadFile)
+	r, err := newRenderer(cfg, ns)
+	if err != nil {
+		return nil, err
 	}
-	instance := strings.TrimSpace(kc.Instance)
-	if instance == "" {
-		instance = "default"
-	}
-	if errs := content.IsLabelValue(instance); len(errs) > 0 {
-		return nil, fmt.Errorf("kubernetes provider: provider.kubernetes.instance %q is not a valid label value: %s",
-			instance, strings.Join(errs, "; "))
-	}
-	grace := defaultGracePeriod
-	if kc.DeleteGracePeriod.IsSet() {
-		grace = kc.DeleteGracePeriod.Duration
-	}
-	if grace < 0 {
-		return nil, fmt.Errorf("kubernetes provider: provider.kubernetes.deleteGracePeriod must not be negative")
-	}
+	instance := r.instance
 	p := &Provider{
-		renderer:     renderer{cfg: cfg, namespace: ns, instance: instance, grace: grace},
+		renderer:     r,
 		client:       client,
 		log:          log.With("component", "kubernetes", "namespace", ns, "instance", instance),
-		prefix:       namePrefix(kc.NamePrefix),
+		prefix:       namePrefix(cfg.Provider.Kubernetes.NamePrefix),
 		selector:     instanceSelector(instance),
 		identity:     processIdentity(),
 		events:       make(chan engine.Instance, eventBufferSize),
@@ -198,10 +184,49 @@ func New(cfg *config.Config, client kclient.Interface, log *slog.Logger) (*Provi
 		gcFirstDelay: defaultGCFirstDelay,
 		orphanMinAge: defaultOrphanMinAge,
 	}
-	if err := p.validateProfiles(); err != nil {
-		return nil, err
-	}
 	return p, nil
+}
+
+// Validate runs the checks of New that need no cluster (for "quackmux
+// validate"): the instance, the grace period and every profile rendered
+// once. The namespace is checked only when the configuration names one.
+func Validate(cfg *config.Config) error {
+	ns := strings.TrimSpace(cfg.Provider.Kubernetes.Namespace)
+	if ns == "" {
+		ns = "default"
+	}
+	_, err := newRenderer(cfg, ns)
+	return err
+}
+
+// newRenderer validates the provider settings and the profiles and returns
+// the renderer for them.
+func newRenderer(cfg *config.Config, ns string) (renderer, error) {
+	kc := cfg.Provider.Kubernetes
+	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
+		return renderer{}, fmt.Errorf("kubernetes provider: invalid namespace %q: %s", ns, strings.Join(errs, "; "))
+	}
+	instance := strings.TrimSpace(kc.Instance)
+	if instance == "" {
+		instance = "default"
+	}
+	if errs := content.IsLabelValue(instance); len(errs) > 0 {
+		return renderer{}, fmt.Errorf("kubernetes provider: provider.kubernetes.instance %q is not a valid label value: %s",
+			instance, strings.Join(errs, "; "))
+	}
+	grace := defaultGracePeriod
+	if kc.DeleteGracePeriod.IsSet() {
+		grace = kc.DeleteGracePeriod.Duration
+	}
+	if grace < time.Second {
+		// A grace period of 0 force-deletes the pod while DuckDB still runs.
+		return renderer{}, fmt.Errorf("kubernetes provider: provider.kubernetes.deleteGracePeriod must be at least 1s, got %s", grace)
+	}
+	r := renderer{cfg: cfg, namespace: ns, instance: instance, grace: grace}
+	if err := r.validateProfiles(); err != nil {
+		return renderer{}, err
+	}
+	return r, nil
 }
 
 // processIdentity names the gateway process in events: $POD_NAME, else the

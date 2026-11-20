@@ -287,6 +287,22 @@ func TestNewRejectsInvalidEngines(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want an error containing %q", name, err, tc.want)
 		}
+		// Validate ("quackmux validate") finds the same, except what only
+		// reading the token file shows.
+		verr := Validate(baseConfig(t, e))
+		switch name {
+		case "missing token file", "empty token file":
+			if verr != nil {
+				t.Errorf("%s: Validate read the token file: %v", name, verr)
+			}
+		default:
+			if verr == nil || !strings.Contains(verr.Error(), tc.want) {
+				t.Errorf("%s: Validate: got %v, want an error containing %q", name, verr, tc.want)
+			}
+		}
+	}
+	if err := Validate(baseConfig(t)); err == nil {
+		t.Error("Validate: no engines must be rejected")
 	}
 	if _, err := New(baseConfig(t, ok, ok), nil); err == nil || !strings.Contains(err.Error(), "duplicate name") {
 		t.Errorf("duplicate names: %v", err)

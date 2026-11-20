@@ -134,8 +134,10 @@ func TestRenderPod(t *testing.T) {
 		engine.EnvOwner:      "alice",
 		engine.EnvSubdomain:  "default",
 		engine.EnvProfile:    "default",
-		"HOME":               "/tmp",
-		"FOO":                "bar",
+		// The default grace period of 30s less the reserve of 5s.
+		engine.EnvStopTimeout: "25",
+		"HOME":                "/tmp",
+		"FOO":                 "bar",
 	}
 	for name, want := range wantEnv {
 		got, n := envVar(&c, name)

@@ -327,8 +327,12 @@ type StaticEngine struct {
 // Profile describes one kind of engine.
 type Profile struct {
 	Description string `json:"description,omitempty"`
-	// Image is the engine container image (DuckDB 2.0 with quack).
-	Image           string            `json:"image,omitempty"`
+	// Image is the engine container image (DuckDB 2.0 with quack). It
+	// replaces the image of the podTemplate's engine container; without
+	// both, DefaultEngineImage applies.
+	Image string `json:"image,omitempty"`
+	// ImagePullPolicy likewise replaces the podTemplate's (default
+	// IfNotPresent).
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 	// Database is the DuckDB database path inside the engine (":memory:").
 	Database string `json:"database,omitempty"`
@@ -574,11 +578,9 @@ func (c *Config) ApplyDefaults() {
 		c.Profiles = map[string]Profile{DefaultProfileName: {}}
 	}
 	for name, prof := range c.Profiles {
-		setStr(&prof.Image, DefaultEngineImage)
+		// Image and ImagePullPolicy stay empty: the Kubernetes provider
+		// takes them from the profile's podTemplate, else the defaults.
 		setStr(&prof.Database, ":memory:")
-		if prof.ImagePullPolicy == "" {
-			prof.ImagePullPolicy = corev1.PullIfNotPresent
-		}
 		setInt(&prof.Pool.Size, 1)
 		setStr(&prof.Pool.SelectPolicy, "RANDOM")
 		prof.Pool.SelectPolicy = strings.ToUpper(prof.Pool.SelectPolicy)

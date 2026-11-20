@@ -92,11 +92,37 @@ func cmdValidate(args []string) error {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
 	path := fs.String("config", "config.yaml", "configuration file")
 	_ = fs.Parse(args)
-	if _, err := config.Load(*path); err != nil {
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	if err := validateStartup(cfg); err != nil {
 		return err
 	}
 	fmt.Println("configuration is valid")
 	return nil
+}
+
+// validateStartup runs the checks that "serve" makes at start-up as far as
+// they need no cluster, no engine and no secret files: the provider
+// settings (for Kubernetes with every profile rendered once) and the leader
+// election settings.
+func validateStartup(cfg *config.Config) error {
+	var errs []error
+	switch cfg.Provider.Type {
+	case "kubernetes":
+		errs = append(errs, kubernetes.Validate(cfg))
+	case "process":
+		// New only checks the settings; it starts nothing.
+		_, err := process.New(cfg, slog.New(slog.DiscardHandler))
+		errs = append(errs, err)
+	case "static":
+		errs = append(errs, static.Validate(cfg))
+	}
+	if cfg.HA.Enabled {
+		errs = append(errs, ha.Validate(cfg.HA))
+	}
+	return errors.Join(errs...)
 }
 
 func cmdToken() error {

@@ -280,7 +280,9 @@ provider:
     instance: default
     # Prefix of engine pod names, e.g. quack-user-alice-x7k2p.
     namePrefix: quack
-    # Grace period when deleting engine pods.
+    # Grace period when deleting engine pods (at least 1s). The engine gets
+    # 5s less (at least 1s) as QUACKMUX_STOP_TIMEOUT to stop DuckDB, with a
+    # checkpoint of a database file, before the kubelet kills it.
     deleteGracePeriod: 30s
     # Rate limit of the Kubernetes API client.
     qps: 20
@@ -334,12 +336,15 @@ profiles:
     # Free text for operators (admin API).
     description: ""
     # Engine container image: DuckDB 2.0 with the quack and httpfs extensions
-    # (images/engine). The engine container contract: the gateway sets
-    # QUACK_TOKEN, QUACKMUX_DATABASE, QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494),
-    # QUACKMUX_ENGINE_ID, QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER,
-    # QUACKMUX_SUBDOMAIN and QUACKMUX_PROFILE.
+    # (images/engine). Without it, the image of the podTemplate's engine
+    # container applies, else quackmux/duckdb-engine:2.0.0. The engine
+    # container contract: the gateway sets QUACK_TOKEN, QUACKMUX_DATABASE,
+    # QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494), QUACKMUX_ENGINE_ID,
+    # QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER, QUACKMUX_SUBDOMAIN,
+    # QUACKMUX_PROFILE and QUACKMUX_STOP_TIMEOUT.
     image: quackmux/duckdb-engine:2.0.0
-    # Always | IfNotPresent | Never
+    # Always | IfNotPresent | Never (without it: the podTemplate's, else
+    # IfNotPresent)
     imagePullPolicy: IfNotPresent
     # DuckDB database inside the engine. ":memory:" is lost with the pod; a
     # file needs a volume (see podTemplate).
@@ -360,6 +365,9 @@ profiles:
     #   memory_limit: 3GB
     #   threads: "2"
     #   temp_directory: /tmp/duckdb-spill
+    #   # Spill space; without it DuckDB may fill 90% of the node's free disk
+    #   # (keep it below resources.limits.ephemeral-storage).
+    #   max_temp_directory_size: 20GiB
     # Several engines per key, sessions spread over them (Kyuubi:
     # kyuubi.engine.pool.size / selectPolicy). Every engine has its own
     # database state: only for stateless workloads (reading a lake).
@@ -395,9 +403,11 @@ profiles:
     #   requests:
     #     cpu: "1"
     #     memory: 2Gi
+    #     ephemeral-storage: 2Gi
     #   limits:
     #     cpu: "2"
     #     memory: 4Gi
+    #     ephemeral-storage: 24Gi
     # Extra environment variables of the engine container (the contract
     # variables above are always set by the gateway and cannot be replaced).
     env: []

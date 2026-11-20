@@ -450,7 +450,9 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
 
 * `base/config.yaml` (und `overlays/ha/config.yaml`) bearbeiten oder im eigenen Overlay per
   `configMapGenerator` mit `behavior: replace` eine eigene Datei einsetzen.
-* Vorher prüfen: `quackmux validate -config meine-umgebung/config.yaml`. Unbekannte Felder sind Fehler.
+* Vorher prüfen: `quackmux validate -config meine-umgebung/config.yaml`. Unbekannte Felder sind Fehler. Ohne
+  Cluster prüft `validate` auch, was das Gateway beim Start ablehnen würde: Provider-Einstellungen, jedes Profil
+  einmal als Pod gerendert, Lease-Name und Timings der Leader-Election. Token- und Secret-Dateien liest es nicht.
 * `kubectl apply -k …` erzeugt eine neue ConfigMap (neuer Hash) und rollt das Gateway neu aus (Base: kurze
   Unterbrechung, Sessions bleiben; HA: siehe oben). Die alten ConfigMaps und Secrets mit Hash-Suffix bleiben
   liegen; `kubectl rollout undo` braucht sie. Löschen Sie sie erst, wenn Sie nicht mehr zurückrollen wollen.
@@ -459,6 +461,26 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
 * Anderer Namespace: `namespace` im eigenen Overlay setzen (Kustomize benennt den Namespace um und passt die
   RoleBinding an) und `provider.kubernetes.namespace` in der Konfiguration ändern oder weglassen; ohne Angabe
   starten die Engines im Namespace des Gateways.
+
+## Persistente Daten
+
+Engines halten ihren Zustand im Speicher (`database: ":memory:"`) und verlieren ihn mit dem Pod. Ein PVC im
+`podTemplate` ist **kein** Speicher pro Benutzer: Das Gateway rendert das Template für jede Engine des Profils
+gleich. Alle Engines des Profils mounten also dasselbe Volume: jeder Benutzer, jede Gruppe und Subdomain, jede
+Pool-Engine und die Ersatz-Engine, die neben einer DRAINING-Engine anläuft. Mit `database: /data/engine.duckdb`
+öffnen sie dieselbe Datei. Eine DuckDB-Datei kann nur ein Prozess schreibend öffnen; jede weitere Engine scheitert
+beim Start (`Could not set lock on file`). Auf Netzwerk-Dateisystemen ohne verlässliche Locks droht Datenverlust.
+
+* **Gemeinsame Daten read-only anhängen:** PVC (`ReadOnlyMany`) im Template und im `initSQL`
+  `ATTACH '/data/lake.duckdb' AS lake (READ_ONLY)`. Das verträgt beliebig viele Engines.
+* **Schreibbare Daten in einen externen Katalog:** etwa DuckLake mit Postgres-Katalog und Objektspeicher (Beispiel
+  in [images/engine/README.md](../../images/engine/README.md)).
+* **Eine schreibbare Datei auf einem PVC** trägt nur ein Profil, das nie mehr als eine Engine hat:
+  `allowedShareLevels: [SERVER]`, `pool.size: 1`, Benutzer, die nur eine Subdomain nutzen (`allowedUsers`),
+  `maxLifetime` 0 und `engine.replaceOnSpecChange: false`, sonst läuft eine Ersatz-Engine neben der alten an. Das
+  Gateway erzwingt das nicht.
+
+PVCs pro Engine-Schlüssel (etwa pro Benutzer) legt das Gateway noch nicht an.
 
 ## Härtung geteilter Engines
 
@@ -503,6 +525,12 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
     `quack_authorization_function`.
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
+* **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
+  `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
+  Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere
+  Pods verdrängen. Setzen Sie je Profil `settings.max_temp_directory_size` und darüber
+  `resources.limits.ephemeral-storage` (mit passendem `requests`-Wert): Dann scheitert die Query mit einem
+  Fehler, statt dass der Node volläuft, und im Notfall räumt das Kubelet nur diese Engine.
 * **Sandbox:** Wo vorhanden, isoliert eine Sandbox-Runtime die Engines zusätzlich
   (`profiles.<name>.podTemplate.spec.runtimeClassName`, z. B. gVisor).
 * **Namespace:** Pod Security `restricted` ist aktiv. Das Gateway darf alle Secrets des Namespace lesen;

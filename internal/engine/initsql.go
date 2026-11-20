@@ -26,6 +26,12 @@ const (
 	EnvSubdomain  = "QUACKMUX_SUBDOMAIN"
 	EnvProfile    = "QUACKMUX_PROFILE"
 
+	// EnvStopTimeout is how many seconds the engine waits for DuckDB to
+	// stop after SIGTERM before it kills it (images/engine: default 20).
+	// Providers whose platform kills the engine after a grace period set
+	// it below that period.
+	EnvStopTimeout = "QUACKMUX_STOP_TIMEOUT"
+
 	// EnginePort is the Quack port inside engine containers.
 	EnginePort = 9494
 )

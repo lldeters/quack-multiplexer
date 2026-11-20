@@ -30,7 +30,7 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 | `QUACKMUX_EXTENSION_DIR` | `/opt/duckdb/extensions` | Verzeichnis, aus dem DuckDB Extensions lädt. |
 | `QUACKMUX_MAX_CONNECTIONS` | DuckDB-Default (1024) | `quack_server_max_connections`: gleichzeitige TCP-Verbindungen. Der Server nutzt einen Thread pro Verbindung. |
 | `QUACKMUX_KEEP_ALIVE_TIMEOUT` | DuckDB-Default (300) | `quack_server_keep_alive_timeout` in Sekunden. Der Wert sollte über `server.upstream.idleConnTimeout` des Gateways liegen (Default 90 s), damit das Gateway inaktive Verbindungen zuerst schließt. |
-| `QUACKMUX_STOP_TIMEOUT` | `20` | So viele Sekunden (`20` oder `20s`) wartet der Entrypoint beim Stoppen auf DuckDB, danach folgt `SIGKILL`. Der Wert muss unter der Grace Period des Pods liegen (`provider.kubernetes.deleteGracePeriod`, Default 30 s). |
+| `QUACKMUX_STOP_TIMEOUT` | `20` | So viele Sekunden (`20` oder `20s`) wartet der Entrypoint beim Stoppen auf DuckDB, danach folgt `SIGKILL`. Der Wert muss unter der Grace Period des Pods liegen. Unter Kubernetes setzt ihn das Gateway auf `provider.kubernetes.deleteGracePeriod` − 5 s (mindestens 1 s); ein eigener Wert im Profil wird ignoriert. |
 | `QUACKMUX_DUCKDB_BIN` | `duckdb` | Pfad der DuckDB-CLI, für eigene Images. |
 | `TMPDIR` | `/tmp` | Hier legt der Entrypoint sein privates Verzeichnis an. Es muss beschreibbar sein. |
 | `QUACKMUX_ENGINE_ID`, `QUACKMUX_SHARE_LEVEL`, `QUACKMUX_OWNER`, `QUACKMUX_SUBDOMAIN`, `QUACKMUX_PROFILE` | – | Setzt das Gateway. Sie erscheinen nur in der Logzeile. |
@@ -240,8 +240,10 @@ docker run --rm --name quack-engine -p 9494:9494 -v quack-data:/data \
 
 Der Kubernetes-Provider des Gateways setzt die Umgebungsvariablen, holt das Token aus einem Secret und mountet ein
 `emptyDir` auf `/tmp`. Das Root-Dateisystem ist read-only, nur `/tmp` muss beschreibbar sein. Die Readiness-Probe ist
-`GET /` auf Port 9494. Der numerische `USER 1000:1000` erfüllt `runAsNonRoot`. Für persistente Engines gehören ein
-PVC auf `/data` (mit `fsGroup: 1000`) ins `podTemplate` und `database: /data/engine.duckdb` ins Profil.
+`GET /` auf Port 9494. Der numerische `USER 1000:1000` erfüllt `runAsNonRoot`. Ein PVC auf `/data` (mit
+`fsGroup: 1000`) im `podTemplate` mounten alle Engines des Profils gleichzeitig; eine Datenbankdatei darauf kann nur
+eine Engine schreibend öffnen. Wann das trotzdem passt, steht in
+[deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Persistente Daten“.
 
 ## Sicherheit
 

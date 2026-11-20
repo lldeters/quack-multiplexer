@@ -824,3 +824,30 @@ func TestWatchdog(t *testing.T) {
 		<-done
 	})
 }
+
+// Validate ("quackmux validate") rejects what New would, without a cluster;
+// in particular the lease name derived from an instance that is a valid
+// label value but no object name.
+func TestValidate(t *testing.T) {
+	cfg, err := config.Parse([]byte("auth: {mode: none}\nserver: {sessionKeyFile: /x}\nha: {enabled: true}\nprovider: {kubernetes: {instance: Prod}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(cfg.HA); err == nil || !strings.Contains(err.Error(), "ha.leaseName") {
+		t.Fatalf("lease name %q: %v", cfg.HA.LeaseName, err)
+	}
+	cfg.HA.LeaseName = "quackmux-prod"
+	if err := Validate(cfg.HA); err != nil {
+		t.Fatalf("explicit lease name: %v", err)
+	}
+	bad := cfg.HA
+	bad.Namespace = "Not_A_Namespace"
+	if err := Validate(bad); err == nil {
+		t.Error("invalid namespace accepted")
+	}
+	bad = cfg.HA
+	bad.RenewDeadline = bad.LeaseDuration
+	if err := Validate(bad); err == nil {
+		t.Error("renewDeadline = leaseDuration accepted")
+	}
+}

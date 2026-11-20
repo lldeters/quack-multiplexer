@@ -35,7 +35,8 @@ func TestDefaults(t *testing.T) {
 		t.Errorf("unexpected defaults: %+v %+v %+v %+v", c.Server.Listen, c.Admin.Listen, c.Defaults, c.Provider.Type)
 	}
 	p := c.Profiles["default"]
-	if p.Image != DefaultEngineImage || p.Database != ":memory:" || p.Pool.Size != 1 || p.Pool.SelectPolicy != "RANDOM" {
+	// The image stays empty: the provider falls back to the podTemplate's.
+	if p.Image != "" || p.ImagePullPolicy != "" || p.Database != ":memory:" || p.Pool.Size != 1 || p.Pool.SelectPolicy != "RANDOM" {
 		t.Errorf("unexpected profile defaults: %+v", p)
 	}
 	if !*c.Engine.ReplaceOnSpecChange {

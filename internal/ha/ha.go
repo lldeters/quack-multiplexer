@@ -109,6 +109,31 @@ func Run(ctx context.Context, cfg config.HAConfig, client kubernetes.Interface, 
 	return e.Run(ctx, onStartedLeading, onStoppedLeading)
 }
 
+// Validate checks the settings that need no cluster (for "quackmux
+// validate"): the lease name, an explicit namespace and the timings.
+func Validate(c config.HAConfig) error {
+	if ns := strings.TrimSpace(c.Namespace); ns != "" {
+		if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
+			return fmt.Errorf("ha: invalid lease namespace %q: %s", ns, strings.Join(errs, "; "))
+		}
+	}
+	if name := leaseName(c); len(validation.IsDNS1123Subdomain(name)) > 0 {
+		// The default name is derived from provider.kubernetes.instance,
+		// which may be a label value that is no object name ("Prod").
+		return fmt.Errorf("ha: invalid lease name %q: %s (set ha.leaseName)", name,
+			strings.Join(validation.IsDNS1123Subdomain(name), "; "))
+	}
+	return validateTimings(durationOr(c.LeaseDuration, DefaultLeaseDuration),
+		durationOr(c.RenewDeadline, DefaultRenewDeadline), durationOr(c.RetryPeriod, DefaultRetryPeriod))
+}
+
+func leaseName(c config.HAConfig) string {
+	if name := strings.TrimSpace(c.LeaseName); name != "" {
+		return name
+	}
+	return DefaultLeaseName
+}
+
 // New validates the options and creates an Elector. It does not contact the
 // Kubernetes API.
 func New(o Options) (*Elector, error) {
@@ -125,13 +150,10 @@ func New(o Options) (*Elector, error) {
 	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
 		return nil, fmt.Errorf("ha: invalid lease namespace %q: %s", ns, strings.Join(errs, "; "))
 	}
-	name := strings.TrimSpace(o.Config.LeaseName)
-	if name == "" {
-		name = DefaultLeaseName
+	if err := Validate(o.Config); err != nil {
+		return nil, err
 	}
-	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
-		return nil, fmt.Errorf("ha: invalid lease name %q: %s", name, strings.Join(errs, "; "))
-	}
+	name := leaseName(o.Config)
 	identity := strings.TrimSpace(o.Identity)
 	if identity == "" {
 		var err error
@@ -143,9 +165,6 @@ func New(o Options) (*Elector, error) {
 	lease := durationOr(o.Config.LeaseDuration, DefaultLeaseDuration)
 	renew := durationOr(o.Config.RenewDeadline, DefaultRenewDeadline)
 	retry := durationOr(o.Config.RetryPeriod, DefaultRetryPeriod)
-	if err := validateTimings(lease, renew, retry); err != nil {
-		return nil, err
-	}
 
 	log := o.Log
 	if log == nil {

@@ -202,7 +202,9 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   gelöscht oder stürzt er ab, gehen seine Sessions auf CLOSED („engine terminated“). Folge-Requests bekommen
   `must_invalidate`.
 * Die Pods haben `restartPolicy: Never`: Nach einem Absturz ist der In-Memory-Zustand ohnehin weg. Ein Neustart
-  im selben Pod würde nur falsche Hoffnungen wecken.
+  im selben Pod würde nur falsche Hoffnungen wecken. Eine Restart-Policy am Engine-Container (auch aus dem
+  `podTemplate`) entfernt das Gateway; startet der Container trotzdem neu (`restartCount > 0`, etwa durch einen
+  Mutating Webhook), gilt die Engine als ausgefallen.
 
 ## 6. Neustart und Hochverfügbarkeit
 
@@ -228,8 +230,8 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 
 ## 7. Engines in Kubernetes
 
-* Pod `quack-<level>-<owner>-<rand>` mit Container `engine` (Image aus dem Profil, Default
-  `quackmux/duckdb-engine:2.0.0`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
+* Pod `quack-<level>-<owner>-<rand>` mit Container `engine` (Image und Pull-Policy aus dem Profil, sonst aus dem
+  `podTemplate`, sonst `quackmux/duckdb-engine:2.0.0` mit `IfNotPresent`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
   startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP. Das Token kommt aus der Umgebungsvariable
   `QUACK_TOKEN`.
 * Token: 32 Zufallsbytes pro Engine, in einem Secret `<pod>-token`. Das Secret wird zuerst angelegt und danach
@@ -242,7 +244,13 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   * Netz: eine NetworkPolicy erlaubt Ingress auf 9494 nur vom Gateway.
 * Profile formen den Pod: Ressourcen, Env, NodeSelector, Tolerations, Affinity, ServiceAccount, PullSecrets,
   Labels und Annotationen. Optional dient ein komplettes `podTemplate` als Basis, das Gateway ergänzt seine
-  Pflichtfelder. Persistente Daten gehen über PVCs im Template, sinnvoll bei `USER`-Engines.
+  Pflichtfelder. Ein PVC im Template mounten **alle** Engines des Profils (jeder Benutzer, jede Subdomain, Pool-
+  und Ersatz-Engines); eine DuckDB-Datei darauf kann nur eine davon schreibend öffnen. Das taugt für read-only
+  angehängte Daten oder ein Profil mit genau einer Engine. PVCs pro Engine-Schlüssel sind offen
+  (deploy/kubernetes/README.md, „Persistente Daten“).
+* Grace Period beim Löschen: `provider.kubernetes.deleteGracePeriod` (Default 30 s, mindestens 1 s). Das Gateway
+  setzt `QUACKMUX_STOP_TIMEOUT` der Engine auf 5 s weniger (mindestens 1 s), damit der Entrypoint DuckDB samt
+  Checkpoint stoppt, bevor das Kubelet den Container tötet.
 * RBAC (Namespace-scoped):
   * pods: get, list, watch, create, delete, patch
   * secrets: get, list, create, delete, patch

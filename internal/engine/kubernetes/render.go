@@ -255,9 +255,17 @@ func (r *renderer) shapeContainer(c *corev1.Container, in podInput) {
 	case c.Image == "":
 		c.Image = config.DefaultEngineImage
 	}
-	if prof.ImagePullPolicy != "" {
+	switch {
+	case prof.ImagePullPolicy != "":
 		c.ImagePullPolicy = prof.ImagePullPolicy
+	case c.ImagePullPolicy == "":
+		c.ImagePullPolicy = corev1.PullIfNotPresent
 	}
+	// The pod's restartPolicy Never must hold for the engine: a
+	// container-level policy or restart rules would restart it in place, a
+	// fresh DuckDB without the state its sessions rely on.
+	c.RestartPolicy = nil
+	c.RestartPolicyRules = nil
 	if !hasResources(c.Resources) {
 		c.Resources = *prof.Resources.DeepCopy()
 	}
@@ -283,7 +291,17 @@ func hasResources(rr corev1.ResourceRequirements) bool {
 var contractEnvNames = map[string]bool{
 	engine.EnvToken: true, engine.EnvDatabase: true, engine.EnvInitSQL: true, engine.EnvPort: true,
 	engine.EnvEngineID: true, engine.EnvShareLevel: true, engine.EnvOwner: true, engine.EnvSubdomain: true,
-	engine.EnvProfile: true, homeEnv: true,
+	engine.EnvProfile: true, engine.EnvStopTimeout: true, homeEnv: true,
+}
+
+// stopGraceReserve is the part of the pod's grace period left to the
+// engine's entrypoint after its stop timeout (to kill DuckDB and exit).
+const stopGraceReserve = 5 * time.Second
+
+// stopTimeoutSeconds returns QUACKMUX_STOP_TIMEOUT for a grace period: the
+// period less stopGraceReserve, at least one second.
+func stopTimeoutSeconds(grace time.Duration) int64 {
+	return max(1, ceilSeconds(grace-stopGraceReserve))
 }
 
 // env returns the environment of the engine container: the engine
@@ -311,6 +329,9 @@ func (r *renderer) env(base []corev1.EnvVar, in podInput) []corev1.EnvVar {
 		literalEnv(engine.EnvOwner, in.Key.Owner),
 		literalEnv(engine.EnvSubdomain, in.Key.Subdomain),
 		literalEnv(engine.EnvProfile, in.ProfileName),
+		// The engine must stop DuckDB (checkpoint included) before the
+		// kubelet kills the container at the end of the grace period.
+		literalEnv(engine.EnvStopTimeout, strconv.FormatInt(stopTimeoutSeconds(r.grace), 10)),
 		// The root file system is read-only; DuckDB keeps ~/.duckdb in HOME.
 		literalEnv(homeEnv, tmpMountPath),
 	}
@@ -666,10 +687,10 @@ func (r *renderer) validateProfiles() error {
 		if el := apivalidation.ValidateAnnotations(pod.Annotations, base.Child("annotations")); len(el) > 0 {
 			errs = append(errs, el.ToAggregate())
 		}
-		switch prof.ImagePullPolicy {
-		case "", corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:
+		switch policy := pod.Spec.Containers[engineContainer(&pod.Spec)].ImagePullPolicy; policy {
+		case corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:
 		default:
-			errs = append(errs, fmt.Errorf("profiles.%s.imagePullPolicy: %q is not Always, IfNotPresent or Never", name, prof.ImagePullPolicy))
+			errs = append(errs, fmt.Errorf("profiles.%s.imagePullPolicy: %q is not Always, IfNotPresent or Never", name, policy))
 		}
 	}
 	if err := errors.Join(errs...); err != nil {

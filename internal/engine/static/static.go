@@ -147,11 +147,40 @@ func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Provider, error
 	if len(sc.Engines) == 0 {
 		return nil, errors.New("static provider: provider.static.engines must not be empty")
 	}
+	engines, err := newEntries(cfg, loadToken)
+	if err != nil {
+		return nil, err
+	}
+	p.engines = engines
+	p.events = make(chan engine.Instance, max(minEventBuffer, 2*len(p.engines)))
+	p.checkCoverage(cfg)
+	return p, nil
+}
+
+// Validate checks provider.static as New does, but without reading token
+// files (for "quackmux validate", which may run where they do not exist).
+func Validate(cfg *config.Config) error {
+	if len(cfg.Provider.Static.Engines) == 0 {
+		return errors.New("static provider: provider.static.engines must not be empty")
+	}
+	_, err := newEntries(cfg, func(se config.StaticEngine) (string, error) {
+		if se.TokenFile != "" && se.Token == "" {
+			return "unread", nil
+		}
+		return loadToken(se)
+	})
+	return err
+}
+
+// newEntries builds the entries of provider.static.engines, getting their
+// tokens from token.
+func newEntries(cfg *config.Config, token func(config.StaticEngine) (string, error)) ([]*entry, error) {
 	now := time.Now()
 	seen := map[string]bool{}
+	var entries []*entry
 	var errs []error
-	for i, se := range sc.Engines {
-		e, err := newEntry(cfg, se, now)
+	for i, se := range cfg.Provider.Static.Engines {
+		e, err := newEntry(cfg, se, now, token)
 		if err == nil && seen[se.Name] {
 			err = errors.New("duplicate name")
 		}
@@ -160,17 +189,12 @@ func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Provider, error
 			continue
 		}
 		seen[se.Name] = true
-		p.engines = append(p.engines, e)
+		entries = append(entries, e)
 	}
-	if err := errors.Join(errs...); err != nil {
-		return nil, err
-	}
-	p.events = make(chan engine.Instance, max(minEventBuffer, 2*len(p.engines)))
-	p.checkCoverage(cfg)
-	return p, nil
+	return entries, errors.Join(errs...)
 }
 
-func newEntry(cfg *config.Config, se config.StaticEngine, created time.Time) (*entry, error) {
+func newEntry(cfg *config.Config, se config.StaticEngine, created time.Time, loadToken func(config.StaticEngine) (string, error)) (*entry, error) {
 	if se.Name == "" {
 		return nil, errors.New("name is required")
 	}
