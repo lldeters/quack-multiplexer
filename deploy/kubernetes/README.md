@@ -481,11 +481,15 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   * `quack_authorization_function`: Die Quack-Extension kann vor der Ausführung von Anfragen eine eigene
     SQL-Funktion zur Autorisierung aufrufen. Damit lassen sich etwa `quack_stop`, `quack_serve` oder
     Dateizugriffe sperren (Signatur: Dokumentation der Quack-Extension).
-  * `SET enable_external_access = false` am Ende sperrt Datei- und Netzwerkzugriffe sowie das Nachladen von
-    Extensions aus SQL. Was die Engine braucht, vorher anhängen bzw. laden (etwa `LOAD httpfs`) oder per
-    Allowlist freigeben (DuckDB-Dokumentation „Securing DuckDB“). `SET lock_configuration = true` als letzte
-    Anweisung verhindert weitere `SET`s. Beides schränkt auch legitime Nutzung ein und muss sich mit dem
-    anschließenden `quack_serve` vertragen: vorab mit einer Test-Engine prüfen.
+  * `SET lock_configuration = true` als letzte Anweisung verhindert weitere `SET`s der Sessions, etwa
+    `SET GLOBAL threads` oder ein Zurückdrehen von Einstellungen. Clients können sich weiter verbinden und
+    abfragen (mit DuckDB 2.0.0 geprüft).
+  * `SET enable_external_access = false` gehört **nicht** ins `initSQL`: Die Engine startet dann nicht, weil
+    der Entrypoint das Token danach per `getenv()` liest und `quack_serve` selbst Dateizugriff braucht. Nach dem
+    Serverstart gesetzt, würde es Datei- und Netzwerkzugriffe und `getenv()` für alle Sessions sperren, ohne den
+    Quack-Server zu stören. Dafür bietet das Engine-Image derzeit keinen Haken.
+  * `quack_stop(…)` bleibt für jede Session aufrufbar, auch mit gesperrter Konfiguration. Dagegen hilft nur die
+    `quack_authorization_function`.
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
 * **Sandbox:** Wo vorhanden, isoliert eine Sandbox-Runtime die Engines zusätzlich

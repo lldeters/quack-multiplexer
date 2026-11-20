@@ -82,8 +82,12 @@ die das Token enthält, geht nach `/dev/null`.
   `SET GLOBAL …` im Init-SQL. YAML-Werte in `settings` müssen Strings sein (`threads: "4"`).
 * Extensions lassen sich zur Laufzeit nicht installieren: Das Verzeichnis ist schreibgeschützt und Autoinstall ist
   aus. Vorinstallierte Extensions lädt `LOAD` oder Autoload. Weitere Extensions kommen ins Image (siehe unten).
-* `enable_external_access = false` darf nicht im Init-SQL stehen. Das Token wird erst danach per `getenv()`
-  gelesen, und DuckDB sperrt `getenv()` ohne External Access.
+* `enable_external_access = false` darf nicht im Init-SQL stehen, sonst startet die Engine nicht. Das Token wird
+  erst danach per `getenv()` gelesen, DuckDB sperrt `getenv()` ohne External Access, und `quack_serve` braucht
+  selbst Dateizugriff (`$HOME/.duckdb/stored_secrets`). Erst nach `quack_serve` gesetzt, würde es den Server nicht
+  stören. Dafür hat der Entrypoint noch keinen Haken.
+* `SET lock_configuration = true` als letzte Anweisung des Init-SQL funktioniert: Clients verbinden sich und fragen
+  ab, nur ihre eigenen `SET`s schlagen fehl („the configuration has been locked“).
 
 ## Stoppen
 
