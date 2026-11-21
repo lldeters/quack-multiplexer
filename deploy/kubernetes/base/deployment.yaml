@@ -40,7 +40,9 @@ spec:
       # The Service "quackmux" would otherwise inject QUACKMUX_SERVICE_* and
       # QUACKMUX_PORT* variables into the container.
       enableServiceLinks: false
-      # server.shutdownTimeout (30s) drains in-flight requests, plus margin.
+      # server.shutdownTimeout (30s) drains in-flight requests, plus margin; with
+      # leader election (overlays/ha) the lease is released first (at most
+      # ha.renewDeadline + 1s, normally milliseconds).
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true

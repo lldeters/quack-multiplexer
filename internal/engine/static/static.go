@@ -88,6 +88,7 @@ func WithHTTPClient(c *http.Client) Option {
 type Provider struct {
 	log      *slog.Logger
 	interval time.Duration
+	failures int // failed probes in a row that take an engine out of rotation
 	timeout  time.Duration
 	client   *http.Client
 
@@ -106,6 +107,7 @@ type Provider struct {
 type entry struct {
 	probeURL string
 	inst     engine.Instance
+	failures int // probes failed in a row
 }
 
 var _ engine.Provider = (*Provider)(nil)
@@ -125,12 +127,16 @@ func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Provider, error
 	p := &Provider{
 		log:      log.With("component", "static-engines"),
 		interval: sc.HealthInterval.Duration,
+		failures: sc.FailureThreshold,
 		timeout:  DefaultProbeTimeout,
 		synced:   make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 	if p.interval <= 0 {
 		p.interval = DefaultHealthInterval
+	}
+	if p.failures <= 0 {
+		p.failures = 1
 	}
 	for _, o := range opts {
 		o(p)
@@ -141,11 +147,40 @@ func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Provider, error
 	if len(sc.Engines) == 0 {
 		return nil, errors.New("static provider: provider.static.engines must not be empty")
 	}
+	engines, err := newEntries(cfg, loadToken)
+	if err != nil {
+		return nil, err
+	}
+	p.engines = engines
+	p.events = make(chan engine.Instance, max(minEventBuffer, 2*len(p.engines)))
+	p.checkCoverage(cfg)
+	return p, nil
+}
+
+// Validate checks provider.static as New does, but without reading token
+// files (for "quackmux validate", which may run where they do not exist).
+func Validate(cfg *config.Config) error {
+	if len(cfg.Provider.Static.Engines) == 0 {
+		return errors.New("static provider: provider.static.engines must not be empty")
+	}
+	_, err := newEntries(cfg, func(se config.StaticEngine) (string, error) {
+		if se.TokenFile != "" && se.Token == "" {
+			return "unread", nil
+		}
+		return loadToken(se)
+	})
+	return err
+}
+
+// newEntries builds the entries of provider.static.engines, getting their
+// tokens from token.
+func newEntries(cfg *config.Config, token func(config.StaticEngine) (string, error)) ([]*entry, error) {
 	now := time.Now()
 	seen := map[string]bool{}
+	var entries []*entry
 	var errs []error
-	for i, se := range sc.Engines {
-		e, err := newEntry(cfg, se, now)
+	for i, se := range cfg.Provider.Static.Engines {
+		e, err := newEntry(cfg, se, now, token)
 		if err == nil && seen[se.Name] {
 			err = errors.New("duplicate name")
 		}
@@ -154,17 +189,12 @@ func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Provider, error
 			continue
 		}
 		seen[se.Name] = true
-		p.engines = append(p.engines, e)
+		entries = append(entries, e)
 	}
-	if err := errors.Join(errs...); err != nil {
-		return nil, err
-	}
-	p.events = make(chan engine.Instance, max(minEventBuffer, 2*len(p.engines)))
-	p.checkCoverage(cfg)
-	return p, nil
+	return entries, errors.Join(errs...)
 }
 
-func newEntry(cfg *config.Config, se config.StaticEngine, created time.Time) (*entry, error) {
+func newEntry(cfg *config.Config, se config.StaticEngine, created time.Time, loadToken func(config.StaticEngine) (string, error)) (*entry, error) {
 	if se.Name == "" {
 		return nil, errors.New("name is required")
 	}
@@ -424,6 +454,7 @@ func (p *Provider) probeRound(ctx context.Context) ([]engine.Instance, bool) {
 func (p *Provider) applyLocked(e *entry, probeErr error) (engine.Instance, bool) {
 	prev := e.inst.Phase
 	if probeErr == nil {
+		e.failures = 0
 		e.inst.Phase, e.inst.Message = engine.PhaseReady, MessageHealthy
 		switch prev {
 		case engine.PhaseStarting:
@@ -432,6 +463,14 @@ func (p *Provider) applyLocked(e *entry, probeErr error) (engine.Instance, bool)
 			p.log.Info("static engine recovered", "engine", e.inst.ID, "endpoint", e.inst.Endpoint)
 		}
 		return e.inst, true // see the package documentation
+	}
+	e.failures++
+	if prev != engine.PhaseFailed && e.failures < p.failures {
+		// Not yet: a single failed probe does not take the engine (and all
+		// its sessions) out of rotation.
+		p.log.Warn("static engine missed a health check", "engine", e.inst.ID, "endpoint", e.inst.Endpoint,
+			"failures", e.failures, "threshold", p.failures, "err", probeErr)
+		return engine.Instance{}, false
 	}
 	e.inst.Phase, e.inst.Message = engine.PhaseFailed, "health check failed: "+probeErr.Error()
 	if prev == engine.PhaseFailed {
@@ -512,7 +551,7 @@ func (p *Provider) Launch(context.Context, engine.LaunchRequest) (engine.Instanc
 }
 
 // Claim implements engine.Provider: not supported (there are no warm pools).
-func (p *Provider) Claim(context.Context, string, engine.Key) error {
+func (p *Provider) Claim(context.Context, string, engine.Key, string) error {
 	return engine.ErrNotSupported
 }
 

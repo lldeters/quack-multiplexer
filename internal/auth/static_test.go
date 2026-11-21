@@ -507,3 +507,17 @@ func TestGenerateToken(t *testing.T) {
 		seen[tok] = true
 	}
 }
+
+// The token of the example users file shipped with the manifests is public:
+// it never authenticates anybody, and the gateway says so.
+func TestStaticIgnoresTheExampleToken(t *testing.T) {
+	yaml := "users:\n  - name: alice\n    tokens:\n      - sha256: \"" + exampleTokenSHA256 + "\"\n"
+	path := writeFile(t, t.TempDir(), "users.yaml", []byte(yaml))
+	a, buf := newTestStatic(t, path, 0, func() time.Time { return staticNow })
+	if _, err := a.Authenticate(context.Background(), Request{Credential: "change-me-example-token-0000"}); err == nil {
+		t.Fatal("the public example token authenticated")
+	}
+	if !strings.Contains(buf.String(), "public example token") {
+		t.Fatalf("no warning about the example token:\n%s", buf.String())
+	}
+}

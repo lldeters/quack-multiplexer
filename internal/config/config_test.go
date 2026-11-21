@@ -29,12 +29,14 @@ func TestDefaults(t *testing.T) {
 			t.Errorf("%s = %s, want %s", ch.name, ch.got, ch.want)
 		}
 	}
-	if c.Server.Listen != ":9494" || c.Admin.Listen != ":9495" || c.Defaults.ShareLevel != "USER" ||
+	// Without an admin token, the admin API listens on the loopback interface.
+	if c.Server.Listen != ":9494" || c.Admin.Listen != "127.0.0.1:9495" || c.Defaults.ShareLevel != "USER" ||
 		c.Defaults.Profile != "default" || c.Provider.Type != "kubernetes" {
-		t.Errorf("unexpected defaults: %+v %+v %+v", c.Server.Listen, c.Defaults, c.Provider.Type)
+		t.Errorf("unexpected defaults: %+v %+v %+v %+v", c.Server.Listen, c.Admin.Listen, c.Defaults, c.Provider.Type)
 	}
 	p := c.Profiles["default"]
-	if p.Image != DefaultEngineImage || p.Database != ":memory:" || p.Pool.Size != 1 || p.Pool.SelectPolicy != "RANDOM" {
+	// The image stays empty: the provider falls back to the podTemplate's.
+	if p.Image != "" || p.ImagePullPolicy != "" || p.Database != ":memory:" || p.Pool.Size != 1 || p.Pool.SelectPolicy != "RANDOM" {
 		t.Errorf("unexpected profile defaults: %+v", p)
 	}
 	if !*c.Engine.ReplaceOnSpecChange {
@@ -135,5 +137,31 @@ func TestValidationMessageListsAllProblems(t *testing.T) {
 	_, err := Parse([]byte("auth: {mode: ldap}\ndefaults: {shareLevel: CLUSTER}\n"))
 	if err == nil || !strings.Contains(err.Error(), "auth.mode") || !strings.Contains(err.Error(), "CLUSTER") {
 		t.Fatalf("want both problems reported, got %v", err)
+	}
+}
+
+func TestAdminListenDefaultFollowsToken(t *testing.T) {
+	c, err := Parse([]byte("auth: {mode: none}\nadmin: {tokenFile: /etc/quackmux/admin/token}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Admin.Listen != ":9495" {
+		t.Fatalf("admin.listen %q with a token, want all interfaces", c.Admin.Listen)
+	}
+}
+
+func TestAllowedOriginsDefaultFollowsAuthMode(t *testing.T) {
+	for mode, want := range map[string]int{"none": 0, "static": 1} {
+		yaml := "auth: {mode: " + mode + "}\n"
+		if mode == "static" {
+			yaml = "auth: {mode: static, static: {file: users.yaml}}\n"
+		}
+		c, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.Server.AllowedOrigins) != want {
+			t.Fatalf("auth.mode %s: allowedOrigins %v", mode, c.Server.AllowedOrigins)
+		}
 	}
 }

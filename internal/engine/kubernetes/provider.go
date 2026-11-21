@@ -114,6 +114,11 @@ type Provider struct {
 	// deleted concurrently (see replay).
 	emitMu sync.Mutex
 
+	// closeMu guards the events channel against senders outside the
+	// informer (Terminate), which may run after Run has closed it.
+	closeMu      sync.RWMutex
+	eventsClosed bool
+
 	replayMu  sync.Mutex
 	replayIDs map[string]struct{}
 	replayCh  chan struct{}
@@ -150,31 +155,17 @@ func New(cfg *config.Config, client kclient.Interface, log *slog.Logger) (*Provi
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	kc := cfg.Provider.Kubernetes
-	ns := resolveNamespace(kc.Namespace, os.Getenv, os.ReadFile)
-	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
-		return nil, fmt.Errorf("kubernetes provider: invalid namespace %q: %s", ns, strings.Join(errs, "; "))
+	ns := resolveNamespace(cfg.Provider.Kubernetes.Namespace, os.Getenv, os.ReadFile)
+	r, err := newRenderer(cfg, ns)
+	if err != nil {
+		return nil, err
 	}
-	instance := strings.TrimSpace(kc.Instance)
-	if instance == "" {
-		instance = "default"
-	}
-	if errs := content.IsLabelValue(instance); len(errs) > 0 {
-		return nil, fmt.Errorf("kubernetes provider: provider.kubernetes.instance %q is not a valid label value: %s",
-			instance, strings.Join(errs, "; "))
-	}
-	grace := defaultGracePeriod
-	if kc.DeleteGracePeriod.IsSet() {
-		grace = kc.DeleteGracePeriod.Duration
-	}
-	if grace < 0 {
-		return nil, fmt.Errorf("kubernetes provider: provider.kubernetes.deleteGracePeriod must not be negative")
-	}
+	instance := r.instance
 	p := &Provider{
-		renderer:     renderer{cfg: cfg, namespace: ns, instance: instance, grace: grace},
+		renderer:     r,
 		client:       client,
 		log:          log.With("component", "kubernetes", "namespace", ns, "instance", instance),
-		prefix:       namePrefix(kc.NamePrefix),
+		prefix:       namePrefix(cfg.Provider.Kubernetes.NamePrefix),
 		selector:     instanceSelector(instance),
 		identity:     processIdentity(),
 		events:       make(chan engine.Instance, eventBufferSize),
@@ -193,10 +184,49 @@ func New(cfg *config.Config, client kclient.Interface, log *slog.Logger) (*Provi
 		gcFirstDelay: defaultGCFirstDelay,
 		orphanMinAge: defaultOrphanMinAge,
 	}
-	if err := p.validateProfiles(); err != nil {
-		return nil, err
-	}
 	return p, nil
+}
+
+// Validate runs the checks of New that need no cluster (for "quackmux
+// validate"): the instance, the grace period and every profile rendered
+// once. The namespace is checked only when the configuration names one.
+func Validate(cfg *config.Config) error {
+	ns := strings.TrimSpace(cfg.Provider.Kubernetes.Namespace)
+	if ns == "" {
+		ns = "default"
+	}
+	_, err := newRenderer(cfg, ns)
+	return err
+}
+
+// newRenderer validates the provider settings and the profiles and returns
+// the renderer for them.
+func newRenderer(cfg *config.Config, ns string) (renderer, error) {
+	kc := cfg.Provider.Kubernetes
+	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
+		return renderer{}, fmt.Errorf("kubernetes provider: invalid namespace %q: %s", ns, strings.Join(errs, "; "))
+	}
+	instance := strings.TrimSpace(kc.Instance)
+	if instance == "" {
+		instance = "default"
+	}
+	if errs := content.IsLabelValue(instance); len(errs) > 0 {
+		return renderer{}, fmt.Errorf("kubernetes provider: provider.kubernetes.instance %q is not a valid label value: %s",
+			instance, strings.Join(errs, "; "))
+	}
+	grace := defaultGracePeriod
+	if kc.DeleteGracePeriod.IsSet() {
+		grace = kc.DeleteGracePeriod.Duration
+	}
+	if grace < time.Second {
+		// A grace period of 0 force-deletes the pod while DuckDB still runs.
+		return renderer{}, fmt.Errorf("kubernetes provider: provider.kubernetes.deleteGracePeriod must be at least 1s, got %s", grace)
+	}
+	r := renderer{cfg: cfg, namespace: ns, instance: instance, grace: grace}
+	if err := r.validateProfiles(); err != nil {
+		return renderer{}, err
+	}
+	return r, nil
 }
 
 // processIdentity names the gateway process in events: $POD_NAME, else the
@@ -271,7 +301,10 @@ func (p *Provider) Run(ctx context.Context) error {
 		}
 		wg.Wait()
 		close(p.stopped)
+		p.closeMu.Lock()
+		p.eventsClosed = true
 		close(p.events)
+		p.closeMu.Unlock()
 	}()
 
 	selector := p.selector.String()
@@ -405,7 +438,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		Name: req.ID, Key: req.Key, Warm: req.Warm, User: req.User,
 		ProfileName: req.ProfileName, Profile: req.Profile, SpecHash: hash,
 	})
-	secret := p.secret(req.ID, req.Token)
+	secret := p.secret(req.ID, req.Token, engine.RenderInitSQL(req.Profile))
 	secrets := p.client.CoreV1().Secrets(p.namespace)
 
 	// Known before the pod exists, so that its first events carry the token.
@@ -465,16 +498,16 @@ func (p *Provider) attachSecret(ctx context.Context, secretName string, pod *cor
 }
 
 // Claim implements engine.Provider: it re-keys a warm-pool pod for a
-// session (labels key-hash, share-level, warm=false and the key annotation)
-// and gives it its activeDeadlineSeconds backstop.
-func (p *Provider) Claim(ctx context.Context, id string, key engine.Key) error {
+// session (labels key-hash, share-level, warm=false, the key and user
+// annotations) and gives it its activeDeadlineSeconds backstop.
+func (p *Provider) Claim(ctx context.Context, id string, key engine.Key, user string) error {
 	patch := map[string]any{"metadata": map[string]any{
 		"labels": map[string]string{
 			LabelKeyHash:    key.Hash(),
 			LabelShareLevel: strings.ToLower(string(key.ShareLevel)),
 			LabelWarm:       "false",
 		},
-		"annotations": map[string]string{AnnotationKey: key.String()},
+		"annotations": map[string]string{AnnotationKey: key.String(), AnnotationUser: user},
 	}}
 	if d := p.claimDeadline(id); d > 0 {
 		patch["spec"] = map[string]any{"activeDeadlineSeconds": d}
@@ -529,10 +562,15 @@ func (p *Provider) Terminate(ctx context.Context, id string, reason string) erro
 	}
 	grace := ceilSeconds(p.grace)
 	err := pods.Delete(ctx, id, metav1.DeleteOptions{GracePeriodSeconds: &grace})
+	gone := false
 	switch {
 	case err == nil:
 		p.log.Debug("deleting engine pod", "engine", id, "reason", reason)
 	case apierrors.IsNotFound(err):
+		// No pod (any more), for example after a create that the API server
+		// rejected. The informer reports nothing for a pod that never
+		// existed, and the manager forgets an engine only on Gone.
+		gone = true
 	default:
 		return fmt.Errorf("delete engine pod %s: %w", id, err)
 	}
@@ -543,7 +581,21 @@ func (p *Provider) Terminate(ctx context.Context, id string, reason string) erro
 		// The owner reference or the orphan collector removes it later.
 		p.log.Warn("deleting the token secret of an engine failed", "engine", id, "secret", secretName, "err", err)
 	}
+	if gone {
+		p.emitGone(ctx, id, "no engine pod")
+	}
 	return nil
+}
+
+// emitGone reports that an engine has no pod. A second Gone for the same pod
+// (from the informer) is harmless.
+func (p *Provider) emitGone(ctx context.Context, id, msg string) {
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+	if p.eventsClosed {
+		return
+	}
+	p.emit(ctx, engine.Instance{ID: id, Phase: engine.PhaseGone, Message: msg})
 }
 
 // recordEvent records a Kubernetes event about the termination on the pod,

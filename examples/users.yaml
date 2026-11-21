@@ -3,7 +3,7 @@
 # Secret (deploy/kubernetes/base/secrets/users.yaml).
 #
 # Create a token and its hash:   quackmux token
-# Hash an existing token:        quackmux hash-token TOKEN
+# Hash an existing token:        quackmux hash-token < FILE   (or: hash-token TOKEN)
 #
 # Clients send the token itself, optionally followed by options:
 #   change-me-example-token-0000?share_level=connection&profile=large

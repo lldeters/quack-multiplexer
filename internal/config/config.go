@@ -46,7 +46,11 @@ type ServerConfig struct {
 	// Banner is returned on GET /.
 	Banner string `json:"banner,omitempty"`
 	// AllowedOrigins for CORS (DuckDB-Wasm clients). Default ["*"] like the
-	// stock Quack server.
+	// stock Quack server, but none with auth.mode none: without
+	// authentication, any web page could run queries through the browser of
+	// a user who reaches the gateway. Requests that carry an Origin header
+	// (browsers send it with every POST) from other origins are refused. An
+	// explicit empty list allows none.
 	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
 	// MaxHandshakeBytes bounds a CONNECTION_REQUEST body (default 64KiB).
 	MaxHandshakeBytes int `json:"maxHandshakeBytes,omitempty"`
@@ -79,6 +83,11 @@ type UpstreamConfig struct {
 	// ControlTimeout bounds requests the gateway sends on its own
 	// (DISCONNECT, CANCEL on behalf of a closed session).
 	ControlTimeout Duration `json:"controlTimeout,omitempty"`
+	// HandshakeTimeout bounds the handshake with an engine (the
+	// CONNECTION_REQUEST of a client), which a healthy engine answers at
+	// once. It is independent of the client: a client that gives up does
+	// not leave a half-created backend connection behind.
+	HandshakeTimeout Duration `json:"handshakeTimeout,omitempty"`
 	// The engine's HTTP server (cpp-httplib) aborts a connection when the
 	// peer stalls for 5s and rejects bodies over 100 MiB. Like nginx, the
 	// gateway therefore buffers messages in memory so that slow clients never
@@ -293,6 +302,11 @@ type StaticProviderConfig struct {
 	Engines []StaticEngine `json:"engines"`
 	// HealthInterval for GET / probes (default 10s).
 	HealthInterval Duration `json:"healthInterval,omitempty"`
+	// FailureThreshold is the number of probes in a row that must fail
+	// before an engine is taken out of rotation (default 3). Its sessions
+	// are closed then, so a single lost probe (a busy engine that sheds a
+	// connection) must not count.
+	FailureThreshold int `json:"failureThreshold,omitempty"`
 }
 
 // StaticEngine is a pre-existing Quack server.
@@ -313,8 +327,12 @@ type StaticEngine struct {
 // Profile describes one kind of engine.
 type Profile struct {
 	Description string `json:"description,omitempty"`
-	// Image is the engine container image (DuckDB 2.0 with quack).
-	Image           string            `json:"image,omitempty"`
+	// Image is the engine container image (DuckDB 2.0 with quack). It
+	// replaces the image of the podTemplate's engine container; without
+	// both, DefaultEngineImage applies.
+	Image string `json:"image,omitempty"`
+	// ImagePullPolicy likewise replaces the podTemplate's (default
+	// IfNotPresent).
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 	// Database is the DuckDB database path inside the engine (":memory:").
 	Database string `json:"database,omitempty"`
@@ -446,14 +464,19 @@ func (c *Config) ApplyDefaults() {
 	setDur(&s.IdleTimeout, 300*time.Second)
 	setDur(&s.ShutdownTimeout, 30*time.Second)
 	setStr(&s.Banner, "This is a quackmux gateway for DuckDB Quack. Use ATTACH 'quack:...' to connect here.\n")
-	if len(s.AllowedOrigins) == 0 {
-		s.AllowedOrigins = []string{"*"}
+	if s.AllowedOrigins == nil {
+		if c.Auth.Mode == "none" {
+			s.AllowedOrigins = []string{}
+		} else {
+			s.AllowedOrigins = []string{"*"}
+		}
 	}
 	u := &s.Upstream
 	setDur(&u.DialTimeout, 5*time.Second)
 	setInt(&u.MaxIdleConnsPerEngine, 64)
 	setDur(&u.IdleConnTimeout, 90*time.Second)
 	setDur(&u.ControlTimeout, 10*time.Second)
+	setDur(&u.HandshakeTimeout, 30*time.Second)
 	if u.MaxBufferedRequestBytes == 0 {
 		u.MaxBufferedRequestBytes = 100 << 20
 	}
@@ -467,7 +490,14 @@ func (c *Config) ApplyDefaults() {
 		u.MaxRequestBytes = 100 << 20
 	}
 
-	setStr(&c.Admin.Listen, ":9495")
+	if c.Admin.TokenFile == "" {
+		// Without a token the admin API (which can close sessions and stop
+		// engines) is only reachable from this machine unless configured
+		// otherwise.
+		setStr(&c.Admin.Listen, "127.0.0.1:9495")
+	} else {
+		setStr(&c.Admin.Listen, ":9495")
+	}
 
 	setStr(&c.Auth.Mode, "static")
 	setStr(&c.Auth.None.DefaultUser, "anonymous")
@@ -542,16 +572,15 @@ func (c *Config) ApplyDefaults() {
 	setInt(&pr.PortRangeStart, 19500)
 	setInt(&pr.PortRangeEnd, 19999)
 	setDur(&p.Static.HealthInterval, 10*time.Second)
+	setInt(&p.Static.FailureThreshold, 3)
 
 	if len(c.Profiles) == 0 {
 		c.Profiles = map[string]Profile{DefaultProfileName: {}}
 	}
 	for name, prof := range c.Profiles {
-		setStr(&prof.Image, DefaultEngineImage)
+		// Image and ImagePullPolicy stay empty: the Kubernetes provider
+		// takes them from the profile's podTemplate, else the defaults.
 		setStr(&prof.Database, ":memory:")
-		if prof.ImagePullPolicy == "" {
-			prof.ImagePullPolicy = corev1.PullIfNotPresent
-		}
 		setInt(&prof.Pool.Size, 1)
 		setStr(&prof.Pool.SelectPolicy, "RANDOM")
 		prof.Pool.SelectPolicy = strings.ToUpper(prof.Pool.SelectPolicy)

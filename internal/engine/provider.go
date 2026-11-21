@@ -91,8 +91,11 @@ type Provider interface {
 	// Launch creates an instance and returns it in PhaseStarting (or
 	// PhaseReady). It must not wait for readiness.
 	Launch(ctx context.Context, req LaunchRequest) (Instance, error)
-	// Claim re-keys an unclaimed warm instance for a session.
-	Claim(ctx context.Context, id string, key Key) error
+	// Claim re-keys an unclaimed warm instance for a session of user. The
+	// user is kept like that of a launched instance (Instance.User), so that
+	// a restarted gateway still counts the engine against
+	// limits.maxEnginesPerUser.
+	Claim(ctx context.Context, id string, key Key, user string) error
 	// Terminate stops an instance and releases its resources. Terminating
 	// an unknown instance is not an error.
 	Terminate(ctx context.Context, id string, reason string) error

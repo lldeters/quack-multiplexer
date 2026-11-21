@@ -169,6 +169,15 @@ func parseUsersFile(data []byte, now time.Time) (*staticState, []logEntry, error
 				continue
 			}
 			tokenAt[hash] = twhere
+			if hash == exampleTokenSHA256 {
+				// The token of the shipped example file is public: never
+				// let it authenticate anybody.
+				warnings = append(warnings, logEntry{
+					"users file contains the public example token from the repository; it is ignored",
+					[]any{"user", u.Name, "token", tokenLabel(t, ti)},
+				})
+				continue
+			}
 			tok := &staticToken{user: user, label: tokenLabel(t, ti), expires: expires}
 			st.tokens[hash] = tok
 			if plain {
@@ -193,6 +202,10 @@ func parseUsersFile(data []byte, now time.Time) (*staticState, []logEntry, error
 	}
 	return st, warnings, nil
 }
+
+// exampleTokenSHA256 is the sha256 of "change-me-example-token-0000", the
+// token of the example users file in deploy/kubernetes/base/secrets.
+const exampleTokenSHA256 = "cef58a2821dd799a53522c76b3e602d8534f044586a2eb12a890e09e3a8f2de2"
 
 // tokenHash returns the lookup key of a token entry and whether the entry
 // holds the token in plain text.

@@ -38,6 +38,8 @@ server:
   # Text returned on GET / (without authentication).
   banner: "This is a quackmux gateway for DuckDB Quack. Use ATTACH 'quack:...' to connect here.\n"
   # CORS origins for DuckDB-Wasm clients, like the stock Quack server.
+  # Browser requests (they carry an Origin header) from other origins are
+  # refused. Default ["*"], but none ([]) with auth.mode none.
   allowedOrigins: ["*"]
   # Upper bound for the body of a CONNECTION_REQUEST (bytes, default 64 KiB).
   maxHandshakeBytes: 65536
@@ -65,6 +67,10 @@ server:
     # CANCEL on behalf of a closed session, heartbeats to the engine,
     # health probes).
     controlTimeout: 10s
+    # Timeout of the handshake with an engine (a client's ATTACH once the
+    # engine is ready). It does not depend on the client, so a client that
+    # gives up leaves no half-created engine connection behind.
+    handshakeTimeout: 30s
     # The engine's HTTP server aborts a connection whose peer stalls for 5s.
     # The gateway therefore buffers messages completely in memory, so that a
     # slow client never stalls an engine: requests up to
@@ -249,7 +255,9 @@ limits:
   maxSessionsPerUser: 0
   # Engines in total (starting, ready and draining).
   maxEngines: 0
-  # USER and CONNECTION engines per user.
+  # Engines a user caused to be started or claimed (a warm engine), of any
+  # share level: also a SERVER or GROUP engine (e.g. for a new subdomain)
+  # counts against the user whose session started it.
   maxEnginesPerUser: 0
   # Engines launching at the same time (0 means the default, 20).
   maxStartingEngines: 20
@@ -272,7 +280,9 @@ provider:
     instance: default
     # Prefix of engine pod names, e.g. quack-user-alice-x7k2p.
     namePrefix: quack
-    # Grace period when deleting engine pods.
+    # Grace period when deleting engine pods (at least 1s). The engine gets
+    # 5s less (at least 1s) as QUACKMUX_STOP_TIMEOUT to stop DuckDB, with a
+    # checkpoint of a database file, before the kubelet kills it.
     deleteGracePeriod: 30s
     # Rate limit of the Kubernetes API client.
     qps: 20
@@ -313,6 +323,9 @@ provider:
     #     poolIndex: 0
     # Period of the GET / health probes.
     healthInterval: 10s
+    # Probes that must fail in a row before an engine (and every session on
+    # it) is taken out of rotation.
+    failureThreshold: 3
 
 # -----------------------------------------------------------------------------
 # Engine profiles: what an engine looks like. Names must not be empty or
@@ -323,12 +336,15 @@ profiles:
     # Free text for operators (admin API).
     description: ""
     # Engine container image: DuckDB 2.0 with the quack and httpfs extensions
-    # (images/engine). The engine container contract: the gateway sets
-    # QUACK_TOKEN, QUACKMUX_DATABASE, QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494),
-    # QUACKMUX_ENGINE_ID, QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER,
-    # QUACKMUX_SUBDOMAIN and QUACKMUX_PROFILE.
+    # (images/engine). Without it, the image of the podTemplate's engine
+    # container applies, else quackmux/duckdb-engine:2.0.0. The engine
+    # container contract: the gateway sets QUACK_TOKEN, QUACKMUX_DATABASE,
+    # QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494), QUACKMUX_ENGINE_ID,
+    # QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER, QUACKMUX_SUBDOMAIN,
+    # QUACKMUX_PROFILE and QUACKMUX_STOP_TIMEOUT.
     image: quackmux/duckdb-engine:2.0.0
-    # Always | IfNotPresent | Never
+    # Always | IfNotPresent | Never (without it: the podTemplate's, else
+    # IfNotPresent)
     imagePullPolicy: IfNotPresent
     # DuckDB database inside the engine. ":memory:" is lost with the pod; a
     # file needs a volume (see podTemplate).
@@ -349,6 +365,9 @@ profiles:
     #   memory_limit: 3GB
     #   threads: "2"
     #   temp_directory: /tmp/duckdb-spill
+    #   # Spill space; without it DuckDB may fill 90% of the node's free disk
+    #   # (keep it below resources.limits.ephemeral-storage).
+    #   max_temp_directory_size: 20GiB
     # Several engines per key, sessions spread over them (Kyuubi:
     # kyuubi.engine.pool.size / selectPolicy). Every engine has its own
     # database state: only for stateless workloads (reading a lake).
@@ -384,9 +403,11 @@ profiles:
     #   requests:
     #     cpu: "1"
     #     memory: 2Gi
+    #     ephemeral-storage: 2Gi
     #   limits:
     #     cpu: "2"
     #     memory: 4Gi
+    #     ephemeral-storage: 24Gi
     # Extra environment variables of the engine container (the contract
     # variables above are always set by the gateway and cannot be replaced).
     env: []
@@ -490,7 +511,9 @@ ha:
   # The leader steps down (and the process exits) when it could not renew
   # the lease for this long; must be shorter than leaseDuration.
   renewDeadline: 10s
-  # Interval of renewal and acquisition attempts.
+  # Interval of renewal and acquisition attempts. A process that just started
+  # waits 3 x retryPeriod before it campaigns, so that the replicas that run
+  # already take over first (deploy/kubernetes/README.md, "Rollout").
   retryPeriod: 2s
 
 # -----------------------------------------------------------------------------

@@ -232,7 +232,7 @@ E2E_EXTENSION_DIR=${E2E_EXTENSION_DIR-/opt/duckdb/extensions}
 client_preamble() {
 	echo ".mode list"
 	if [ -n "$E2E_EXTENSION_DIR" ]; then
-		printf "SET extension_directory = '%s';\n" "$E2E_EXTENSION_DIR"
+		printf "SET extension_directories = ['%s'];\n" "$E2E_EXTENSION_DIR"
 	fi
 	echo "SET autoinstall_known_extensions = false;"
 	echo "LOAD httpfs;"
@@ -441,11 +441,15 @@ summary() {
 
 # build_images ENGINE_IMAGE GATEWAY_IMAGE builds the engine image from
 # images/engine and the gateway image from the root Dockerfile.
+# DOCKER_BUILD_FLAGS (split at spaces, as in the Makefile) are passed to both
+# builds, e.g. "--network host --build-arg GOPROXY=..." behind a proxy.
 build_images() {
 	[ -f "$REPO_ROOT/images/engine/Dockerfile" ] || die "$REPO_ROOT/images/engine/Dockerfile not found"
 	[ -f "$REPO_ROOT/Dockerfile" ] || die "$REPO_ROOT/Dockerfile not found"
 	say "building engine image $1 (images/engine)"
-	docker build -t "$1" "$REPO_ROOT/images/engine"
+	# shellcheck disable=SC2086 # DOCKER_BUILD_FLAGS is a list of flags
+	docker build ${DOCKER_BUILD_FLAGS:-} -t "$1" "$REPO_ROOT/images/engine"
 	say "building gateway image $2 (Dockerfile)"
-	docker build -t "$2" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+	# shellcheck disable=SC2086
+	docker build ${DOCKER_BUILD_FLAGS:-} -t "$2" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
 }

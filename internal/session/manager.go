@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"quackmux/internal/config"
 	"quackmux/internal/engine"
 	"quackmux/internal/metrics"
@@ -132,6 +134,8 @@ type Manager struct {
 	log     *slog.Logger
 	met     *metrics.Metrics
 	now     func() time.Time
+	// fence, if set, must report true for Reap to act (see SetFence).
+	fence func() bool
 
 	mu         sync.RWMutex
 	sessions   map[string]*Session
@@ -140,6 +144,12 @@ type Manager struct {
 	pending    map[string]int // connects in progress per user
 	total      int
 	wg         sync.WaitGroup // background control requests
+	bgMu       sync.Mutex     // orders spawn against Shutdown
+	bgClosed   bool
+
+	// adoptions confirms each adopted session with the engine once, also
+	// when many requests of it arrive at the same time.
+	adoptions singleflight.Group
 }
 
 // NewManager creates a session manager.
@@ -161,6 +171,13 @@ func NewManager(cfg *config.Config, engines Engines, backend Backend, sealer *Se
 
 // SetClock replaces the clock (tests).
 func (m *Manager) SetClock(now func() time.Time) { m.now = now }
+
+// SetFence makes Reap do nothing while fence reports false. With leader
+// election it reports whether this process still holds a fresh lease
+// (ha.Elector.Fresh): a leader that resumes after a freeze sees the
+// heartbeats of its sessions missing, because the new leader received them,
+// and must not close those sessions on the engines. Call it before Run.
+func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
 
 // Reservation holds a slot under the session limits while a connect is in
 // progress. Exactly one of Open or Cancel must be called.
@@ -313,6 +330,30 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 		}
 		return nil, &Closed{Reason: fmt.Sprintf("engine is %s", st), MustInvalidate: true, ClosedAt: m.now()}, nil
 	}
+	// Adopt only connections the engine still has. The gateway disconnects
+	// every session it closes, so this keeps a closed session from coming
+	// back once its tombstone expired or a restart forgot it (DuckDB clients
+	// keep heartbeating while attached). It also renews the engine lease.
+	v, err, _ := m.adoptions.Do(route.SessionID, func() (any, error) {
+		at := m.now()
+		return at, m.backend.Heartbeat(context.Background(), target.Endpoint, route.BackendConnID)
+	})
+	if err != nil {
+		var ee *upstream.EngineError
+		if errors.As(err, &ee) && upstream.IsSessionGone(ee.Response.Message) {
+			c := Closed{Reason: "the engine no longer knows this connection", ClosedAt: m.now()}
+			m.mu.Lock()
+			if m.sessions[route.SessionID] == nil {
+				m.tombstones[route.SessionID] = tombstone{Closed: c, user: route.User}
+			}
+			m.mu.Unlock()
+			return nil, &c, nil
+		}
+		m.log.Warn("cannot confirm a session with its engine", "session", route.SessionID, "engine", engineID, "err", err)
+		return nil, &Closed{Reason: "engine " + engineID + " is not reachable, try again shortly",
+			Transient: true, ClosedAt: m.now()}, nil
+	}
+	confirmedAt := v.(time.Time)
 	now := m.now()
 	key := target.Key
 	if key.ShareLevel == engine.ShareConnection && key.Owner == "" {
@@ -330,14 +371,19 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	}
 	s.lastSeen.Store(now.UnixNano())
 	s.lastActive.Store(now.UnixNano())
-	s.lastBackend.Store(now.UnixNano())
+	s.lastBackend.Store(confirmedAt.UnixNano()) // the confirming heartbeat renewed the engine lease
+	// Attach to the engine before the session becomes visible: a close right
+	// after (engine gone, admin) detaches it, which must not come first.
+	m.engines.AttachAdopted(s.EngineID, s.ID, s.User)
 	m.mu.Lock()
 	if existing := m.sessions[s.ID]; existing != nil { // lost a race with a concurrent adoption
 		m.mu.Unlock()
+		m.engines.DetachSession(s.EngineID)
 		return existing, nil, nil
 	}
 	if t, dead := m.tombstones[s.ID]; dead {
 		m.mu.Unlock()
+		m.engines.DetachSession(s.EngineID)
 		c := t.Closed
 		return nil, &c, nil
 	}
@@ -345,7 +391,6 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	m.perUser[s.User]++
 	m.total++
 	m.mu.Unlock()
-	m.engines.AttachAdopted(s.EngineID, s.ID, s.User)
 	m.metricOpened(s)
 	m.log.Info("session adopted", "session", s.ID, "user", s.User, "engine", s.EngineID)
 	return s, nil, nil
@@ -372,9 +417,19 @@ func (s *Session) Begin(now time.Time, t wire.MessageType) (*Closed, bool) {
 	return nil, true
 }
 
-// TouchBackend records that a request of this session reached the engine
-// (which renews the engine-side lease).
-func (s *Session) TouchBackend(now time.Time) { s.lastBackend.Store(now.UnixNano()) }
+// TouchBackend records that a message of this session reached the engine at
+// or after t: the engine renews its lease when a message arrives, so t is the
+// time the message was sent, not when it was answered. The stamp only moves
+// forward (a long request may be answered after a later keep-alive).
+func (s *Session) TouchBackend(t time.Time) {
+	n := t.UnixNano()
+	for {
+		old := s.lastBackend.Load()
+		if n <= old || s.lastBackend.CompareAndSwap(old, n) {
+			return
+		}
+	}
+}
 
 // End marks the end of a request started with Begin.
 func (s *Session) End(now time.Time, t wire.MessageType) {
@@ -446,9 +501,7 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 
 	if mode.Disconnect || mode.Cancel {
 		if target, ok := m.engines.Lookup(s.EngineID); ok {
-			m.wg.Add(1)
-			go func() {
-				defer m.wg.Done()
+			m.spawn(func() {
 				ctx := context.Background()
 				if mode.Cancel {
 					if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil {
@@ -460,14 +513,39 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 						m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
 					}
 				}
-			}()
+			})
 		}
 	}
 	return true
 }
 
-// Wait blocks until background control requests finished (tests, shutdown).
+// spawn runs f in the background unless the manager is shutting down.
+func (m *Manager) spawn(f func()) bool {
+	m.bgMu.Lock()
+	defer m.bgMu.Unlock()
+	if m.bgClosed {
+		return false
+	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		f()
+	}()
+	return true
+}
+
+// Wait blocks until background control requests finished (tests).
 func (m *Manager) Wait() { m.wg.Wait() }
+
+// Shutdown starts no more background control requests and waits for the
+// running ones. Handlers may still be running (the HTTP shutdown can time
+// out), so starting new ones must stop before the wait.
+func (m *Manager) Shutdown() {
+	m.bgMu.Lock()
+	m.bgClosed = true
+	m.bgMu.Unlock()
+	m.wg.Wait()
+}
 
 func reasonLabel(reason string) string {
 	for _, p := range []string{"client disconnect", "idle timeout", "max lifetime", "heartbeat lease expired",
@@ -485,8 +563,10 @@ func (m *Manager) ClosedByClient(s *Session) {
 }
 
 // ClosedByBackend records that the engine no longer knows the connection.
+// The DISCONNECT is best effort: should the engine still have the
+// connection after all, it is not left behind.
 func (m *Manager) ClosedByBackend(s *Session, msg string) {
-	m.close(s, "backend closed the connection: "+msg, CloseMode{Force: true}, nil)
+	m.close(s, "backend closed the connection: "+msg, CloseMode{Force: true, Disconnect: true}, nil)
 }
 
 // EngineGone implements engine.SessionCloser.
@@ -518,6 +598,10 @@ func (m *Manager) byEngine(engineID string) []*Session {
 // Reap applies session timeouts. It runs periodically (Run) and may be
 // called directly (tests).
 func (m *Manager) Reap() {
+	if m.fence != nil && !m.fence() {
+		m.log.Debug("not applying session timeouts: the leader lease is not fresh")
+		return
+	}
 	now := m.now()
 	sc := m.cfg.Session
 	m.mu.RLock()
@@ -546,10 +630,14 @@ func (m *Manager) Reap() {
 				continue
 			}
 		}
-		// The gateway answers client heartbeats itself; keep the engine-side
-		// lease (session.backendHeartbeatTimeout) alive for quiet sessions.
+		// The gateway answers client heartbeats itself, so it keeps the
+		// engine-side lease (session.backendHeartbeatTimeout) alive. The
+		// engine renews the lease only when a message arrives, and a long
+		// PREPARE or FETCH carries none while it runs: keep-alives go out
+		// with requests in flight as well, like the stock client's
+		// heartbeats.
 		if every := sc.BackendHeartbeatTimeout.Duration / 3; every > 0 &&
-			now.Sub(time.Unix(0, s.lastBackend.Load())) > every && s.InFlight() == 0 {
+			now.Sub(time.Unix(0, s.lastBackend.Load())) > every {
 			m.keepAlive(s, now)
 		}
 	}
@@ -578,9 +666,7 @@ func (m *Manager) keepAlive(s *Session, now time.Time) {
 	if !ok || !s.keepalive.CompareAndSwap(false, true) {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	if !m.spawn(func() {
 		defer s.keepalive.Store(false)
 		err := m.backend.Heartbeat(context.Background(), target.Endpoint, s.BackendConnID)
 		var ee *upstream.EngineError
@@ -592,22 +678,44 @@ func (m *Manager) keepAlive(s *Session, now time.Time) {
 		default:
 			m.log.Debug("backend keep-alive failed", "session", s.ID, "engine", s.EngineID, "err", err)
 		}
-	}()
+	}) {
+		s.keepalive.Store(false)
+	}
 }
 
 // Run reaps sessions until ctx is cancelled.
+//
+// After a pause of the whole process (a stopped container or VM, a stalled
+// node) one round is skipped, so that the heartbeats that queued up in the
+// meantime are processed before the sessions are judged by them.
 func (m *Manager) Run(ctx context.Context) {
-	t := time.NewTicker(m.cfg.Session.CheckInterval.Duration)
+	every := m.cfg.Session.CheckInterval.Duration
+	t := time.NewTicker(every)
 	defer t.Stop()
+	last := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m.Reap()
+			// Both cases may be ready at once, and select picks at random.
+			if ctx.Err() != nil {
+				return
+			}
+			if gap := time.Since(last); paused(gap, every) {
+				m.log.Warn("the gateway was paused, skipping one round of session timeouts", "paused", gap.Round(time.Second))
+			} else {
+				m.Reap()
+			}
+			last = time.Now()
 		}
 	}
 }
+
+// paused reports whether gap, the time between the end of a Run round and
+// the next tick of its ticker (period every), means that the process stood
+// still rather than that it was busy.
+func paused(gap, every time.Duration) bool { return gap > 2*every+time.Second }
 
 // Get returns a snapshot of an open session.
 func (m *Manager) Get(id string) (View, bool) {

@@ -685,7 +685,11 @@ func TestRenewTracker(t *testing.T) {
 	}{
 		{"successful update as holder", func(tr *renewTracker, _ *fakeLock) error { return tr.Update(ctx, rec("me")) }, true},
 		{"successful create as holder", func(tr *renewTracker, _ *fakeLock) error { return tr.Create(ctx, rec("me")) }, true},
-		{"release does not count", func(tr *renewTracker, _ *fakeLock) error { return tr.Update(ctx, rec("")) }, false},
+		{"release does not count", func(tr *renewTracker, _ *fakeLock) error {
+			me := "me"
+			tr.holder.Store(&me) // client-go reads the lease before it releases it
+			return tr.Update(ctx, rec(""))
+		}, false},
 		{"other holder does not count", func(tr *renewTracker, _ *fakeLock) error { return tr.Update(ctx, rec("you")) }, false},
 		{"failed update does not count", func(tr *renewTracker, fl *fakeLock) error {
 			fl.setErr(errors.New("boom"))
@@ -823,4 +827,155 @@ func TestWatchdog(t *testing.T) {
 		cancel(nil)
 		<-done
 	})
+}
+
+// Validate ("quackmux validate") rejects what New would, without a cluster;
+// in particular the lease name derived from an instance that is a valid
+// label value but no object name.
+func TestValidate(t *testing.T) {
+	cfg, err := config.Parse([]byte("auth: {mode: none}\nserver: {sessionKeyFile: /x}\nha: {enabled: true}\nprovider: {kubernetes: {instance: Prod}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(cfg.HA); err == nil || !strings.Contains(err.Error(), "ha.leaseName") {
+		t.Fatalf("lease name %q: %v", cfg.HA.LeaseName, err)
+	}
+	cfg.HA.LeaseName = "quackmux-prod"
+	if err := Validate(cfg.HA); err != nil {
+		t.Fatalf("explicit lease name: %v", err)
+	}
+	bad := cfg.HA
+	bad.Namespace = "Not_A_Namespace"
+	if err := Validate(bad); err == nil {
+		t.Error("invalid namespace accepted")
+	}
+	bad = cfg.HA
+	bad.RenewDeadline = bad.LeaseDuration
+	if err := Validate(bad); err == nil {
+		t.Error("renewDeadline = leaseDuration accepted")
+	}
+}
+
+// Fresh needs a renewal within RenewDeadline, not only the leader flag: a
+// leader that resumes after a freeze is still flagged as leader until its
+// watchdog runs, and must not act on its outdated view meanwhile.
+func TestFreshNeedsARecentRenewal(t *testing.T) {
+	e, err := New(Options{Config: shortTimings(), Client: fake.NewSimpleClientset(), Namespace: testNamespace, Identity: "gw-0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Fresh() {
+		t.Fatal("fresh before Run")
+	}
+	tr := newRenewTracker(&resourcelock.LeaseLock{LockConfig: resourcelock.ResourceLockConfig{Identity: "gw-0"}})
+	tr.base = time.Now().Add(-time.Minute)
+	e.renew.Store(tr)
+	e.setLeader(true)
+	if e.Fresh() {
+		t.Fatal("fresh without any renewal")
+	}
+	mine := resourcelock.LeaderElectionRecord{HolderIdentity: "gw-0"}
+	tr.observe(time.Since(tr.base)-2*e.renewDeadline, mine, nil) // renewed, then frozen
+	if !e.IsLeader() || e.Fresh() {
+		t.Fatalf("leader %v, fresh %v after a renewal 2 x renewDeadline ago", e.IsLeader(), e.Fresh())
+	}
+	tr.observe(time.Since(tr.base), resourcelock.LeaderElectionRecord{HolderIdentity: "gw-1"}, nil)
+	if e.Fresh() {
+		t.Fatal("another holder's record counts as a renewal")
+	}
+	tr.observe(time.Since(tr.base), mine, nil)
+	if !e.Fresh() {
+		t.Fatal("not fresh right after a renewal")
+	}
+	e.setLeader(false)
+	if e.Fresh() {
+		t.Fatal("fresh without leadership")
+	}
+}
+
+// recordingLock is a lease lock that serves a fixed record and counts writes.
+type recordingLock struct {
+	id      string
+	rec     resourcelock.LeaderElectionRecord
+	updates int
+}
+
+func (l *recordingLock) Get(context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	r := l.rec
+	return &r, []byte(r.HolderIdentity), nil
+}
+func (l *recordingLock) Create(context.Context, resourcelock.LeaderElectionRecord) error { return nil }
+func (l *recordingLock) Update(_ context.Context, r resourcelock.LeaderElectionRecord) error {
+	l.updates++
+	l.rec = r
+	return nil
+}
+func (l *recordingLock) RecordEvent(string) {}
+func (l *recordingLock) Identity() string   { return l.id }
+func (l *recordingLock) Describe() string   { return "test/lease" }
+
+// A candidate releases only a lease it holds. client-go releases after
+// reading the lease but decides on the record it observed at its last
+// renewal: a leader that resumes after a freeze would otherwise empty the
+// lease of the candidate that took over meanwhile (kind HA test, h3).
+func TestReleaseOnlyByTheHolder(t *testing.T) {
+	ctx := context.Background()
+	release := resourcelock.LeaderElectionRecord{LeaseDurationSeconds: 1}
+	l := &recordingLock{id: "gw-0", rec: resourcelock.LeaderElectionRecord{HolderIdentity: "gw-1"}}
+	tr := newRenewTracker(l)
+	if err := tr.Update(ctx, release); !errors.Is(err, errNotHolder) {
+		t.Fatalf("release before any read: %v", err)
+	}
+	if _, _, err := tr.Get(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Update(ctx, release); !errors.Is(err, errNotHolder) {
+		t.Fatalf("release of gw-1's lease: %v", err)
+	}
+	if l.updates != 0 || l.rec.HolderIdentity != "gw-1" {
+		t.Fatalf("the lease of gw-1 was written: %+v (%d updates)", l.rec, l.updates)
+	}
+	// Renewals are not affected, and the holder may release its own lease.
+	if err := tr.Update(ctx, resourcelock.LeaderElectionRecord{HolderIdentity: "gw-0"}); err != nil {
+		t.Fatalf("renewal: %v", err)
+	}
+	if _, _, err := tr.Get(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Update(ctx, release); err != nil || l.rec.HolderIdentity != "" {
+		t.Fatalf("release of the own lease: %v, record %+v", err, l.rec)
+	}
+}
+
+// A process that just started lets the candidates that run already go first:
+// when the leader goes away orderly, the waiting follower takes over, not the
+// pod that replaces the old leader. In a rollout that pod has the old template
+// (its ReplicaSet re-creates it), and its leadership stalled the rollout
+// (kind HA test, h4).
+func TestRunningCandidateWinsOverFreshOne(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	a := newElector(t, client, "gw-a", shortTimings(), nil)
+	b := newElector(t, client, "gw-b", shortTimings(), nil)
+	c := newElector(t, client, "gw-c", shortTimings(), nil)
+
+	ca := start(t, a, true)
+	ca.waitLeading(t)
+	cb := start(t, b, true)
+	waitFor(t, "b to campaign and observe a", func() bool { return b.Leader() == "gw-a" })
+	// a leaves (and releases the lease) while its replacement c starts.
+	ca.cancel()
+	cc := start(t, c, true)
+	if err := ca.wait(t); err != nil {
+		t.Fatalf("a: Run = %v", err)
+	}
+	cb.waitLeading(t)
+	time.Sleep(10 * c.retryPeriod)
+	if h := holder(getLease(t, client)); h != "gw-b" || c.IsLeader() {
+		t.Fatalf("holder %q (c leads: %v), want the running candidate gw-b", h, c.IsLeader())
+	}
+	for _, x := range []*candidate{cb, cc} {
+		if err := x.stop(t); err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	}
 }

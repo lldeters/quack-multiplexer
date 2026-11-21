@@ -10,6 +10,8 @@
 # Optional environment (see env.sh for more):
 #   SKIP_BUILD=1       load the existing images instead of building them
 #   KIND_NODE_IMAGE    node image for "kind create cluster --image"
+#   KIND_CONFIG        kind cluster configuration for "kind create cluster --config",
+#                      e.g. to set failCgroupV1: false on hosts with cgroup v1
 #   ROLLOUT_TIMEOUT    wait for the gateway rollout (default 180s)
 set -euo pipefail
 # shellcheck source=env.sh
@@ -38,7 +40,8 @@ clusters=$(kind get clusters 2>/dev/null || true)
 if grep -qx -- "$KIND_CLUSTER" <<<"$clusters"; then
 	say "the cluster exists"
 else
-	kind create cluster --name "$KIND_CLUSTER" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 120s
+	kind create cluster --name "$KIND_CLUSTER" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} \
+		${KIND_CONFIG:+--config "$KIND_CONFIG"} --wait 120s
 fi
 kctl cluster-info >/dev/null || die "cannot reach the cluster with context $KUBE_CONTEXT"
 

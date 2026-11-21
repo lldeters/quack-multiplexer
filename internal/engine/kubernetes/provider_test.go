@@ -309,12 +309,12 @@ func TestClaim(t *testing.T) {
 	waitFor(t, "pod in cache", func() bool { return e.p.cachedPod(req.ID) != nil })
 
 	claimKey := engine.Key{ShareLevel: engine.ShareConnection, Owner: "sess-42", Subdomain: "default", Profile: "default"}
-	if err := e.p.Claim(ctx, req.ID, claimKey); err != nil {
+	if err := e.p.Claim(ctx, req.ID, claimKey, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	pod, _ = pods.Get(ctx, req.ID, metav1.GetOptions{})
 	if pod.Labels[LabelKeyHash] != claimKey.Hash() || pod.Labels[LabelShareLevel] != "connection" || pod.Labels[LabelWarm] != "false" ||
-		pod.Annotations[AnnotationKey] != claimKey.String() {
+		pod.Annotations[AnnotationKey] != claimKey.String() || pod.Annotations[AnnotationUser] != "alice" {
 		t.Errorf("claimed pod metadata %v %v", pod.Labels, pod.Annotations)
 	}
 	if d := pod.Spec.ActiveDeadlineSeconds; d == nil || *d != int64((2*time.Hour+time.Hour+10*time.Minute)/time.Second) {
@@ -324,12 +324,12 @@ func TestClaim(t *testing.T) {
 		t.Error("a claim must merge, not replace, the metadata")
 	}
 	claimed := waitEvent(t, e.p, "claimed instance", func(i engine.Instance) bool { return i.ID == req.ID && !i.Warm })
-	if claimed.Key != claimKey || claimed.Token != "warm-token" {
+	if claimed.Key != claimKey || claimed.Token != "warm-token" || claimed.User != "alice" {
 		t.Errorf("claimed instance %+v", claimed)
 	}
 
 	// A pod that waited in the pool for 5h gets 5h + drainTimeout + 10m.
-	if err := e.p.Claim(ctx, old.Name, claimKey); err != nil {
+	if err := e.p.Claim(ctx, old.Name, claimKey, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	pod, _ = pods.Get(ctx, old.Name, metav1.GetOptions{})
@@ -337,7 +337,7 @@ func TestClaim(t *testing.T) {
 		t.Errorf("deadline of an old warm pod: %v", d)
 	}
 
-	if err := e.p.Claim(ctx, "quack-warm-default-missing", claimKey); err == nil {
+	if err := e.p.Claim(ctx, "quack-warm-default-missing", claimKey, "alice"); err == nil {
 		t.Error("claiming a missing pod must fail")
 	}
 }
@@ -500,7 +500,7 @@ func TestCollectOrphans(t *testing.T) {
 	e := newTestEnv(t, testConfig(t, ""))
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	mk := func(name, engineName, instance string, age time.Duration) *corev1.Secret {
-		s := e.p.secret(engineName, "t")
+		s := e.p.secret(engineName, "t", "")
 		s.Name = name
 		s.Labels[LabelInstance] = instance
 		s.CreationTimestamp = metav1.NewTime(now.Add(-age))

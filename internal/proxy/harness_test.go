@@ -128,14 +128,21 @@ func mergeYAML(t *testing.T, base, extra string) []byte {
 
 func newHarness(t *testing.T, yamlExtra string, prov *fake.Provider) *harness {
 	t.Helper()
+	if prov == nil {
+		prov = fake.New()
+	}
+	return newHarnessWith(t, yamlExtra, prov, prov)
+}
+
+// newHarnessWith runs the gateway on prov, a provider that wraps the fake
+// provider inner (whose engines the harness helpers inspect).
+func newHarnessWith(t *testing.T, yamlExtra string, inner *fake.Provider, prov engine.Provider) *harness {
+	t.Helper()
 	cfg, err := config.Parse(mergeYAML(t, baseConfig, yamlExtra))
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	if prov == nil {
-		prov = fake.New()
-	}
-	h := &harness{t: t, cfg: cfg, prov: prov, clock: newClock()}
+	h := &harness{t: t, cfg: cfg, prov: inner, clock: newClock()}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if testing.Verbose() {
 		log = slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -166,8 +173,8 @@ func newHarness(t *testing.T, yamlExtra string, prov *fake.Provider) *harness {
 		h.srv.Close()
 		cancel()
 		h.sessions.Wait()
-		for _, id := range prov.IDs() {
-			_ = prov.Terminate(context.Background(), id, "test cleanup")
+		for _, id := range inner.IDs() {
+			_ = inner.Terminate(context.Background(), id, "test cleanup")
 		}
 	})
 	return h
@@ -326,9 +333,11 @@ func (h *harness) backendConn(connID string) string {
 	return r.BackendConnID
 }
 
+// eventually polls cond until it holds. The deadline is generous: under the
+// race detector and a loaded machine a few goroutine hops can take seconds.
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

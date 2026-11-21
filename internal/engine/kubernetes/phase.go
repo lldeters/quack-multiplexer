@@ -71,6 +71,16 @@ func podStatus(pod *corev1.Pod) (phase engine.Phase, endpoint, message string) {
 	if main != nil && main.State.Terminated != nil {
 		return engine.PhaseFailed, "", truncate("engine container terminated: " + describeTermination(main.State.Terminated))
 	}
+	// Restarted in place all the same (a container-level restart policy,
+	// for example from a mutating webhook): a fresh DuckDB that has lost
+	// the state of its sessions.
+	if main != nil && main.RestartCount > 0 {
+		msg := fmt.Sprintf("engine container restarted in place (%d times)", main.RestartCount)
+		if t := main.LastTerminationState.Terminated; t != nil {
+			msg += ", last termination: " + describeTermination(t)
+		}
+		return engine.PhaseFailed, "", truncate(msg)
+	}
 	if cs := waitingContainer(pod, func(reason string) bool { return permanentWaitingReasons[reason] }); cs != nil {
 		return engine.PhaseFailed, "", truncate(waitingMessage(cs))
 	}

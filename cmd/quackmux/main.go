@@ -3,7 +3,7 @@
 //	quackmux serve -config /etc/quackmux/config.yaml
 //	quackmux validate -config config.yaml
 //	quackmux token            # generate a token and print its sha256 for users.yaml
-//	quackmux hash-token TOKEN # print the sha256 of an existing token
+//	quackmux hash-token [TOKEN] # print the sha256 of an existing token (read from stdin without TOKEN)
 //	quackmux version
 package main
 
@@ -14,6 +14,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -57,11 +59,7 @@ func main() {
 	case "token":
 		err = cmdToken()
 	case "hash-token":
-		if len(os.Args) != 3 {
-			err = errors.New("usage: quackmux hash-token TOKEN")
-		} else {
-			fmt.Println(auth.HashToken(os.Args[2]))
-		}
+		err = cmdHashToken(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("quackmux", version)
 	case "help", "-h", "--help":
@@ -83,7 +81,9 @@ Usage:
   quackmux serve -config FILE      run the gateway
   quackmux validate -config FILE   check a configuration file
   quackmux token                   generate a client token and its sha256
-  quackmux hash-token TOKEN        print the sha256 of a token (for users.yaml)
+  quackmux hash-token [TOKEN]      print the sha256 of a token (for users.yaml); without
+                                   TOKEN it is read from stdin, which keeps it out of
+                                   the process list and the shell history
   quackmux version
 `)
 }
@@ -92,11 +92,37 @@ func cmdValidate(args []string) error {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
 	path := fs.String("config", "config.yaml", "configuration file")
 	_ = fs.Parse(args)
-	if _, err := config.Load(*path); err != nil {
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	if err := validateStartup(cfg); err != nil {
 		return err
 	}
 	fmt.Println("configuration is valid")
 	return nil
+}
+
+// validateStartup runs the checks that "serve" makes at start-up as far as
+// they need no cluster, no engine and no secret files: the provider
+// settings (for Kubernetes with every profile rendered once) and the leader
+// election settings.
+func validateStartup(cfg *config.Config) error {
+	var errs []error
+	switch cfg.Provider.Type {
+	case "kubernetes":
+		errs = append(errs, kubernetes.Validate(cfg))
+	case "process":
+		// New only checks the settings; it starts nothing.
+		_, err := process.New(cfg, slog.New(slog.DiscardHandler))
+		errs = append(errs, err)
+	case "static":
+		errs = append(errs, static.Validate(cfg))
+	}
+	if cfg.HA.Enabled {
+		errs = append(errs, ha.Validate(cfg.HA))
+	}
+	return errors.Join(errs...)
 }
 
 func cmdToken() error {
@@ -141,6 +167,51 @@ func sessionKey(cfg *config.Config, log *slog.Logger) ([]byte, error) {
 	return k, nil
 }
 
+// cmdHashToken prints the sha256 of a token given as the argument or, to
+// keep it out of process listings and shell histories, on stdin.
+func cmdHashToken(args []string) error {
+	var tok string
+	switch len(args) {
+	case 1:
+		tok = args[0]
+	case 0:
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 64<<10))
+		if err != nil {
+			return err
+		}
+		tok = strings.TrimSpace(string(b))
+		if tok == "" {
+			return errors.New("hash-token: no token on stdin")
+		}
+	default:
+		return errors.New("usage: quackmux hash-token [TOKEN]")
+	}
+	if strings.Contains(tok, "?") {
+		// The gateway hashes only the part before '?' (client options).
+		return errors.New("hash-token: a token must not contain '?'")
+	}
+	fmt.Println(auth.HashToken(tok))
+	return nil
+}
+
+// placeholderMarker marks the example secrets shipped in
+// deploy/kubernetes/base/secrets; they are public.
+const placeholderMarker = "CHANGE-ME-INSECURE-PLACEHOLDER"
+
+// refusePlaceholder fails for a secret that still is one of the shipped,
+// public examples, except with auth.mode none (development), where it only
+// warns.
+func refusePlaceholder(cfg *config.Config, log *slog.Logger, what, value string) error {
+	if !strings.Contains(value, placeholderMarker) {
+		return nil
+	}
+	if cfg.Auth.Mode == "none" {
+		log.Warn("the " + what + " is the public example from the repository; replace it outside development")
+		return nil
+	}
+	return fmt.Errorf("the %s is the public example from the repository (%s...): generate one with \"quackmux token\"", what, placeholderMarker)
+}
+
 func readTokenFile(path string) (string, error) {
 	if path == "" {
 		return "", nil
@@ -169,6 +240,9 @@ func cmdServe(args []string) error {
 
 	met := metrics.New()
 	key, err := sessionKey(cfg, log)
+	if err == nil {
+		err = refusePlaceholder(cfg, log, "session key", string(key))
+	}
 	if err != nil {
 		return err
 	}
@@ -229,9 +303,30 @@ func cmdServe(args []string) error {
 	sessions := session.NewManager(cfg, engines, up, sealer, log, met)
 	engines.SetSessionCloser(sessions)
 
+	var elector *ha.Elector
+	if cfg.HA.Enabled {
+		identity := os.Getenv("POD_NAME")
+		if identity == "" {
+			identity, _ = os.Hostname()
+		}
+		elector, err = ha.New(ha.Options{Config: cfg.HA, Client: kube, Namespace: namespace, Identity: identity, Log: log})
+		if err != nil {
+			return err
+		}
+		// Background work that acts on engines runs only while this process
+		// holds a fresh lease: a leader that resumes after a freeze must not
+		// close sessions or stop engines that the new leader serves by now.
+		sessions.SetFence(elector.Fresh)
+		engines.SetFence(elector.Fresh)
+	}
+
 	var leading atomic.Bool
 	var started atomic.Bool
+	var stopping atomic.Bool
 	ready := func() (bool, string) {
+		if stopping.Load() {
+			return false, "shutting down"
+		}
 		if cfg.HA.Enabled && !leading.Load() {
 			return false, "not the leader"
 		}
@@ -245,6 +340,14 @@ func cmdServe(args []string) error {
 	adminToken, err := readTokenFile(cfg.Admin.TokenFile)
 	if err != nil {
 		return fmt.Errorf("admin token: %w", err)
+	}
+	if cfg.Admin.TokenFile != "" && adminToken == "" {
+		// An empty file (a failed "quackmux token > file") must not
+		// silently open the admin API.
+		return fmt.Errorf("admin token file %s is empty", cfg.Admin.TokenFile)
+	}
+	if err := refusePlaceholder(cfg, log, "admin token", adminToken); err != nil {
+		return err
 	}
 	if cfg.Admin.Listen != "" && adminToken == "" {
 		log.Warn("admin API has no token (admin.tokenFile): anyone who can reach it can manage sessions and engines")
@@ -266,12 +369,14 @@ func cmdServe(args []string) error {
 		return nil
 	}
 
-	errc := make(chan error, 3)
+	// Room for every sender (both listeners, run, the elector and its
+	// callbacks), so that none of them blocks once nobody reads any more.
+	errc := make(chan error, 8)
 	quackSrv := &http.Server{
 		Addr: cfg.Server.Listen, Handler: gw,
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration,
 		IdleTimeout:       cfg.Server.IdleTimeout.Duration,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+		ErrorLog:          serverErrorLog(log),
 		BaseContext:       func(net.Listener) context.Context { return context.Background() },
 	}
 	go func() { errc <- serve(quackSrv, cfg.Server.TLS, "quack", log) }()
@@ -281,21 +386,26 @@ func cmdServe(args []string) error {
 		go func() { errc <- serve(adminSrv, cfg.Admin.TLS, "admin", log) }()
 	}
 
-	runCtx, cancelRun := context.WithCancel(ctx)
+	// The serving machinery and the leadership end when the shutdown below
+	// says so, not with the signal (see there).
+	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
-	if cfg.HA.Enabled {
-		identity := os.Getenv("POD_NAME")
-		if identity == "" {
-			identity, _ = os.Hostname()
-		}
+	electorDone := make(chan struct{})
+	if elector != nil {
 		go func() {
-			err := ha.Run(runCtx, cfg.HA, kube, namespace, identity,
+			defer close(electorDone)
+			err := elector.Run(runCtx,
 				func(lctx context.Context) {
 					leading.Store(true)
 					met.IsLeader.Set(1)
 					if err := run(lctx); err != nil {
 						errc <- err
 					}
+					// The leader context ended (lease lost or released): stop
+					// reporting ready at once, not only once client-go has tried
+					// to release the lease, which can take another renewDeadline.
+					leading.Store(false)
+					met.IsLeader.Set(0)
 				},
 				func() {
 					leading.Store(false)
@@ -303,12 +413,13 @@ func cmdServe(args []string) error {
 					// Losing the lease while serving: exit so that the pod
 					// restarts as a clean follower.
 					errc <- errors.New("lost leadership")
-				}, log)
+				})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				errc <- err
 			}
 		}()
 	} else {
+		close(electorDone)
 		met.IsLeader.Set(1)
 		go func() {
 			if err := run(runCtx); err != nil {
@@ -329,18 +440,60 @@ func cmdServe(args []string) error {
 
 	// Graceful shutdown: stop accepting, let in-flight requests finish. Engines
 	// keep running; sessions are adopted by the next gateway process.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration)
+	timeout := cfg.Server.ShutdownTimeout.Duration
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	// Shortly before the deadline, queries that still wait for their engine
+	// are answered with an error: a request that ends unanswered when the
+	// process exits can be sent again by libcurl, and the query would run
+	// twice. Fetches and uploads in flight may be repeated safely.
+	abort := time.AfterFunc(timeout-min(timeout/4, 5*time.Second), gw.AbortQueries)
+	defer abort.Stop()
+	stopping.Store(true)
+	if elector != nil {
+		// Hand the lease over first, and wait until it is released: another
+		// replica then takes over within seconds, while this one finishes its
+		// in-flight requests, instead of after the drain or the expiry of the
+		// lease. The background work ends with the leadership (and is fenced
+		// by its freshness anyway).
+		cancelRun()
+		select {
+		case <-electorDone:
+		case <-time.After(cfg.HA.RenewDeadline.Duration + time.Second):
+			log.Warn("leader election did not stop in time; the lease may expire instead of being released")
+		}
+	}
 	_ = quackSrv.Shutdown(shutdownCtx)
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
+	// Without HA, the background work (engine events, session keep-alives)
+	// stops only once the in-flight requests are done.
 	cancelRun()
-	sessions.Wait()
+	sessions.Shutdown()
 	if errors.Is(runErr, http.ErrServerClosed) {
 		runErr = nil
 	}
 	return runErr
+}
+
+// serverErrorLog is the error log of the Quack listener. Most of its lines
+// (TLS handshake errors of scanners, closed connections) are noise, but a
+// recovered handler panic means a request went unanswered: that is an error.
+func serverErrorLog(log *slog.Logger) *stdlog.Logger {
+	return stdlog.New(errorLogWriter{log: log}, "", 0)
+}
+
+type errorLogWriter struct{ log *slog.Logger }
+
+func (w errorLogWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimRight(string(p), "\n")
+	if strings.Contains(msg, "panic serving") {
+		w.log.Error("request handler panicked", "listener", "quack", "msg", msg)
+	} else {
+		w.log.Debug(msg, "listener", "quack")
+	}
+	return len(p), nil
 }
 
 func serve(srv *http.Server, t *config.TLSConfig, name string, log *slog.Logger) error {

@@ -34,7 +34,9 @@ Alle Konfigurationsoptionen mit ihren Defaults stehen in
 ## Installation
 
 1. Echte Secrets erzeugen (nächster Abschnitt). Die Dateien unter `base/secrets/` sind öffentlich bekannte
-   Platzhalter.
+   Platzhalter. Solange Session-Key oder Admin-Token Platzhalter sind, startet das Gateway nicht (außer mit
+   `auth.mode: none`, etwa im Overlay `dev`). Den Beispiel-Token der Platzhalter-`users.yaml` ignoriert es immer.
+   Eine leere Tokendatei (etwa nach einem fehlgeschlagenen `quackmux token > …`) ist ebenfalls ein Startfehler.
 2. Anwenden und warten:
 
    ```sh
@@ -74,7 +76,8 @@ Die Werkzeuge stecken im Binary (`go build -o bin/quackmux ./cmd/quackmux`):
 quackmux token                            # neues Token und sein sha256
 # token:  …43 Zeichen…   -> bekommt der Benutzer
 # sha256: …64 Hex…       -> kommt in users.yaml
-quackmux hash-token 'vorhandenes-token'   # sha256 eines bestehenden Tokens
+quackmux hash-token < token.txt           # sha256 eines bestehenden Tokens; von stdin gelesen,
+                                          # erscheint es weder in der Prozessliste noch in der Shell-History
 ```
 
 Legen Sie ein eigenes Overlay außerhalb dieses Repositorys an und checken Sie echte Secrets nirgends ein
@@ -349,7 +352,10 @@ Läuft Prometheus in einem anderen Namespace, braucht die Policy `quackmux-gatew
 | `quackmux_requests_in_flight`, `quackmux_is_leader` | laufende Requests; 1 auf der Replika, die bedient |
 
 Das Audit-Log (`audit.enabled`, in der Base an) schreibt jede Query als JSON-Zeile mit Benutzer, Session,
-Engine und gekürztem SQL ins Gateway-Log:
+Engine und gekürztem SQL ins Gateway-Log. Statements, die Zugangsdaten enthalten können, stehen dort ohne ihren
+Text (`"sql":"[redacted: …]"`, `"redacted":true`): `CREATE SECRET` und alles, was `secret`, `passw`, `pwd`,
+`token`, `AccountKey` oder eine SAS-Signatur (`sig=`) enthält, auch in Namen wie `s3_secret_access_key`, sowie URLs
+mit Benutzer und Passwort. Das ist eine Heuristik: Behandeln Sie das Audit-Log trotzdem als vertraulich.
 
 ```sh
 kubectl -n quackmux logs deployment/quackmux | grep '"component":"audit"'
@@ -369,11 +375,23 @@ kubectl apply -k deploy/kubernetes/overlays/ha     # bzw. Ihr Overlay auf dieser
   `Available` ist dann erfüllt (`kubectl -n quackmux wait --for=condition=Available deployment/quackmux`).
 * Leader anzeigen: `kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}'`
   (oder die Metrik `quackmux_is_leader`).
-* Fällt der Leader aus, übernimmt der Follower spätestens nach `ha.leaseDuration` (15 s); fährt der Leader
-  geordnet herunter, gibt er die Lease frei und die Übernahme dauert nur Sekunden. Kann ein Leader die Lease
-  nicht verlängern, beendet sich sein Prozess und startet als Follower neu. Der neue Leader findet die Engines
-  wieder und übernimmt die Sessions mit deren nächstem Heartbeat. Laufende Requests scheitern mit einem
-  Transportfehler, die Sessions überleben.
+* **Geordnetes Herunterfahren** (Pod löschen, Rollout, Drain): Der Leader meldet sich sofort nicht mehr ready, gibt
+  die Lease frei und lässt danach seine laufenden Requests auslaufen. Der wartende Follower übernimmt innerhalb
+  von Sekunden (in kind gemessen: 1–4 s); ein frisch gestarteter Ersatz-Pod bewirbt sich erst nach
+  `3 × ha.retryPeriod` (6 s). Queries, die beim
+  Herunterfahren noch laufen, bekommen kurz vor `server.shutdownTimeout` einen Fehler und werden auf der Engine
+  abgebrochen, damit libcurl sie nicht unbemerkt ein zweites Mal sendet.
+* **Ausfall des Leaders** (Node weg, Prozess hängt): Der Follower übernimmt, wenn die Lease abgelaufen ist
+  (`ha.leaseDuration`, 15 s, plus Retry und Readiness-Probe; in kind gemessen: etwa 20 s). Kann ein Leader die
+  Lease nicht verlängern, beendet sich sein Prozess und startet als Follower neu. Wacht ein eingefrorener Leader
+  wieder auf, tritt er zurück, ohne Sessions zu schließen oder die Lease des neuen Leaders anzutasten. Clients,
+  deren Verbindung noch zum eingefrorenen Pod führt, warten, bis er aufwacht oder neu gestartet wird.
+* In beiden Fällen findet der neue Leader die Engines wieder und übernimmt die Sessions mit deren nächstem
+  Heartbeat oder Request. Die Sessions überleben. In der kurzen Lücke ohne bereiten Endpunkt (ein bis drei
+  Sekunden, bis der Service den neuen Leader kennt) scheitern Requests mit „Could not connect to server“; sie
+  laufen nicht und können wiederholt werden.
+* Geprüft mit [test/e2e/kind/ha.sh](../../test/e2e/kind/ha.sh): Übergabe, eingefrorener Leader, Rollout und
+  PodDisruptionBudget mit angehängten DuckDB-2.0-Clients.
 * Eine bevorzugte `podAntiAffinity` verteilt die Replikas auf verschiedene Nodes.
 * `overlays/ha/config.yaml` ersetzt `base/config.yaml` vollständig. Halten Sie beide Dateien bis auf den
   Abschnitt `ha` gleich.
@@ -390,6 +408,10 @@ LEADER=$(kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.hold
 kubectl -n quackmux delete pod "$LEADER"      # gibt die Lease frei, der neue Pod übernimmt
 kubectl -n quackmux get deployment quackmux   # fertig bei UP-TO-DATE 2, AVAILABLE 1
 ```
+
+Die alte ReplicaSet ersetzt den gelöschten Leader sofort durch einen Pod mit dem alten Template. Dieser Pod
+bewirbt sich erst nach `3 × ha.retryPeriod` (6 s) um die Lease, wie jeder frisch gestartete Prozess. Bis dahin
+hat der neue Pod sie längst übernommen, und Kubernetes räumt den alten Pod ab.
 
 Wer vollautomatische Rollouts mit kurzer Unterbrechung vorzieht, setzt im eigenen Overlay
 `maxUnavailable: 100%`; dann ersetzt Kubernetes beide Pods auf einmal, wie bei `Recreate`.
@@ -443,7 +465,9 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
 
 * `base/config.yaml` (und `overlays/ha/config.yaml`) bearbeiten oder im eigenen Overlay per
   `configMapGenerator` mit `behavior: replace` eine eigene Datei einsetzen.
-* Vorher prüfen: `quackmux validate -config meine-umgebung/config.yaml`. Unbekannte Felder sind Fehler.
+* Vorher prüfen: `quackmux validate -config meine-umgebung/config.yaml`. Unbekannte Felder sind Fehler. Ohne
+  Cluster prüft `validate` auch, was das Gateway beim Start ablehnen würde: Provider-Einstellungen, jedes Profil
+  einmal als Pod gerendert, Lease-Name und Timings der Leader-Election. Token- und Secret-Dateien liest es nicht.
 * `kubectl apply -k …` erzeugt eine neue ConfigMap (neuer Hash) und rollt das Gateway neu aus (Base: kurze
   Unterbrechung, Sessions bleiben; HA: siehe oben). Die alten ConfigMaps und Secrets mit Hash-Suffix bleiben
   liegen; `kubectl rollout undo` braucht sie. Löschen Sie sie erst, wenn Sie nicht mehr zurückrollen wollen.
@@ -452,6 +476,26 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
 * Anderer Namespace: `namespace` im eigenen Overlay setzen (Kustomize benennt den Namespace um und passt die
   RoleBinding an) und `provider.kubernetes.namespace` in der Konfiguration ändern oder weglassen; ohne Angabe
   starten die Engines im Namespace des Gateways.
+
+## Persistente Daten
+
+Engines halten ihren Zustand im Speicher (`database: ":memory:"`) und verlieren ihn mit dem Pod. Ein PVC im
+`podTemplate` ist **kein** Speicher pro Benutzer: Das Gateway rendert das Template für jede Engine des Profils
+gleich. Alle Engines des Profils mounten also dasselbe Volume: jeder Benutzer, jede Gruppe und Subdomain, jede
+Pool-Engine und die Ersatz-Engine, die neben einer DRAINING-Engine anläuft. Mit `database: /data/engine.duckdb`
+öffnen sie dieselbe Datei. Eine DuckDB-Datei kann nur ein Prozess schreibend öffnen; jede weitere Engine scheitert
+beim Start (`Could not set lock on file`). Auf Netzwerk-Dateisystemen ohne verlässliche Locks droht Datenverlust.
+
+* **Gemeinsame Daten read-only anhängen:** PVC (`ReadOnlyMany`) im Template und im `initSQL`
+  `ATTACH '/data/lake.duckdb' AS lake (READ_ONLY)`. Das verträgt beliebig viele Engines.
+* **Schreibbare Daten in einen externen Katalog:** etwa DuckLake mit Postgres-Katalog und Objektspeicher (Beispiel
+  in [images/engine/README.md](../../images/engine/README.md)).
+* **Eine schreibbare Datei auf einem PVC** trägt nur ein Profil, das nie mehr als eine Engine hat:
+  `allowedShareLevels: [SERVER]`, `pool.size: 1`, Benutzer, die nur eine Subdomain nutzen (`allowedUsers`),
+  `maxLifetime` 0 und `engine.replaceOnSpecChange: false`, sonst läuft eine Ersatz-Engine neben der alten an. Das
+  Gateway erzwingt das nicht.
+
+PVCs pro Engine-Schlüssel (etwa pro Benutzer) legt das Gateway noch nicht an.
 
 ## Härtung geteilter Engines
 
@@ -477,17 +521,31 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   oder mit `quack_serve(…)` weitere Server öffnen, und mit `getenv('QUACK_TOKEN')` das Engine-Token lesen. Die
   NetworkPolicy lässt nur das Gateway an Port 9494 der Engines; ein ausgelesenes Token oder ein zusätzlicher
   Server nützt deshalb von außen nichts. Gegen `quack_stop` hilft sie nicht.
+* **Init-SQL:** Es steht im Secret der Engine (`<pod>-token`, Schlüssel `init.sql`), nicht in der Pod-Spec; wer
+  nur Pods lesen darf, sieht es nicht. In der Engine selbst kann es aber jede Session aus der Umgebung lesen
+  (`read_text('/proc/1/environ')`). Schlüssel im `initSQL` sind also für alle Benutzer der Engine sichtbar;
+  besser `PROVIDER credential_chain` mit Workload Identity.
 * **Gegenmittel im `initSQL`** des Profils (läuft nach den `settings`, bevor der Server startet):
   * `quack_authorization_function`: Die Quack-Extension kann vor der Ausführung von Anfragen eine eigene
     SQL-Funktion zur Autorisierung aufrufen. Damit lassen sich etwa `quack_stop`, `quack_serve` oder
     Dateizugriffe sperren (Signatur: Dokumentation der Quack-Extension).
-  * `SET enable_external_access = false` am Ende sperrt Datei- und Netzwerkzugriffe sowie das Nachladen von
-    Extensions aus SQL. Was die Engine braucht, vorher anhängen bzw. laden (etwa `LOAD httpfs`) oder per
-    Allowlist freigeben (DuckDB-Dokumentation „Securing DuckDB“). `SET lock_configuration = true` als letzte
-    Anweisung verhindert weitere `SET`s. Beides schränkt auch legitime Nutzung ein und muss sich mit dem
-    anschließenden `quack_serve` vertragen: vorab mit einer Test-Engine prüfen.
+  * `SET lock_configuration = true` als letzte Anweisung verhindert weitere `SET`s der Sessions, etwa
+    `SET GLOBAL threads` oder ein Zurückdrehen von Einstellungen. Clients können sich weiter verbinden und
+    abfragen (mit DuckDB 2.0.0 geprüft).
+  * `SET enable_external_access = false` gehört **nicht** ins `initSQL`: Die Engine startet dann nicht, weil
+    der Entrypoint das Token danach per `getenv()` liest und `quack_serve` selbst Dateizugriff braucht. Nach dem
+    Serverstart gesetzt, würde es Datei- und Netzwerkzugriffe und `getenv()` für alle Sessions sperren, ohne den
+    Quack-Server zu stören. Dafür bietet das Engine-Image derzeit keinen Haken.
+  * `quack_stop(…)` bleibt für jede Session aufrufbar, auch mit gesperrter Konfiguration. Dagegen hilft nur die
+    `quack_authorization_function`.
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
+* **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
+  `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
+  Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere
+  Pods verdrängen. Setzen Sie je Profil `settings.max_temp_directory_size` und darüber
+  `resources.limits.ephemeral-storage` (mit passendem `requests`-Wert): Dann scheitert die Query mit einem
+  Fehler, statt dass der Node volläuft, und im Notfall räumt das Kubelet nur diese Engine.
 * **Sandbox:** Wo vorhanden, isoliert eine Sandbox-Runtime die Engines zusätzlich
   (`profiles.<name>.podTemplate.spec.runtimeClassName`, z. B. gVisor).
 * **Namespace:** Pod Security `restricted` ist aktiv. Das Gateway darf alle Secrets des Namespace lesen;

@@ -121,9 +121,12 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
    * offen: weiter;
    * Tombstone, also vom Gateway geschlossen: präziser Fehler, z. B. „quackmux: session closed: idle timeout
      (6h0m0s) – DETACH and ATTACH again“;
-   * unbekannt: adoptieren, wenn die Engine existiert. Ist die wiedergefundene Engine gerade nicht ready, folgt
-     ein vorübergehender Fehler ohne Invalidierung. Fehlt die Engine ganz, gibt es einen `must_invalidate`-Fehler
-     „engine no longer exists“.
+   * unbekannt: adoptieren, wenn die Engine existiert und die Backend-Verbindung noch kennt. Das prüft das
+     Gateway einmal per HEARTBEAT an die Engine, was zugleich die Engine-Lease erneuert. Weil das Gateway jede
+     Session, die es schließt, bei der Engine abmeldet, kommen geschlossene Sessions so auch nach Ablauf ihres
+     Tombstones oder nach einem Neustart nicht zurück (DuckDB-Clients senden weiter Heartbeats). Ist die
+     wiedergefundene Engine gerade nicht ready oder nicht erreichbar, folgt ein vorübergehender Fehler ohne
+     Invalidierung. Fehlt die Engine ganz, gibt es einen `must_invalidate`-Fehler „engine no longer exists“.
 4. Aktivität verbuchen:
    * `lastSeen`: jede Nachricht.
    * `lastActive`: alle außer `HEARTBEAT_REQUEST`.
@@ -131,9 +134,11 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 
    `HEARTBEAT_REQUEST` und `DISCONNECT_MESSAGE` beantwortet das Gateway **selbst**:
    * **Heartbeats:** Das Gateway besitzt die Client-Lease. Von der Engine fordert es eine längere Lease an
-     (`session.backendHeartbeatTimeout`, Default 1 h) und erneuert sie bei ruhigen Sessions selbst per
-     Keepalive. Eine hängende Engine kann so nie den Heartbeat-Thread des Clients blockieren, und damit auch
-     nicht sein `DETACH`.
+     (`session.backendHeartbeatTimeout`, Default 1 h) und erneuert sie selbst per Keepalive, spätestens nach
+     einem Drittel davon. Das gilt auch, während ein Request läuft: Die Engine erneuert die Lease nur beim
+     Eingang einer Nachricht, und eine lange Query bringt währenddessen keine. Gezählt wird ab dem Senden
+     eines Requests, nicht ab seiner Antwort. Eine hängende Engine kann so nie den Heartbeat-Thread des
+     Clients blockieren, und damit auch nicht sein `DETACH`.
    * **DISCONNECT:** Das Gateway bestätigt sofort, denn der Client wartet nur 2 s. Der Abbau der
      Engine-Verbindung läuft im Hintergrund.
 5. Header neu schreiben (Backend-Connection-ID einsetzen, `client_query_id` übernehmen). Den Rest des Bodys
@@ -197,7 +202,9 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   gelöscht oder stürzt er ab, gehen seine Sessions auf CLOSED („engine terminated“). Folge-Requests bekommen
   `must_invalidate`.
 * Die Pods haben `restartPolicy: Never`: Nach einem Absturz ist der In-Memory-Zustand ohnehin weg. Ein Neustart
-  im selben Pod würde nur falsche Hoffnungen wecken.
+  im selben Pod würde nur falsche Hoffnungen wecken. Eine Restart-Policy am Engine-Container (auch aus dem
+  `podTemplate`) entfernt das Gateway; startet der Container trotzdem neu (`restartCount > 0`, etwa durch einen
+  Mutating Webhook), gilt die Engine als ausgefallen.
 
 ## 6. Neustart und Hochverfügbarkeit
 
@@ -205,18 +212,43 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   quackmux.io/instance=<instance>`. Key, Profil und Spec-Hash rekonstruiert es aus Labels und Annotationen, das
   Token aus dem Pod-Secret.
 * **Session-Adoption:** Die Clients senden spätestens nach `timeout/3 · 1,2` einen Heartbeat. Die versiegelte ID
-  enthält alles, um die Session neu anzulegen. Während `engine.recoveryGrace` (Default `maxHeartbeatTimeout/2 +
-  30 s`) werden wiedergefundene Engines nicht als idle beendet.
+  enthält alles, um die Session neu anzulegen; vorher bestätigt die Engine, dass sie die Verbindung noch hat
+  (siehe 4.3). Während `engine.recoveryGrace` (Default `maxHeartbeatTimeout/2 + 30 s`) werden wiedergefundene
+  Engines nicht als idle beendet. Findet das Gateway mehrere READY-Engines für denselben Key (eine Engine, die
+  ihren Startup-Timeout verpasst hat, neben ihrem Ersatz), nimmt es für neue Sessions immer die älteste und
+  drained die anderen.
 * **HA (optional, `ha.enabled`):** Mehrere Replikas machen Leader-Election über eine Kubernetes-`Lease`. Nur der
   Leader ist `ready` und bekommt über den Service Traffic. Verliert er die Lease, beendet sich der Prozess und
-  startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Laufende Requests während des
-  Failovers scheitern mit einem Transportfehler. Die Sessions selbst überleben.
+  startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Die Sessions überleben.
+* **Veralteter Leader:** Friert der Leader ein (gestoppter Container oder VM, hängender Node), verlängert er die
+  Lease nicht mehr, und der Follower übernimmt nach `ha.leaseDuration`. Wacht der alte Prozess wieder auf, hält
+  er sich bis zur nächsten Prüfung seines Watchdogs (jede Sekunde) noch für den Leader. Seine Sessions sehen für
+  ihn abgelaufen aus, weil ihre Heartbeats beim neuen Leader angekommen sind. Ohne Schutz schickte er der Engine
+  `DISCONNECT` für Verbindungen, die der neue Leader bedient. Deshalb handeln Session-Reaper und
+  Engine-Reconciler nur mit frischer Lease, also wenn die letzte Verlängerung höchstens `ha.renewDeadline`
+  zurückliegt (`ha.Elector.Fresh`). Eine andere Replika kann die Lease frühestens `ha.leaseDuration` nach der
+  letzten Verlängerung übernehmen. Nach einer Pause des Prozesses überspringt der Reaper außerdem eine Runde,
+  auch ohne HA, damit liegen gebliebene Heartbeats zuerst verarbeitet werden. Gefunden mit
+  `test/e2e/kind/ha.sh`, Szenario h3. Ein aufgeweckter Leader gibt außerdem keine Lease frei, die er nicht mehr
+  hält: client-go (v0.37) entscheidet beim Freigeben nach dem zuletzt beobachteten Stand und hätte die Lease
+  des neuen Leaders geleert. Der Lock-Wrapper schreibt eine Freigabe nur, wenn die gerade gelesene Lease uns
+  gehört.
+* **Geordnete Übergabe:** Beim Herunterfahren meldet sich der Leader sofort nicht mehr ready und gibt die
+  Lease frei. Er wartet auf die Freigabe und lässt erst danach seine laufenden Requests auslaufen. Ein frisch
+  gestarteter Prozess bewirbt sich erst nach `3 × ha.retryPeriod`. So übernimmt der wartende Follower und nicht
+  der Ersatz-Pod; im Rollout hätte der Ersatz-Pod das alte Template und hielte den Rollout wieder an.
+* **Laufende Requests beim Shutdown:** Das Gateway wartet bis zu `server.shutdownTimeout` auf laufende Requests.
+  Kurz vor Ablauf (spätestens 5 s davor) beantwortet es Queries, die noch auf ihre Engine warten, mit einem
+  Fehler („the gateway is shutting down“) und bricht sie auf der Engine per CANCEL ab. Ein Request, der beim
+  Prozessende unbeantwortet bliebe, könnte libcurl auf einer neuen Verbindung erneut senden; die Query liefe
+  dann ein zweites Mal. Offene FETCHes und Uploads dürfen dagegen abbrechen: libcurl wiederholt sie beim nächsten
+  Gateway, und die Engine liefert denselben Batch noch einmal bzw. verwirft doppelte Uploads.
 * Das Gateway beendet beim eigenen Shutdown **keine** Engines.
 
 ## 7. Engines in Kubernetes
 
-* Pod `quack-<level>-<owner>-<rand>` mit Container `engine` (Image aus dem Profil, Default
-  `quackmux/duckdb-engine:2.0.0`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
+* Pod `quack-<level>-<owner>-<rand>` mit Container `engine` (Image und Pull-Policy aus dem Profil, sonst aus dem
+  `podTemplate`, sonst `quackmux/duckdb-engine:2.0.0` mit `IfNotPresent`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
   startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP. Das Token kommt aus der Umgebungsvariable
   `QUACK_TOKEN`.
 * Token: 32 Zufallsbytes pro Engine, in einem Secret `<pod>-token`. Das Secret wird zuerst angelegt und danach
@@ -229,7 +261,13 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   * Netz: eine NetworkPolicy erlaubt Ingress auf 9494 nur vom Gateway.
 * Profile formen den Pod: Ressourcen, Env, NodeSelector, Tolerations, Affinity, ServiceAccount, PullSecrets,
   Labels und Annotationen. Optional dient ein komplettes `podTemplate` als Basis, das Gateway ergänzt seine
-  Pflichtfelder. Persistente Daten gehen über PVCs im Template, sinnvoll bei `USER`-Engines.
+  Pflichtfelder. Ein PVC im Template mounten **alle** Engines des Profils (jeder Benutzer, jede Subdomain, Pool-
+  und Ersatz-Engines); eine DuckDB-Datei darauf kann nur eine davon schreibend öffnen. Das taugt für read-only
+  angehängte Daten oder ein Profil mit genau einer Engine. PVCs pro Engine-Schlüssel sind offen
+  (deploy/kubernetes/README.md, „Persistente Daten“).
+* Grace Period beim Löschen: `provider.kubernetes.deleteGracePeriod` (Default 30 s, mindestens 1 s). Das Gateway
+  setzt `QUACKMUX_STOP_TIMEOUT` der Engine auf 5 s weniger (mindestens 1 s), damit der Entrypoint DuckDB samt
+  Checkpoint stoppt, bevor das Kubelet den Container tötet.
 * RBAC (Namespace-scoped):
   * pods: get, list, watch, create, delete, patch
   * secrets: get, list, create, delete, patch
@@ -240,8 +278,9 @@ Weitere Provider:
 
 * `process` startet lokale DuckDB-CLI-Prozesse für die Entwicklung.
 * `static` routet auf extern betriebene Quack-Server. Diese Engines sind *permanent*: Das Gateway beendet und
-  drained sie nie. Ein fehlgeschlagener Health-Probe nimmt sie aus dem Verkehr, ein erfolgreicher holt sie
-  zurück. `CONNECTION` ist mit `static` nicht möglich.
+  drained sie nie. Schlagen `provider.static.failureThreshold` Health-Probes in Folge fehl (Default 3), nimmt
+  das Gateway sie aus dem Verkehr und schließt ihre Sessions; ein erfolgreicher Probe holt sie zurück.
+  `CONNECTION` ist mit `static` nicht möglich.
 
 ## 8. Authentifizierung, Optionen, Policy
 
@@ -275,7 +314,9 @@ Weitere Provider:
     * `maxSessions`
     * `maxSessionsPerUser`
     * `maxEngines`
-    * `maxEnginesPerUser`
+    * `maxEnginesPerUser`: Engines, die Sessions des Benutzers gestartet oder (aus dem Warm-Pool) übernommen
+      haben, über alle Share-Levels. Sonst könnte jeder Benutzer SERVER- oder GROUP-Engines für beliebige
+      Subdomains starten, bis `maxEngines` alle anderen aussperrt.
     * `maxStartingEngines`
 * Isolation: Bei `GROUP`/`SERVER` teilen sich Benutzer denselben Datenbankzustand und dieselben Rechte der
   Engine. Wer Mandantentrennung braucht, nutzt `USER` oder `CONNECTION`.
@@ -298,13 +339,18 @@ Weitere Provider:
   * `quackmux_requests_total{type,outcome}`, `quackmux_request_seconds{type}`, `quackmux_bytes_total{direction}`
   * `quackmux_auth_failures_total{reason}`
 * **Audit-Log** (optional): jede Query (`PREPARE_REQUEST`) mit User, Session, Engine, `client_query_id` und
-  gekürztem SQL als strukturierte Logzeile.
-* **CORS**: wie der Stock-Server (`OPTIONS /quack`, `Access-Control-Allow-Origin`), für DuckDB-Wasm.
+  gekürztem SQL als strukturierte Logzeile. Statements, die Zugangsdaten enthalten können (`CREATE SECRET`,
+  `secret`, `passw`, `pwd`, `token`, `AccountKey`, `sig=` irgendwo im Text, URLs mit Benutzer und Passwort), loggt
+  das Gateway ohne ihren Text (`redacted=true`). Die Erkennung ist bewusst grob und schwärzt im Zweifel.
+* **CORS**: wie der Stock-Server (`OPTIONS /quack`, `Access-Control-Allow-Origin`), für DuckDB-Wasm. Requests mit
+  einem `Origin`-Header (Browser senden ihn bei jedem POST, die DuckDB-Clients nie) aus nicht erlaubten Origins
+  lehnt das Gateway ab. Default ist `["*"]`, mit `auth.mode: none` aber keiner: Sonst könnte jede Webseite über
+  den Browser eines Benutzers, der das Gateway erreicht, Queries ausführen.
 
 ## 10. Bekannte Grenzen
 
-* Läuft eine Query während eines Gateway-Restarts oder -Failovers, bricht der laufende Request mit Transportfehler
-  ab. Die Session bleibt erhalten.
+* Läuft eine Query während eines Gateway-Restarts oder -Failovers, bekommt der Client einen Fehler, und die Query
+  wird auf der Engine abgebrochen (siehe 6). Die Session bleibt erhalten.
 * Optionen per Header funktionieren nicht mit `ssl_fingerprint`-Pinning. Dieser Client-Pfad sendet keine
   Extra-Header. Dort Token-Optionen nutzen.
 * Das Gateway prüft kein SQL. Autorisierung innerhalb geteilter Engines bleibt Sache der Engine (Init-SQL,

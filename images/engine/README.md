@@ -30,7 +30,7 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 | `QUACKMUX_EXTENSION_DIR` | `/opt/duckdb/extensions` | Verzeichnis, aus dem DuckDB Extensions lädt. |
 | `QUACKMUX_MAX_CONNECTIONS` | DuckDB-Default (1024) | `quack_server_max_connections`: gleichzeitige TCP-Verbindungen. Der Server nutzt einen Thread pro Verbindung. |
 | `QUACKMUX_KEEP_ALIVE_TIMEOUT` | DuckDB-Default (300) | `quack_server_keep_alive_timeout` in Sekunden. Der Wert sollte über `server.upstream.idleConnTimeout` des Gateways liegen (Default 90 s), damit das Gateway inaktive Verbindungen zuerst schließt. |
-| `QUACKMUX_STOP_TIMEOUT` | `20` | So viele Sekunden (`20` oder `20s`) wartet der Entrypoint beim Stoppen auf DuckDB, danach folgt `SIGKILL`. Der Wert muss unter der Grace Period des Pods liegen (`provider.kubernetes.deleteGracePeriod`, Default 30 s). |
+| `QUACKMUX_STOP_TIMEOUT` | `20` | So viele Sekunden (`20` oder `20s`) wartet der Entrypoint beim Stoppen auf DuckDB, danach folgt `SIGKILL`. Der Wert muss unter der Grace Period des Pods liegen. Unter Kubernetes setzt ihn das Gateway auf `provider.kubernetes.deleteGracePeriod` − 5 s (mindestens 1 s); ein eigener Wert im Profil wird ignoriert. |
 | `QUACKMUX_DUCKDB_BIN` | `duckdb` | Pfad der DuckDB-CLI, für eigene Images. |
 | `TMPDIR` | `/tmp` | Hier legt der Entrypoint sein privates Verzeichnis an. Es muss beschreibbar sein. |
 | `QUACKMUX_ENGINE_ID`, `QUACKMUX_SHARE_LEVEL`, `QUACKMUX_OWNER`, `QUACKMUX_SUBDOMAIN`, `QUACKMUX_PROFILE` | – | Setzt das Gateway. Sie erscheinen nur in der Logzeile. |
@@ -44,7 +44,7 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 3. Über die FIFO bekommt DuckDB:
 
    ```sql
-   SET extension_directory = '/opt/duckdb/extensions';
+   SET extension_directories = ['/opt/duckdb/extensions'];
    SET autoinstall_known_extensions = false;
    SET autoload_known_extensions = true;
    LOAD quack;
@@ -82,8 +82,12 @@ die das Token enthält, geht nach `/dev/null`.
   `SET GLOBAL …` im Init-SQL. YAML-Werte in `settings` müssen Strings sein (`threads: "4"`).
 * Extensions lassen sich zur Laufzeit nicht installieren: Das Verzeichnis ist schreibgeschützt und Autoinstall ist
   aus. Vorinstallierte Extensions lädt `LOAD` oder Autoload. Weitere Extensions kommen ins Image (siehe unten).
-* `enable_external_access = false` darf nicht im Init-SQL stehen. Das Token wird erst danach per `getenv()`
-  gelesen, und DuckDB sperrt `getenv()` ohne External Access.
+* `enable_external_access = false` darf nicht im Init-SQL stehen, sonst startet die Engine nicht. Das Token wird
+  erst danach per `getenv()` gelesen, DuckDB sperrt `getenv()` ohne External Access, und `quack_serve` braucht
+  selbst Dateizugriff (`$HOME/.duckdb/stored_secrets`). Erst nach `quack_serve` gesetzt, würde es den Server nicht
+  stören. Dafür hat der Entrypoint noch keinen Haken.
+* `SET lock_configuration = true` als letzte Anweisung des Init-SQL funktioniert: Clients verbinden sich und fragen
+  ab, nur ihre eigenen `SET`s schlagen fehl („the configuration has been locked“).
 
 ## Stoppen
 
@@ -173,7 +177,7 @@ Oder als abgeleitetes Image:
 ```dockerfile
 FROM quackmux/duckdb-engine:2.0.0
 USER 0
-RUN HOME=/root duckdb -init /dev/null -bail -c "SET extension_directory = '/opt/duckdb/extensions'; \
+RUN HOME=/root duckdb -init /dev/null -bail -c "SET extension_directories = ['/opt/duckdb/extensions']; \
       INSTALL aws; INSTALL ducklake; INSTALL postgres_scanner; LOAD aws; LOAD ducklake; LOAD postgres_scanner;" \
  && chmod -R a+rX,go-w /opt/duckdb
 USER 1000:1000
@@ -236,16 +240,21 @@ docker run --rm --name quack-engine -p 9494:9494 -v quack-data:/data \
 
 Der Kubernetes-Provider des Gateways setzt die Umgebungsvariablen, holt das Token aus einem Secret und mountet ein
 `emptyDir` auf `/tmp`. Das Root-Dateisystem ist read-only, nur `/tmp` muss beschreibbar sein. Die Readiness-Probe ist
-`GET /` auf Port 9494. Der numerische `USER 1000:1000` erfüllt `runAsNonRoot`. Für persistente Engines gehören ein
-PVC auf `/data` (mit `fsGroup: 1000`) ins `podTemplate` und `database: /data/engine.duckdb` ins Profil.
+`GET /` auf Port 9494. Der numerische `USER 1000:1000` erfüllt `runAsNonRoot`. Ein PVC auf `/data` (mit
+`fsGroup: 1000`) im `podTemplate` mounten alle Engines des Profils gleichzeitig; eine Datenbankdatei darauf kann nur
+eine Engine schreibend öffnen. Wann das trotzdem passt, steht in
+[deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Persistente Daten“.
 
 ## Sicherheit
 
-* Das Token steht nie in Prozessargumenten oder Logs. Das Init-SQL liegt nur in privaten Dateien. Sie werden
-  gelöscht, sobald der Server läuft. `QUACKMUX_INIT_SQL` entfernt der Entrypoint aus der Umgebung von DuckDB.
+* Token und Init-SQL stehen nie in Prozessargumenten oder Logs. Der Entrypoint kopiert das Init-SQL in private
+  Dateien, die er löscht, sobald der Server läuft, und hält `QUACKMUX_INIT_SQL` aus der Umgebung von DuckDB
+  heraus. Der Kubernetes-Provider liefert beide aus dem Secret der Engine, nicht als Klartext in der Pod-Spec.
 * Clients einer Engine führen beliebiges SQL als Engine-Benutzer aus. Mit External Access, dem DuckDB-Default,
-  können sie Dateien und Umgebungsvariablen des Engine-Prozesses lesen, auch `QUACK_TOKEN`. Deshalb darf nur das
-  Gateway Port 9494 erreichen (NetworkPolicy). In geteilten Engines (`GROUP`, `SERVER`) gehören ins Init-SQL nur
-  Secrets, die alle Benutzer der Engine verwenden dürfen.
+  können sie Dateien und die Umgebung der Prozesse im Container lesen, also `QUACK_TOKEN` und auch das Init-SQL
+  (die Umgebung von tini, etwa per `read_text('/proc/1/environ')`). Deshalb darf nur das Gateway Port 9494
+  erreichen (NetworkPolicy). Zugangsdaten im Init-SQL kann jeder Benutzer der Engine auslesen: In geteilten
+  Engines (`GROUP`, `SERVER`) gehören dorthin nur Secrets, die alle Benutzer verwenden dürfen. Besser sind
+  Provider ohne Schlüssel im SQL, etwa `CREATE SECRET (TYPE s3, PROVIDER credential_chain)` mit Workload Identity.
 * Das Extension-Verzeichnis ist schreibgeschützt und Autoinstall ist aus. Engines brauchen deshalb keinen
   Internetzugang.

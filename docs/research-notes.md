@@ -2,7 +2,8 @@
 
 Condensed results of the source and docs research done on 2026-11-19 against duckdb-quack `main`
 (commit `02c9d4a`, 2026-11-17, `QUACK_VERSION = 3`), DuckDB core `181615215e5e` (2.0.0) and the
-DuckDB 2.0 docs. Everything quackmux relies on is listed here. File paths refer to
+DuckDB 2.0 docs, checked on 2026-11-20 against the released DuckDB v2.0.0 (see the last section).
+Everything quackmux relies on is listed here. File paths refer to
 [duckdb/duckdb-quack](https://github.com/duckdb/duckdb-quack) unless stated otherwise.
 
 ## Quack client behaviour that constrains a proxy
@@ -25,8 +26,9 @@ DuckDB 2.0 docs. Everything quackmux relies on is listed here. File paths refer 
 - **Heartbeats** run at `timeout/3 · [0.8, 1.2]`, and failures are swallowed. A hung heartbeat blocks DETACH.
   DETACH sends DISCONNECT with a 2 s timeout.
 - **Extra headers.** `EXTRA_HTTP_HEADERS` (quack secret) are sent on every request on the httpfs path only; the
-  pinned path (`PinnedHttpsQuackClient`) sends none. ATTACH rejects unknown options, so routing options travel in
-  the token (`secret?share_level=…`) or in those headers.
+  pinned path (`PinnedHttpsQuackClient`) sends none. Routing options travel in the token (`secret?share_level=…`)
+  or in those headers, not as ATTACH options: quack `main` rejects unknown ATTACH options (`quack_storage.cpp`),
+  the version shipped with DuckDB 2.0.0 ignores them silently.
 - **TLS default.** The client assumes HTTPS for every non-localhost host unless `DISABLE_SSL true`.
 - **Content-Type** is not reliable: curl sends `application/octet-stream`. curl sends `Expect: 100-continue` for
   bodies over 1 MiB.
@@ -85,9 +87,47 @@ DuckDB 2.0 docs. Everything quackmux relies on is listed here. File paths refer 
   ZooKeeper for discovery.
 - Kyuubi loses sessions on a server crash. quackmux keeps them through sealed connection ids and adoption.
 
-## Not yet verified against a real DuckDB 2.0 (no binary available while building)
+## Verified against the released DuckDB v2.0.0 (2026-11-20)
 
-- The engine entrypoint: `.read` under `-bail`, the exact `quack_serve` parameter spelling at runtime, `getenv`
-  in a `-bail` session, and the SIGTERM path.
-- The exact client error texts the e2e scripts grep for.
-- Whether `lock_configuration = true` on shared engines breaks client internals.
+Done with the official `duckdb-cli-linux-amd64.tar.gz` (`v2.0.0 (Cyanoptera) d54cbbe3df`), the engine image,
+docker compose and kind (Kubernetes v1.37). Recordings of the traffic are fixtures in
+`internal/wire/testdata/duckdb-v2.0.0`.
+
+- **Shipped quack version.** DuckDB v2.0.0 pins duckdb-quack `f96420ed46` (`.github/config/extensions/quack.cmake`),
+  an ancestor of the `02c9d4a` researched above. The message definitions (`quack_message.json`,
+  `serialize_quack_message.cpp`) are identical; the differences are request logging, internal API updates and two
+  ATTACH checks `f96420e` does not have yet (unknown options, `READ_ONLY`).
+- **Wire format.** 400 recorded messages (client ↔ server, client ↔ gateway, gateway ↔ engine) decode and encode
+  byte for byte with `internal/wire`. Server answers never carry a `client_query_id`; only `CONNECTION_RESPONSE`
+  carries a connection id (32 upper-case hex characters). The server leaves out an empty `extra_info` and a false
+  `must_invalidate`.
+- **Error texts** (all with exception type `Invalid Input`): `Authentication failed`, `Invalid connection id`,
+  `Connection heartbeat lease expired`. After an expired lease the connection is gone: the next message gets
+  `Invalid connection id`.
+- **Client behaviour seen on the wire.**
+  - DuckDB 2.0 pushes whole queries down, expressions and aggregates included
+    (`SELECT ('q1=' || count_star()) FROM t`). `BEGIN TRANSACTION` and `COMMIT` are separate PREPAREs; `COMMIT`
+    has no `client_query_id`.
+  - A scan that fetches starts 16 parallel read-ahead FETCHes (4 cores); those for batches that do not exist get
+    a short `FETCH_RESPONSE` (`total_batches` only).
+  - ACKNOWLEDGEMENT is sent only with `SET quack_enable_reconnects = true`.
+  - The ATTACH option `heartbeat_timeout` sets the proposed lease; the client accepts the larger value the gateway
+    answers (3 s proposed, `session.minHeartbeatTimeout` 5 s answered).
+  - Gateway connection ids observed: 88 to 90 characters (limit 156). A SEND_DATA of 7.6 MB passes the gateway
+    with only the header rewritten.
+- **Engine image.** `.read` under `-bail`, `getenv('QUACK_TOKEN')` in the CLI, the named `quack_serve` parameters
+  (`token`, `allow_other_hostname`, `disable_ssl`) and the SIGTERM path (`quack_stop`, `FORCE CHECKPOINT`, `.quit`)
+  work as the entrypoint expects; the image self-test passes. The `process` provider's scripts work as well.
+- **Extensions.** `extension_directory` is deprecated in 2.0 and warns on every `SET`; `extension_directories`
+  (`VARCHAR[]`) replaces it for INSTALL and LOAD. INSTALL downloads from `http://extensions.duckdb.org` (plain
+  HTTP); the `http_proxy` setting defaults to the `HTTP_PROXY` environment variable. Extensions installed from a
+  mirror (`custom_extension_repository`) load with a plain `LOAD`, because they are core-signed.
+- **Hardening of shared engines.**
+  - `SET lock_configuration = true` as the last init statement works: clients attach and query, only their own
+    `SET`s fail ("the configuration has been locked").
+  - `SET enable_external_access = false` before `quack_serve` breaks the start: `getenv` is then disabled, and
+    `quack_serve` itself needs file access (`$HOME/.duckdb/stored_secrets`). Set after `quack_serve`, it blocks
+    `getenv` and file access for every session while the server keeps working (queries, uploads, fetches).
+  - `quack_stop(…)` stays callable by any session, with or without a locked configuration.
+- **Kubernetes.** From Kubernetes 1.35 on the kubelet refuses hosts with cgroup v1 (`failCgroupV1: true`); kind needs
+  a KubeletConfiguration patch there (`test/e2e/README.md`).

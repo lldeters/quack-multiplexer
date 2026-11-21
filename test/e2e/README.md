@@ -80,6 +80,7 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | Variable | Default | Bedeutung |
 |---|---|---|
 | `E2E_SKIP_BUILD` | – | `1`: vorhandene Images verwenden, nicht bauen |
+| `DOCKER_BUILD_FLAGS` | – | zusätzliche Flags für beide `docker build`, durch Leerzeichen getrennt wie im Makefile, z. B. `--network host --build-arg GOPROXY=…` hinter einem Proxy |
 | `E2E_KEEP` | – | `1`: Container nach dem Lauf weiterlaufen lassen (zum Untersuchen) |
 | `E2E_ENGINE_IMAGE` | `quackmux/duckdb-engine:2.0.0` | Engine- und Client-Image |
 | `E2E_GATEWAY_IMAGE` | `quackmux/quackmux:e2e` | Gateway-Image |
@@ -95,7 +96,7 @@ cd test/e2e/compose
 E2E_KEEP=1 bash run.sh        # oder: docker compose --env-file e2e.env up -d (nach dem Build)
 curl -H "Authorization: Bearer $(cat config/admin.token)" http://127.0.0.1:19495/api/v1/sessions
 docker compose -p quackmux-e2e --env-file e2e.env run --rm -T --no-deps client <<'SQL'
-SET extension_directory = '/opt/duckdb/extensions';
+SET extension_directories = ['/opt/duckdb/extensions'];
 LOAD quack;
 CREATE SECRET (TYPE quack, TOKEN 'e2e-alice-3f9c2b7d1a8e4c60?share_level=server', SCOPE 'quack:gateway:9494');
 ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true);
@@ -112,6 +113,7 @@ HTTP).
 ```bash
 bash test/e2e/kind/setup.sh      # Cluster "quackmux", Images bauen und laden, Overlay dev ausrollen
 bash test/e2e/kind/test.sh       # Szenarien k1–k4 (beliebig oft wiederholbar)
+bash test/e2e/kind/ha.sh         # Hochverfügbarkeit: Szenarien h1–h5 mit overlays/ha
 bash test/e2e/kind/teardown.sh   # Cluster löschen
 ```
 
@@ -152,13 +154,53 @@ Port 9494, Platz für mindestens zwei gleichzeitige Engines (`limits.maxEngines`
 | `QMX_NAMESPACE`, `QMX_DEPLOYMENT` | aus dem Overlay | Namespace und Deployment des Gateways |
 | `QMX_SERVICE`, `QMX_SERVICE_PORT` | Service mit Port 9494 | Ziel der Clients |
 | `SKIP_BUILD` | – | `1`: Images nicht bauen, nur laden (setup.sh) |
+| `DOCKER_BUILD_FLAGS` | – | zusätzliche Flags für beide `docker build` (setup.sh), wie beim Compose-Test |
 | `KIND_NODE_IMAGE` | kind-Default | Node-Image für `kind create cluster` |
+| `KIND_CONFIG` | – | Cluster-Konfiguration für `kind create cluster --config`. Auf Hosts mit cgroup v1 startet das Kubelet ab Kubernetes 1.35 nur mit `failCgroupV1: false` (siehe Fehlersuche). |
 | `ADMIN_TOKEN` | – | Bearer-Token, falls die Admin-API einen verlangt |
 | `ADMIN_LOCAL_PORT` | 19695 | lokaler Port des Port-Forwards |
 | `CLIENT_UID` | 1000 | Benutzer des Client-Pods (der Benutzer des Engine-Images) |
 | `ATTACH_TIMEOUT` | 180 | Sekunden für ein `ATTACH` inklusive Start eines Engine-Pods |
 | `POD_GONE_TIMEOUT` | 30 | Sekunden, bis der `CONNECTION`-Pod nach dem `DETACH` verschwunden sein muss |
 | `KEEP_CLIENT` | – | `1`: Client-Pod nach dem Lauf behalten |
+
+### Hochverfügbarkeit (ha.sh)
+
+**ha.sh** prüft `deploy/kubernetes/overlays/ha` mit echten DuckDB-2.0-Clients im Cluster von setup.sh. Es geht vor
+wie ein Betreiber nach [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md):
+
+1. Es erzeugt ein Overlay auf `overlays/ha` mit frischen Secrets (Session-Key, Admin-Token, `users.yaml` mit einem
+   Token für den Testbenutzer) und dem lokal gebauten Gateway-Image. Das Overlay liegt in
+   `test/e2e/kind/.work/ha-overlay` (von Git ignoriert) und wird danach gelöscht.
+2. Es skaliert das laufende Gateway auf 0 und rollt das Overlay aus.
+3. Am Ende stellt es das Dev-Overlay wieder her, damit test.sh wie gewohnt läuft.
+
+Zwei Clients desselben Benutzers bleiben über alle Szenarien angehängt (`share_level=user`, eine gemeinsame
+Engine). Der erste nutzt den Default-Heartbeat-Timeout (60 s). Der zweite nutzt `HEARTBEAT_TIMEOUT 5`; seine
+Session-Lease (5 s plus `session.heartbeatGrace` 15 s) ist kürzer, als h3 den Leader einfriert. Nach jedem
+Failover müssen beide ihre Tabelle auf der Engine weiter lesen können. Eine Query, die während eines Failovers
+unterwegs ist, darf scheitern (nie doppelt laufen); das Skript wiederholt sie bis zu zweimal und warnt.
+
+| | Ablauf | Was es beweist |
+|---|---|---|
+| h1 | Overlay ausrollen | Zwei Replikas, genau eine ist ready und hält die Lease `quackmux-default`. Der Follower meldet `not the leader` und `quackmux_is_leader 0`. Das Deployment ist `Available` bei `UP-TO-DATE 2, AVAILABLE 1`. |
+| h2 | `kubectl delete pod` des Leaders | Der alte Leader gibt die Lease beim Herunterfahren frei, und der wartende Follower führt nach höchstens `HA_HANDOVER_SECONDS` (gemessen 1–4 s). Der Ersatz-Pod bewirbt sich erst nach `3 × ha.retryPeriod`. Der neue Leader adoptiert beide Sessions auf derselben Engine. |
+| h3 | Den Gateway-Prozess des Leaders auf dem kind-Node mit `SIGSTOP` einfrieren, nach `HA_FREEZE_SECONDS` mit `SIGCONT` wecken | Der Follower übernimmt nach Ablauf der Lease (`ha.leaseDuration`, gemessen etwa 20 s). Der aufgeweckte Prozess merkt, dass er die Lease verloren hat, beendet sich und startet als Follower neu. Dabei schließt er keine Session und gibt die Lease des neuen Leaders nicht frei. Danach arbeiten beide Clients weiter. |
+| h4 | `kubectl rollout restart`, dann den alten Leader löschen | Der Rollout ersetzt zuerst den Follower und wartet (`kubectl rollout status` meldet keinen Erfolg). Das Löschen des alten Leaders schließt ihn ab: Der neue Follower übernimmt, nicht der Pod mit altem Template, den die alte ReplicaSet als Ersatz startet. Danach `UP-TO-DATE 2, AVAILABLE 1`, und die Clients arbeiten weiter. |
+| h5 | Eviction-API wie `kubectl drain` | Die PodDisruptionBudget lehnt die Räumung des Leaders ab, der Follower darf gehen und wird ersetzt. |
+
+h3 braucht `docker exec` auf dem kind-Node (`crictl inspect` liefert die PID des Gateway-Containers). Wer
+Fehler untersuchen will, lässt das HA-Deployment mit `KEEP_HA=1` stehen; das erzeugte Overlay mit seinen Secrets
+bleibt dann ebenfalls liegen.
+
+| Variable | Default | Bedeutung |
+|---|---|---|
+| `HA_OVERLAY` | `../../../../../deploy/kubernetes/overlays/ha` | das geprüfte Overlay, relativ zum erzeugten |
+| `HA_LEASE` | `quackmux-default` | Name der Lease |
+| `HA_HANDOVER_SECONDS` | 12 | Höchstdauer der Übergabe in h2 (eine ablaufende statt freigegebene Lease bräuchte mindestens 15 s) |
+| `HA_FREEZE_SECONDS` | 45 | Dauer des Einfrierens in h3: länger als die Session-Lease des zweiten Clients, kürzer als die Liveness-Probe des Gateways toleriert (etwa 60 s) |
+| `ADMIN_LOCAL_PORT` | 19696 | lokaler Port des Port-Forwards auf die Admin-API eines bestimmten Pods |
+| `KEEP_HA` | – | `1`: HA-Deployment und erzeugtes Overlay nach dem Lauf behalten |
 
 ## Konsistenz der Fixtures
 
@@ -191,6 +233,28 @@ den Wert in `config/admin.token` oder `config/gateway*.yaml` nachziehen. Die Tes
   `kubectl --context kind-quackmux -n quackmux get pods -l app.kubernetes.io/component=engine`. Bei einem Fehler gibt
   `test.sh` Pods, Events und das Gateway-Log selbst aus.
 * **`LOAD quack` scheitert:** Das Extension-Verzeichnis des Images passt nicht zu `E2E_EXTENSION_DIR`.
+* **kind: Control-Plane startet nicht, Kubelet meldet „configured to not run on a host using cgroup v1“:** Ab
+  Kubernetes 1.35 verweigert das Kubelet cgroup v1. Auf solchen Hosts (ältere Distributionen, manche CI-Runner)
+  hilft eine Cluster-Konfiguration, die `KIND_CONFIG` an `setup.sh` übergibt:
+
+  ```yaml
+  kind: Cluster
+  apiVersion: kind.x-k8s.io/v1alpha4
+  kubeadmConfigPatches:
+    - |
+      kind: KubeletConfiguration
+      failCgroupV1: false
+  ```
+* **kind: Pods bleiben in `ContainerCreating`, containerd meldet „failed to update /proc/self/oom_score_adj:
+  Permission denied“:** Der Host erlaubt kein negatives `oom_score_adj` (fehlende Capability `CAP_SYS_RESOURCE`,
+  etwa in manchen Sandboxen). Dann gehören in dieselbe Konfiguration zusätzlich:
+
+  ```yaml
+  containerdConfigPatches:
+    - |-
+      [plugins."io.containerd.cri.v1.runtime"]
+        restrict_oom_score_adj = true
+  ```
 * **SELinux (Fedora, RHEL):** Bind-Mounts der Konfiguration brauchen eventuell eine Relabel-Option (`:z`).
 * **Wie die Skripte mit DuckDB sprechen:** Kurze Szenarien geben der CLI ein SQL-Skript mit `-bail` auf stdin.
   Szenarien mit lange offenem Attachment schreiben über eine FIFO nach und nach in die CLI. Die CLI leert ihre

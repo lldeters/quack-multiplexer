@@ -79,6 +79,16 @@ func (e *engine) touch(now time.Time) { e.lastUsed.Store(now.UnixNano()) }
 
 func (e *engine) idleSince() time.Time { return time.Unix(0, e.lastUsed.Load()) }
 
+// startedAt is when the engine's startup budget began: its creation, or, for
+// an engine this process found while it was not ready (perhaps only for a
+// moment), the moment it was found.
+func (e *engine) startedAt() time.Time {
+	if e.Recovered && e.StateSince.After(e.CreatedAt) {
+		return e.StateSince
+	}
+	return e.CreatedAt
+}
+
 func (e *engine) target() Target {
 	return Target{ID: e.ID, Endpoint: e.Endpoint, Token: e.Token, State: e.State, Key: e.Key}
 }
@@ -155,6 +165,8 @@ type Manager struct {
 	log  *slog.Logger
 	met  *metrics.Metrics
 	now  func() time.Time
+	// fence, if set, must report true for Reconcile to act (see SetFence).
+	fence func() bool
 
 	mu            sync.RWMutex
 	engines       map[string]*engine
@@ -163,6 +175,10 @@ type Manager struct {
 	specHashes    map[string]string
 	recoveryUntil time.Time
 	closer        SessionCloser
+	// warmFailures counts warm engines of a profile that failed in a row;
+	// refills back off while warmRetryAt lies ahead.
+	warmFailures map[string]int
+	warmRetryAt  map[string]time.Time
 
 	synced   chan struct{}
 	syncOnce sync.Once
@@ -171,16 +187,18 @@ type Manager struct {
 // NewManager creates a manager. Call SetSessionCloser and Start before use.
 func NewManager(cfg *config.Config, prov Provider, log *slog.Logger, met *metrics.Metrics) *Manager {
 	return &Manager{
-		cfg:        cfg,
-		prov:       prov,
-		log:        log.With("component", "engines"),
-		met:        met,
-		now:        time.Now,
-		engines:    map[string]*engine{},
-		byUID:      map[UID]string{},
-		polling:    map[Key]uint64{},
-		specHashes: map[string]string{},
-		synced:     make(chan struct{}),
+		cfg:          cfg,
+		prov:         prov,
+		log:          log.With("component", "engines"),
+		met:          met,
+		now:          time.Now,
+		engines:      map[string]*engine{},
+		byUID:        map[UID]string{},
+		polling:      map[Key]uint64{},
+		specHashes:   map[string]string{},
+		warmFailures: map[string]int{},
+		warmRetryAt:  map[string]time.Time{},
+		synced:       make(chan struct{}),
 	}
 }
 
@@ -189,6 +207,12 @@ func (m *Manager) SetClock(now func() time.Time) { m.now = now }
 
 // SetSessionCloser wires the session manager.
 func (m *Manager) SetSessionCloser(c SessionCloser) { m.closer = c }
+
+// SetFence makes Reconcile do nothing while fence reports false. With leader
+// election it reports whether this process still holds a fresh lease
+// (ha.Elector.Fresh): a leader that resumes after a freeze must not stop or
+// launch engines on its outdated view. Call it before Start.
+func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
 
 // Provider returns the underlying provider.
 func (m *Manager) Provider() Provider { return m.prov }
@@ -305,12 +329,22 @@ func (m *Manager) eventLoop(ctx context.Context) {
 	}
 }
 
-func (m *Manager) handleEvent(inst Instance) {
+func (m *Manager) handleEvent(inst Instance) { m.applyEvent(inst, nil) }
+
+// applyEvent applies a provider event. With only set (the result of a
+// launch), it applies inst to that engine alone: if the engine is no longer
+// registered - its pod was deleted and the Gone event came first - the
+// result is dropped instead of registering the engine again.
+func (m *Manager) applyEvent(inst Instance, only *engine) {
 	now := m.now()
 	var notify bool
 	var reason string
 	m.mu.Lock()
 	e, known := m.engines[inst.ID]
+	if only != nil && e != only {
+		m.mu.Unlock()
+		return
+	}
 	if !known {
 		// Instances created by an earlier gateway process arrive through the
 		// initial List; instances that show up later are adopted as well,
@@ -340,6 +374,10 @@ func (m *Manager) handleEvent(inst Instance) {
 			e.State, e.ReadyAt, e.StateSince = StateReady, now, now
 			e.touch(now)
 			close(e.ready)
+			if e.Warm {
+				delete(m.warmFailures, e.ProfileName)
+				delete(m.warmRetryAt, e.ProfileName)
+			}
 			if m.met != nil {
 				m.met.EngineStarts.WithLabelValues(e.ProfileName, "ready").Inc()
 				m.met.EngineStartTime.WithLabelValues(e.ProfileName).Observe(now.Sub(e.CreatedAt).Seconds())
@@ -379,9 +417,25 @@ func leaveStartingLocked(e *engine) {
 	}
 }
 
+// claimTimeout bounds persisting a warm engine claim (a PATCH of the pod).
+const claimTimeout = 30 * time.Second
+
+// Back-off of warm pool refills after warm engines failed to start.
+const (
+	warmRetryBase = 30 * time.Second
+	warmRetryMax  = 10 * time.Minute
+)
+
 func (m *Manager) setFailedLocked(e *engine, now time.Time, msg string) {
 	if e.State == StateStarting && m.met != nil {
 		m.met.EngineStarts.WithLabelValues(e.ProfileName, "failed").Inc()
+	}
+	if e.State == StateStarting && e.Warm {
+		// A warm pool whose engines cannot start (quota, admission, image)
+		// would otherwise launch a new one on every reconcile.
+		n := m.warmFailures[e.ProfileName] + 1
+		m.warmFailures[e.ProfileName] = n
+		m.warmRetryAt[e.ProfileName] = now.Add(min(warmRetryBase<<min(n-1, 5), warmRetryMax))
 	}
 	leaveStartingLocked(e)
 	e.State, e.StateSince = StateFailed, now
@@ -434,6 +488,7 @@ var errRetry = errors.New("engine left service while waiting")
 
 // reserve finds, claims or launches the engine for key and reserves it.
 func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config.Profile) (*engine, error) {
+	claimFailed := false
 	for {
 		m.mu.Lock()
 		if e := m.findLocked(key); e != nil {
@@ -441,18 +496,32 @@ func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config
 			m.mu.Unlock()
 			return e, nil
 		}
-		if key.ShareLevel == ShareConnection {
+		if key.ShareLevel == ShareConnection && !claimFailed {
+			if err := m.checkUserLimitLocked(user); err != nil {
+				m.mu.Unlock()
+				return nil, err
+			}
 			if w := m.claimWarmLocked(key, user); w != nil {
 				w.Reserved++
 				m.mu.Unlock()
-				if err := m.prov.Claim(ctx, w.ID, key); err != nil {
+				// Persist the claim even if the client gives up meanwhile: a
+				// cancelled claim would cost the warm engine.
+				cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
+				err := m.prov.Claim(cctx, w.ID, key, user)
+				cancel()
+				if err != nil {
 					// The claim could not be persisted, so a restarted gateway could
-					// hand the engine out again: never use it.
+					// hand the engine out again: never use it. One attempt per
+					// connect: a failing API must not cost the whole warm pool.
 					m.log.Warn("warm engine claim failed, terminating it", "engine", w.ID, "err", err)
 					m.mu.Lock()
 					w.Reserved--
 					m.terminateLocked(w, "warm claim failed")
 					m.mu.Unlock()
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					claimFailed = true
 					continue
 				}
 				return w, nil
@@ -475,33 +544,50 @@ func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config
 }
 
 // findLocked returns the engine that serves key: a READY or STARTING engine
-// with exactly that key and a current spec. Draining engines take no new
-// sessions.
+// with exactly that key and a current spec, READY first. Draining engines
+// take no new sessions. Normally there is at most one; after a restart there
+// can be more (an engine that failed its startup timeout but became ready
+// later, next to its replacement): then the oldest serves, every time, and
+// Reconcile drains the others, so that the sessions of a key do not spread
+// over engines with different database state.
 func (m *Manager) findLocked(key Key) *engine {
 	var best *engine
 	for _, e := range m.engines {
-		if e.Warm || e.Key != key {
+		if !m.servesNewLocked(e, key) {
 			continue
 		}
-		if e.State != StateReady && e.State != StateStarting {
-			continue
-		}
-		if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
-			continue
-		}
-		if best == nil || (best.State == StateStarting && e.State == StateReady) {
+		if best == nil || (best.State == StateStarting && e.State == StateReady) ||
+			(best.State == e.State && olderEngine(e, best)) {
 			best = e
 		}
 	}
 	return best
 }
 
+// servesNewLocked reports whether e may take new sessions of key.
+func (m *Manager) servesNewLocked(e *engine, key Key) bool {
+	return !e.Warm && e.Key == key && (e.State == StateReady || e.State == StateStarting) &&
+		(m.specCurrentLocked(e) || !m.replaceOnSpecChange())
+}
+
+// olderEngine orders engines by creation, then by id.
+func olderEngine(a, b *engine) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
+}
+
 func (m *Manager) claimWarmLocked(key Key, user string) *engine {
 	var pick *engine
 	inRecovery := m.now().Before(m.recoveryUntil)
+	now := m.now()
 	for _, e := range m.engines {
 		if !e.Warm || e.ProfileName != key.Profile || e.State != StateReady {
 			continue
+		}
+		if max := m.cfg.EngineMaxLifetime(e.ProfileName); max > 0 && now.Sub(e.CreatedAt) > max {
+			continue // recycled by maintainWarmPoolsLocked
 		}
 		if e.Recovered && inRecovery {
 			// A claim that was in flight when the previous gateway process
@@ -564,9 +650,11 @@ func (m *Manager) specCurrentLocked(e *engine) bool {
 	return e.SpecHash == "" || e.SpecHash == h
 }
 
+// checkLimitsLocked checks the limits before an engine is launched for key
+// on behalf of user (empty for warm pool refills).
 func (m *Manager) checkLimitsLocked(key Key, user string) error {
 	l := m.cfg.Limits
-	var total, starting, perUser int
+	var total, starting int
 	for _, e := range m.engines {
 		if e.State == StateFailed || e.State == StateTerminating {
 			continue
@@ -575,9 +663,6 @@ func (m *Manager) checkLimitsLocked(key Key, user string) error {
 		if e.State == StateStarting {
 			starting++
 		}
-		if !e.Warm && user != "" && e.User == user && (e.Key.ShareLevel == ShareUser || e.Key.ShareLevel == ShareConnection) {
-			perUser++
-		}
 	}
 	if l.MaxEngines > 0 && total >= l.MaxEngines {
 		return fmt.Errorf("%w: %d engines running (limits.maxEngines)", ErrLimit, total)
@@ -585,8 +670,26 @@ func (m *Manager) checkLimitsLocked(key Key, user string) error {
 	if l.MaxStartingEngines > 0 && starting >= l.MaxStartingEngines {
 		return fmt.Errorf("%w: %d engines starting (limits.maxStartingEngines), try again shortly", ErrLimit, starting)
 	}
-	if l.MaxEnginesPerUser > 0 && user != "" && (key.ShareLevel == ShareUser || key.ShareLevel == ShareConnection) && perUser >= l.MaxEnginesPerUser {
-		return fmt.Errorf("%w: user %q already has %d engines (limits.maxEnginesPerUser)", ErrLimit, user, perUser)
+	return m.checkUserLimitLocked(user)
+}
+
+// checkUserLimitLocked enforces limits.maxEnginesPerUser: the engines a
+// user caused to be started or claimed, whatever their share level. Shared
+// engines count too: otherwise any user could start engines for arbitrary
+// SERVER or GROUP subdomains until limits.maxEngines locks everybody out.
+func (m *Manager) checkUserLimitLocked(user string) error {
+	max := m.cfg.Limits.MaxEnginesPerUser
+	if max <= 0 || user == "" {
+		return nil
+	}
+	n := 0
+	for _, e := range m.engines {
+		if !e.Warm && e.User == user && e.State != StateFailed && e.State != StateTerminating {
+			n++
+		}
+	}
+	if n >= max {
+		return fmt.Errorf("%w: user %q already has %d engines (limits.maxEnginesPerUser)", ErrLimit, user, n)
 	}
 	return nil
 }
@@ -650,7 +753,7 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 			m.mu.Unlock()
 			return
 		}
-		m.handleEvent(inst)
+		m.applyEvent(inst, e)
 	}()
 }
 
@@ -658,7 +761,7 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 // dropped. errRetry asks Acquire to pick another engine.
 func (m *Manager) wait(ctx context.Context, e *engine) (*Lease, error) {
 	timeout := m.cfg.EngineStartupTimeout(e.ProfileName)
-	remaining := timeout - m.now().Sub(e.CreatedAt)
+	remaining := timeout - m.now().Sub(e.startedAt())
 	if remaining < time.Second {
 		remaining = time.Second
 	}
@@ -742,7 +845,7 @@ func (m *Manager) AttachAdopted(id, sessionID, user string) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := m.prov.Claim(ctx, id, claimKey); err != nil {
+			if err := m.prov.Claim(ctx, id, claimKey, user); err != nil {
 				m.log.Warn("re-claiming adopted warm engine failed", "engine", id, "err", err)
 			}
 		}()
@@ -920,6 +1023,10 @@ func (m *Manager) reconcileLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// Both cases may be ready at once, and select picks at random.
+			if ctx.Err() != nil {
+				return
+			}
 			m.Reconcile()
 		}
 	}
@@ -928,11 +1035,24 @@ func (m *Manager) reconcileLoop(ctx context.Context) {
 // Reconcile applies timeouts and keeps warm pools filled. It runs
 // periodically and may be called directly (tests).
 func (m *Manager) Reconcile() {
+	if m.fence != nil && !m.fence() {
+		m.log.Debug("not reconciling engines: the leader lease is not fresh")
+		return
+	}
 	now := m.now()
 	var drainClose []string
 	m.mu.Lock()
 	inRecovery := now.Before(m.recoveryUntil)
 	permanent := !m.prov.CanLaunch()
+	// The READY engine that serves each key (see findLocked).
+	serving := map[Key]*engine{}
+	for _, e := range m.engines {
+		if e.State == StateReady && m.servesNewLocked(e, e.Key) {
+			if cur := serving[e.Key]; cur == nil || olderEngine(e, cur) {
+				serving[e.Key] = e
+			}
+		}
+	}
 	for _, e := range m.engines {
 		if permanent {
 			// Externally managed engines: only the provider's health probes
@@ -944,7 +1064,7 @@ func (m *Manager) Reconcile() {
 		protected := e.Recovered && inRecovery
 		switch e.State {
 		case StateStarting:
-			if limit := m.cfg.EngineStartupTimeout(e.ProfileName); now.Sub(e.CreatedAt) > limit {
+			if limit := m.cfg.EngineStartupTimeout(e.ProfileName); now.Sub(e.startedAt()) > limit {
 				msg := fmt.Sprintf("startup timeout after %s", limit)
 				if e.Message != "" {
 					msg += ": " + e.Message
@@ -961,6 +1081,10 @@ func (m *Manager) Reconcile() {
 			}
 			if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
 				m.drainLocked(e, "profile changed")
+				continue
+			}
+			if s := serving[e.Key]; s != nil && s != e {
+				m.drainLocked(e, "duplicate engine: "+s.ID+" serves "+e.Key.String())
 				continue
 			}
 			if idle && !protected {
@@ -1017,11 +1141,19 @@ func (m *Manager) maintainWarmPoolsLocked() {
 				m.terminateLocked(e, "warm engine outdated")
 				continue
 			}
+			if max := m.cfg.EngineMaxLifetime(name); max > 0 && e.State == StateReady && m.now().Sub(e.CreatedAt) > max {
+				// Never hand out an engine that would be drained right away.
+				m.terminateLocked(e, fmt.Sprintf("warm engine reached max lifetime %s", max))
+				continue
+			}
 			warm = append(warm, e)
 		}
 		for len(warm) > prof.WarmPool.Size {
 			m.terminateLocked(warm[len(warm)-1], "warm pool shrunk")
 			warm = warm[:len(warm)-1]
+		}
+		if now := m.now(); len(warm) < prof.WarmPool.Size && now.Before(m.warmRetryAt[name]) {
+			continue // the last warm engines of this profile failed: back off
 		}
 		for i := len(warm); i < prof.WarmPool.Size; i++ {
 			key := Key{ShareLevel: ShareConnection, Profile: name}

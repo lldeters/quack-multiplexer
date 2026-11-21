@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+#
+# High availability in the kind cluster prepared by setup.sh: the gateway runs
+# as two replicas with leader election (deploy/kubernetes/overlays/ha), and
+# real DuckDB 2.0 clients keep their attachments through failovers (see
+# ../README.md).
+#
+#   bash test/e2e/kind/ha.sh
+#
+# The script does what deploy/kubernetes/README.md asks of an operator: it
+# generates fresh secrets into an overlay on top of overlays/ha that uses the
+# locally built gateway image (test/e2e/kind/.work/ha-overlay), stops the
+# running gateway and applies the overlay. The scenarios:
+#
+#   h1  exactly one replica is ready, and it holds the lease
+#   h2  deleting the leader hands over within seconds; attachments survive
+#   h3  a frozen leader (SIGSTOP) loses the lease to the follower; when it
+#       resumes it steps down without closing the sessions it still knows
+#   h4  a rollout completes with the documented controlled failover
+#   h5  the PodDisruptionBudget lets the follower be evicted, not the leader
+#
+# Two clients of one user stay attached through all scenarios: one with the
+# default heartbeat timeout (60 s) and one with HEARTBEAT_TIMEOUT 5, whose
+# session lease (5 s + session.heartbeatGrace 15 s) is shorter than h3 keeps
+# the leader frozen. Afterwards the cluster runs the dev overlay again, so
+# that test.sh works as before. h3 freezes the gateway process on its kind
+# node (docker exec).
+#
+# Optional environment (see env.sh for more):
+#   HA_OVERLAY         the overlay under test, relative to the generated one
+#                      (default ../../../../../deploy/kubernetes/overlays/ha)
+#   HA_LEASE           name of the lease (default quackmux-default)
+#   HA_FREEZE_SECONDS  how long h3 freezes the leader (default 45: longer than
+#                      the session lease of the second client, shorter than
+#                      the liveness probe of the gateway tolerates, about 60 s)
+#   HA_HANDOVER_SECONDS  how long h2 may take from deleting the leader until
+#                      another replica leads (default 12: the old leader
+#                      releases the lease; an expiring one takes 15 s or more)
+#   ADMIN_LOCAL_PORT   local port of the admin port-forward (default 19696)
+#   ATTACH_TIMEOUT     seconds an ATTACH may take (default 180)
+#   KEEP_HA=1          keep the HA deployment and the generated overlay (with
+#                      its secrets) after the run
+set -euo pipefail
+# shellcheck source=env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
+
+need kubectl curl docker mkfifo awk sed grep od tr
+# Writing to a session whose client died must fail the check, not kill the run.
+trap '' PIPE
+
+# The dev overlay names the namespace, the Deployment and the images that
+# setup.sh loaded into the cluster; the HA overlay uses the same names.
+DEV_OVERLAY_DIR=$OVERLAY_DIR
+resolve_names
+resolve_images
+
+HA_WORK=$KIND_DIR/.work
+HA_DIR=$HA_WORK/ha-overlay
+HA_OVERLAY=${HA_OVERLAY:-../../../../../deploy/kubernetes/overlays/ha}
+HA_LEASE=${HA_LEASE:-quackmux-default}
+HA_FREEZE_SECONDS=${HA_FREEZE_SECONDS:-45}
+HA_HANDOVER_SECONDS=${HA_HANDOVER_SECONDS:-12}
+RUN_ID=${RUN_ID:-$(date +%s)}
+HA_USER=e2e-ha-$RUN_ID
+ADMIN_LOCAL_PORT=${ADMIN_LOCAL_PORT:-19696}
+ADMIN_URL=http://127.0.0.1:$ADMIN_LOCAL_PORT
+ATTACH_TIMEOUT=${ATTACH_TIMEOUT:-180}
+CLIENT_CMD=(kubectl --context "$KUBE_CONTEXT" -n "$NS" exec -i "$CLIENT_POD" -- /usr/local/bin/duckdb)
+
+E2E_WORK=$(make_workdir)
+ADMIN_HEADER_FILE=''
+PF_PID=''
+LEADER='' FOLLOWER='' NEW_LEADER=''
+ENGINE_POD=''
+SWITCHED=''
+FROZEN_NODE='' FROZEN_PID=''
+CLIENTS_OPEN=''
+
+# Generated overlay ----------------------------------------------------------------
+
+# random_token prints 64 random hex digits (32 bytes, like "quackmux token").
+random_token() { od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; }
+
+sha256_hex() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		printf '%s' "$1" | sha256sum
+	elif command -v shasum >/dev/null 2>&1; then
+		printf '%s' "$1" | shasum -a 256
+	else
+		printf '%s' "$1" | openssl dgst -sha256 -r
+	fi | awk '{ print $1 }'
+}
+
+# make_overlay writes HA_DIR: HA_OVERLAY with the gateway image of the dev
+# overlay and freshly generated secrets (deploy/kubernetes/README.md, "Echte
+# Secrets erzeugen").
+make_overlay() {
+	local name=${GATEWAY_IMAGE%:*} tag=${GATEWAY_IMAGE##*:}
+	case $GATEWAY_IMAGE in *@*) die "GATEWAY_IMAGE with a digest is not supported: $GATEWAY_IMAGE" ;; esac
+	case $tag in */* | "$GATEWAY_IMAGE") name=$GATEWAY_IMAGE tag=latest ;; esac
+	CLIENT_TOKEN=$(random_token)
+	ADMIN_TOKEN=$(random_token)
+	rm -rf "$HA_DIR"
+	(
+		umask 077
+		mkdir -p "$HA_DIR/secrets"
+		random_token >"$HA_DIR/secrets/session-key"
+		printf '%s\n' "$ADMIN_TOKEN" >"$HA_DIR/secrets/admin-token"
+		cat >"$HA_DIR/secrets/users.yaml" <<EOF
+users:
+  - name: $HA_USER
+    tokens:
+      - sha256: "$(sha256_hex "$CLIENT_TOKEN")"
+        description: test/e2e/kind/ha.sh
+EOF
+		cat >"$HA_DIR/kustomization.yaml" <<EOF
+# Generated by test/e2e/kind/ha.sh. The secrets are throwaway values.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - $HA_OVERLAY
+images:
+  - name: quackmux/quackmux
+    newName: $name
+    newTag: $tag
+secretGenerator:
+  - name: quackmux-session-key
+    behavior: replace
+    files: [key=secrets/session-key]
+  - name: quackmux-admin-token
+    behavior: replace
+    files: [token=secrets/admin-token]
+  - name: quackmux-users
+    behavior: replace
+    files: [users.yaml=secrets/users.yaml]
+EOF
+	)
+	ADMIN_HEADER_FILE=$E2E_WORK/admin.header
+	(umask 077 && printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" >"$ADMIN_HEADER_FILE")
+}
+
+# Gateway pods and the lease -------------------------------------------------------
+
+gateway_selector() {
+	local s
+	s=$(kctl -n "$NS" get deployment "$DEPLOY" \
+		-o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}') || return 1
+	printf '%s' "${s%,}"
+}
+
+# gateway_status prints "NAME READY" (READY is True or False) for every gateway
+# pod that is running and not being deleted.
+gateway_status() {
+	local selector
+	selector=$(gateway_selector) || return 1
+	kctl -n "$NS" get pods -l "$selector" -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{if eq .status.phase "Running"}}{{.metadata.name}} {{$r := "False"}}{{range .status.conditions}}{{if eq .type "Ready"}}{{$r = .status}}{{end}}{{end}}{{$r}}{{"\n"}}{{end}}{{end}}{{end}}'
+}
+
+lease_holder() { kctl -n "$NS" get lease "$HA_LEASE" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null; }
+
+# one_leader succeeds when exactly two gateway pods run, exactly one of them is
+# ready, and that one holds the lease. It sets LEADER and FOLLOWER.
+one_leader() {
+	local st ready holder
+	st=$(gateway_status) || return 1
+	[ "$(nlines "$st")" = 2 ] || return 1
+	ready=$(printf '%s\n' "$st" | awk '$2 == "True" { print $1 }')
+	[ "$(nlines "$ready")" = 1 ] || return 1
+	holder=$(lease_holder) || return 1
+	[ "$holder" = "$ready" ] || return 1
+	LEADER=$ready
+	FOLLOWER=$(printf '%s\n' "$st" | awk '$2 != "True" { print $1 }')
+}
+
+# leader_is POD succeeds once POD holds the lease and is ready.
+leader_is() {
+	[ "$(lease_holder)" = "$1" ] || return 1
+	gateway_status | awk -v p="$1" '$1 == p && $2 == "True" { f = 1 } END { exit !f }'
+}
+
+# leader_other_than POD succeeds once a pod other than POD holds the lease and
+# is ready. It sets NEW_LEADER.
+leader_other_than() {
+	local holder
+	holder=$(lease_holder) || return 1
+	[ -n "$holder" ] && [ "$holder" != "$1" ] || return 1
+	leader_is "$holder" || return 1
+	NEW_LEADER=$holder
+}
+
+no_gateway_pods() { [ -z "$(gateway_pods 2>/dev/null)" ]; }
+
+# deployment_counts prints "REPLICAS UPDATED AVAILABLE" of the Deployment.
+deployment_counts() {
+	kctl -n "$NS" get deployment "$DEPLOY" \
+		-o jsonpath='{.status.replicas} {.status.updatedReplicas} {.status.availableReplicas}'
+}
+
+# rollout_done succeeds when the Deployment runs two pods of its newest
+# template, one of them the leader (UP-TO-DATE 2, AVAILABLE 1).
+rollout_done() { one_leader && [ "$(deployment_counts)" = "2 2 1" ]; }
+
+restart_count() {
+	kctl -n "$NS" get pod "$1" -o jsonpath='{.status.containerStatuses[?(@.name=="gateway")].restartCount}'
+}
+
+# restarted_follower POD COUNT succeeds once the gateway container of POD has
+# restarted more than COUNT times and runs as a follower again.
+restarted_follower() {
+	local n
+	n=$(restart_count "$1") || return 1
+	[ -n "$n" ] && [ "$n" -gt "$2" ] || return 1
+	gateway_status | awk -v p="$1" '$1 == p && $2 == "False" { f = 1 } END { exit !f }'
+}
+
+# node_pid POD NODE prints the process id of the gateway container of POD in the
+# PID namespace of its kind node.
+node_pid() {
+	local cid
+	cid=$(kctl -n "$NS" get pod "$1" -o jsonpath='{.status.containerStatuses[?(@.name=="gateway")].containerID}') || return 1
+	[ -n "$cid" ] || return 1
+	docker exec "$2" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#*://}"
+}
+
+# evict POD asks the API server to evict POD (what kubectl drain does).
+evict() {
+	kctl create --raw "/api/v1/namespaces/$NS/pods/$1/eviction" -f - <<EOF
+{"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "$1", "namespace": "$NS"}}
+EOF
+}
+
+# Admin API ------------------------------------------------------------------------
+
+pf_stop() {
+	if [ -n "$PF_PID" ]; then
+		kill "$PF_PID" 2>/dev/null || true
+		wait "$PF_PID" 2>/dev/null || true
+		PF_PID=''
+	fi
+}
+
+# pf_start POD (re)starts the port-forward to the admin port of POD.
+pf_start() {
+	pf_stop
+	(
+		close_session_fds
+		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" port-forward "pod/$1" "$ADMIN_LOCAL_PORT:9495"
+	) >"$E2E_WORK/port-forward.log" 2>&1 &
+	PF_PID=$!
+	if ! wait_for 30 "the admin API of $1 through kubectl port-forward" curl -fsS "$ADMIN_URL/healthz"; then
+		indent "$E2E_WORK/port-forward.log"
+		return 1
+	fi
+}
+
+# is_leader_metric prints the value of quackmux_is_leader of the pod behind the
+# port-forward.
+is_leader_metric() {
+	curl -fsS "$ADMIN_URL/metrics" 2>/dev/null | awk '$1 == "quackmux_is_leader" { print $2 }'
+}
+
+# log_events FILE prints "TIME MESSAGE" for the leadership and shutdown events
+# in a gateway log (JSON lines).
+log_events() {
+	grep -E '"msg":"(shutting down|became leader|stopped leading|stopped campaigning|lost leadership|gateway ready)"' "$1" |
+		sed -n 's/.*"time":"\([^"]*\)".*"msg":"\([^"]*\)".*/\1 \2/p'
+}
+
+# Clients ----------------------------------------------------------------------------
+
+# open_client ID [HEARTBEAT_TIMEOUT] starts a DuckDB CLI in the client pod and
+# attaches the gateway as "remote" with share level USER.
+open_client() {
+	session_start "$1" "${CLIENT_CMD[@]}" || return 1
+	CLIENTS_OPEN="$CLIENTS_OPEN $1"
+	session_send "$1" "$(client_preamble)
+CREATE SECRET (TYPE quack, TOKEN '$CLIENT_TOKEN?share_level=user', SCOPE '$QUACK_URI');
+ATTACH '$QUACK_URI' AS remote (DISABLE_SSL true${2:+, HEARTBEAT_TIMEOUT $2});
+SELECT '$1-attached=' || x AS result FROM remote.query('SELECT ''ok'' AS x');" || return 1
+	session_wait "$1" "$1-attached=ok" "$ATTACH_TIMEOUT"
+}
+
+# expect_attached ID TAG: client ID still reaches the table ha_t on its engine
+# through its attachment. The query goes through remote.query(): the client
+# caches the catalog of an attachment, and c2 attached before c1 created the
+# table. A request in flight during a failover may fail (the client then gets
+# an error, never a second execution); such a query is repeated up to twice,
+# with a warning.
+expect_attached() {
+	local id=$1 tag=$2 attempt=1 log=$E2E_WORK/$1.log
+	while :; do
+		session_send "$id" "SELECT '$tag-$attempt=' || x AS result FROM remote.query('SELECT x FROM ha_t');
+SELECT '$tag-done-$attempt' AS result;" || return 1
+		session_wait "$id" "$tag-done-$attempt" 120 '' || return 1
+		if grep -qF -- "$tag-$attempt=42" "$log"; then break; fi
+		if [ "$attempt" -ge 3 ]; then
+			bad "client $id cannot use its attachment any more:"
+			session_output "$id" | indent
+			return 1
+		fi
+		warn "query $attempt of client $id failed, retrying:"
+		session_output "$id" | indent
+		eval "ERRORS_$id=1"
+		attempt=$((attempt + 1))
+		sleep 3
+	done
+	ok "client $id still uses its attachment ($tag)"
+}
+
+expect_both_attached() {
+	expect_attached c1 "$1-c1" || return 1
+	expect_attached c2 "$1-c2"
+}
+
+# expect_adopted DESCRIPTION: the gateway behind the port-forward knows both
+# sessions of the clients, adopted, on ENGINE_POD.
+expect_adopted() {
+	local list=$E2E_WORK/sessions.json
+	api GET "$ADMIN_URL" "/api/v1/sessions?user=$HA_USER" "$list"
+	if [ "$HTTP_STATUS" != 200 ]; then
+		bad "$1: GET /api/v1/sessions answered HTTP $HTTP_STATUS"
+		indent "$list"
+		return 1
+	fi
+	expect_eq "$(json_value "$list" count)" 2 "$1: both sessions are open" || {
+		indent "$list"
+		return 1
+	}
+	expect_eq "$(json_count "$list" adopted true)" 2 "$1: both sessions are adopted" || return 1
+	expect_eq "$(json_count "$list" engineId "\"$ENGINE_POD\"")" 2 "$1: both run on engine pod $ENGINE_POD" || return 1
+}
+
+close_clients() {
+	local id rc
+	for id in $CLIENTS_OPEN; do
+		rc=0
+		session_send "$id" "DETACH remote;
+SELECT '$id-detached' AS result;" && session_wait "$id" "$id-detached" 60 '' || rc=1
+		session_end "$id" || [ -n "$(eval "printf '%s' \"\${ERRORS_$id:-}\"")" ] || rc=1
+		[ "$rc" = 0 ] || warn "client $id did not end cleanly"
+	done
+	CLIENTS_OPEN=''
+}
+
+# Switching overlays -------------------------------------------------------------
+
+switch_to_ha() {
+	kctl -n "$NS" scale "deployment/$DEPLOY" --replicas=0 >/dev/null || return 1
+	wait_for 120 "the running gateway to stop" no_gateway_pods || return 1
+	SWITCHED=1
+	if ! kctl apply -k "$HA_DIR" >"$E2E_WORK/apply.log" 2>&1; then
+		indent "$E2E_WORK/apply.log"
+		return 1
+	fi
+}
+
+restore_dev() {
+	step "back to the dev overlay"
+	kctl -n "$NS" scale "deployment/$DEPLOY" --replicas=0 >/dev/null || return 1
+	wait_for 120 "the HA gateway pods to stop" no_gateway_pods || return 1
+	kctl -n "$NS" delete poddisruptionbudget "$DEPLOY" --ignore-not-found >/dev/null || return 1
+	kctl apply -k "$DEV_OVERLAY_DIR" >/dev/null || return 1
+	kctl -n "$NS" rollout status "deployment/$DEPLOY" --timeout=180s >/dev/null || return 1
+	ok "deployment/$DEPLOY runs the dev overlay again"
+}
+
+# Cleanup ----------------------------------------------------------------------------
+
+ha_diagnostics() {
+	local p
+	step "diagnostics (namespace $NS)"
+	kctl -n "$NS" get pods -o wide >&2 || true
+	kctl -n "$NS" get lease "$HA_LEASE" -o yaml 2>/dev/null | grep -E 'holderIdentity|renewTime|leaseTransitions' >&2 || true
+	say "recent events:"
+	kctl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 25 >&2 || true
+	for p in $(gateway_pods 2>/dev/null); do
+		say "log of $p (last 60 lines, and of its previous container if any):"
+		kctl -n "$NS" logs "$p" --previous --tail=60 >&2 2>/dev/null || true
+		kctl -n "$NS" logs "$p" --tail=60 >&2 || true
+	done
+}
+
+cleanup() {
+	local rc=$?
+	trap - EXIT
+	if [ -n "$FROZEN_PID" ]; then
+		docker exec "$FROZEN_NODE" kill -CONT "$FROZEN_PID" 2>/dev/null || true
+	fi
+	if [ "$rc" -ne 0 ]; then ha_diagnostics; fi
+	session_kill_all
+	if [ -n "$ENGINE_POD" ]; then
+		kctl -n "$NS" delete pod "$ENGINE_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	fi
+	pf_stop
+	kctl -n "$NS" delete pod "$CLIENT_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	if [ -n "$SWITCHED" ] && [ -z "${KEEP_HA:-}" ]; then
+		restore_dev || rc=1
+	fi
+	if [ -z "${KEEP_HA:-}" ]; then rm -rf "$HA_WORK"; fi
+	rm -rf "$E2E_WORK"
+	exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+scenario_failed_hook() {
+	local f
+	for f in "$E2E_WORK"/c*.log; do
+		if [ -f "$f" ]; then
+			say "  client output ($(basename "$f")):"
+			indent "$f"
+		fi
+	done
+}
+
+# Scenarios ----------------------------------------------------------------------------
+
+# h1: two replicas, one leader. Only the leader is ready (deploy/kubernetes/README.md,
+# "Hochverfügbarkeit"); the Deployment counts as Available all the same.
+scenario_election() {
+	local readyz=$E2E_WORK/h1-readyz.txt
+	wait_for 180 "two gateway replicas, one of them the ready leader" one_leader || return 1
+	ok "two replicas: $LEADER is ready and holds lease $HA_LEASE, $FOLLOWER is not ready"
+	if ! kctl -n "$NS" wait --for=condition=Available "deployment/$DEPLOY" --timeout=60s >/dev/null; then
+		bad "the Deployment does not become Available"
+		return 1
+	fi
+	ok "the Deployment is Available"
+	expect_eq "$(deployment_counts)" "2 2 1" "the Deployment shows UP-TO-DATE 2, AVAILABLE 1" || return 1
+	pf_start "$FOLLOWER" || return 1
+	api GET "$ADMIN_URL" /readyz "$readyz"
+	expect_eq "$HTTP_STATUS" 503 "the follower fails its readiness probe" || return 1
+	expect_output "$readyz" "not the leader" "the follower says 'not the leader'" || return 1
+	expect_eq "$(is_leader_metric)" 0 "the follower reports quackmux_is_leader 0" || return 1
+	pf_start "$LEADER" || return 1
+	expect_eq "$(is_leader_metric)" 1 "the leader reports quackmux_is_leader 1" || return 1
+}
+
+# h2: deleting the leader pod (SIGTERM) releases the lease; the waiting
+# follower takes over within seconds (the pod that replaces the deleted one
+# campaigns only after 3 x ha.retryPeriod) and adopts the sessions of both
+# clients.
+scenario_delete_leader() {
+	local before=$E2E_WORK/h2.before old follower start took logpid
+	engine_pods >"$before" || return 1
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	pf_start "$LEADER" || return 1
+	open_client c1 || return 1
+	open_client c2 5 || return 1
+	session_send c1 "CREATE OR REPLACE TABLE remote.ha_t AS SELECT 42 AS x;
+SELECT 'c1-created' AS result;" || return 1
+	session_wait c1 c1-created 60 || return 1
+	ENGINE_POD=$(new_pods "$before")
+	expect_eq "$(nlines "$ENGINE_POD")" 1 "both USER sessions got one engine pod ($ENGINE_POD)" || return 1
+	expect_both_attached h2-before || return 1
+	expect_sessions "$ADMIN_URL" "$HA_USER" 2 "the leader lists both sessions" || return 1
+	old=$LEADER follower=$FOLLOWER
+	(
+		close_session_fds
+		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" logs -f "pod/$old" --since=5s
+	) >"$E2E_WORK/h2-old.log" 2>&1 &
+	logpid=$!
+	sleep 2
+	say "  kubectl delete pod $old (the leader) at $(date -u +%H:%M:%S)"
+	start=$(now)
+	kctl -n "$NS" delete pod "$old" --wait=false >/dev/null || return 1
+	wait_for 60 "another replica to take over" leader_other_than "$old" || return 1
+	took=$(($(now) - start))
+	kill "$logpid" 2>/dev/null || true
+	wait "$logpid" 2>/dev/null || true
+	kctl -n "$NS" logs "$NEW_LEADER" --since=2m >"$E2E_WORK/h2-new.log" 2>&1 || true
+	say "  old leader: $(log_events "$E2E_WORK/h2-old.log" | tr '\n' ';')"
+	say "  new leader: $(log_events "$E2E_WORK/h2-new.log" | tr '\n' ';')"
+	if [ "$took" -gt "$HA_HANDOVER_SECONDS" ]; then
+		bad "$NEW_LEADER leads only ${took}s after the delete (at most ${HA_HANDOVER_SECONDS}s): the old leader did not release the lease"
+		return 1
+	fi
+	ok "$NEW_LEADER leads ${took}s after the delete: the old leader released the lease"
+	expect_eq "$NEW_LEADER" "$follower" "the waiting follower took over, not the pod that replaces the deleted one" || return 1
+	wait_for 120 "two replicas with one leader again" one_leader || return 1
+	ok "the Deployment replaced $old; $LEADER leads, $FOLLOWER follows"
+	expect_both_attached h2-after || return 1
+	pf_start "$LEADER" || return 1
+	expect_adopted "the new leader $LEADER" || return 1
+}
+
+# h3: a leader that freezes (SIGSTOP, like a stalled node or VM) cannot renew
+# its lease; the follower takes over once the lease expires. When the old
+# leader resumes, its sessions look expired to it (no heartbeat for longer
+# than the session lease of client c2): it must step down without closing
+# them, since the new leader serves them. No query runs during the freeze: a
+# client may still hold a keep-alive connection to the frozen pod, on which a
+# request would wait for the resume.
+scenario_frozen_leader() {
+	local frozen takeover node pid start restarts log=$E2E_WORK/h3-resumed.log
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	frozen=$LEADER takeover=$FOLLOWER
+	node=$(kctl -n "$NS" get pod "$frozen" -o jsonpath='{.spec.nodeName}') || return 1
+	if ! pid=$(node_pid "$frozen" "$node"); then
+		bad "cannot find the gateway process of $frozen on the kind node $node (docker exec $node crictl inspect)"
+		return 1
+	fi
+	restarts=$(restart_count "$frozen")
+	expect_both_attached h3-before || return 1
+	say "  kill -STOP $pid on node $node (gateway $frozen) for ${HA_FREEZE_SECONDS}s"
+	start=$(now)
+	docker exec "$node" kill -STOP "$pid" || return 1
+	FROZEN_NODE=$node FROZEN_PID=$pid
+	wait_for 90 "$FOLLOWER to take over the lease" leader_is "$FOLLOWER" || return 1
+	ok "$FOLLOWER leads $(($(now) - start))s after the freeze (ha.leaseDuration 15s)"
+	pf_start "$FOLLOWER" || return 1
+	say "  sessions the new leader has adopted during the freeze: $(session_count "$ADMIN_URL" "$HA_USER" || echo '?')"
+	sleep_until $((start + HA_FREEZE_SECONDS))
+	say "  kill -CONT $pid: $frozen resumes after $(($(now) - start))s"
+	docker exec "$node" kill -CONT "$pid" || return 1
+	FROZEN_NODE='' FROZEN_PID=''
+	wait_for 60 "$frozen to step down and restart as a follower" restarted_follower "$frozen" "$restarts" || return 1
+	kctl -n "$NS" logs "$frozen" --previous >"$log" 2>&1 || true
+	expect_output "$log" "lost leadership" "the resumed gateway noticed that it lost the lease" || return 1
+	if grep -F '"msg":"session closed"' "$log" | grep -qF "$HA_USER"; then
+		bad "the resumed gateway closed sessions that the new leader serves:"
+		grep -F '"msg":"session closed"' "$log" | indent
+		return 1
+	fi
+	ok "the resumed gateway closed no session"
+	# Give damage, if any, time to show: a DISCONNECT from the old leader would
+	# end the connections on the engine.
+	sleep 5
+	expect_both_attached h3-after || return 1
+	wait_for 60 "two replicas with one leader" one_leader || return 1
+	expect_eq "$LEADER" "$takeover" "$takeover still leads: the resumed gateway left the lease alone" || return 1
+	pf_start "$LEADER" || return 1
+	expect_adopted "the leader $LEADER after the resume" || return 1
+}
+
+# h4: a rollout replaces the follower first and then waits; deleting the old
+# leader completes it (deploy/kubernetes/README.md, "Rollout").
+scenario_rollout() {
+	local old_leader old_follower
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	old_leader=$LEADER old_follower=$FOLLOWER
+	say "  kubectl rollout restart deployment/$DEPLOY"
+	kctl -n "$NS" rollout restart "deployment/$DEPLOY" >/dev/null || return 1
+	wait_for 120 "the follower $old_follower to be replaced" pod_gone "$old_follower" || return 1
+	wait_for 120 "a new pod next to the leader" one_leader || return 1
+	expect_eq "$LEADER" "$old_leader" "the rollout replaced the follower first, $old_leader still leads" || return 1
+	if kctl -n "$NS" rollout status "deployment/$DEPLOY" --timeout=10s >/dev/null 2>&1; then
+		bad "kubectl rollout status reports success while the old leader still runs"
+		return 1
+	fi
+	ok "kubectl rollout status keeps waiting while the old leader runs (as documented)"
+	expect_both_attached h4-during || return 1
+	say "  kubectl delete pod $old_leader (controlled failover)"
+	kctl -n "$NS" delete pod "$old_leader" --wait=false >/dev/null || return 1
+	wait_for 180 "the rollout to complete" rollout_done || return 1
+	ok "the rollout is complete: UP-TO-DATE 2, AVAILABLE 1, $LEADER leads"
+	expect_both_attached h4-after || return 1
+	pf_start "$LEADER" || return 1
+	expect_adopted "the leader $LEADER after the rollout" || return 1
+}
+
+# h5: kubectl drain respects the PodDisruptionBudget (minAvailable 1): the
+# leader cannot be evicted, the (unready) follower can.
+scenario_pdb() {
+	local out=$E2E_WORK/h5-evict.txt rc old_follower
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	rc=0
+	evict "$LEADER" >"$out" 2>&1 || rc=$?
+	expect_status "$rc" nonzero "the eviction of the leader $LEADER is refused" || return 1
+	expect_output "$out" "disruption budget" "the PodDisruptionBudget refused it" || {
+		indent "$out"
+		return 1
+	}
+	old_follower=$FOLLOWER
+	rc=0
+	evict "$old_follower" >"$out" 2>&1 || rc=$?
+	expect_status "$rc" 0 "the follower $old_follower may be evicted" || {
+		indent "$out"
+		return 1
+	}
+	wait_for 120 "the follower $old_follower to go" pod_gone "$old_follower" || return 1
+	wait_for 120 "a new follower" one_leader || return 1
+	ok "the Deployment replaced the evicted follower by $FOLLOWER"
+	expect_both_attached h5-after || return 1
+}
+
+# Main -------------------------------------------------------------------------------
+
+step "prerequisites"
+kctl get namespace "$NS" >/dev/null 2>&1 || die "namespace $NS not found with context $KUBE_CONTEXT: run setup.sh first"
+kctl -n "$NS" get deployment "$DEPLOY" >/dev/null 2>&1 || die "deployment/$DEPLOY not found in $NS: run setup.sh first"
+make_overlay
+OVERLAY_DIR=$HA_DIR OVERLAY_RENDERED=''
+render_overlay
+case $OVERLAY_RENDERED in
+*"kind: PodDisruptionBudget"*) ;;
+*) die "$HA_OVERLAY does not look like overlays/ha (no PodDisruptionBudget)" ;;
+esac
+SVC=${QMX_SERVICE:-quackmux}
+SVC_PORT=${QMX_SERVICE_PORT:-9494}
+QUACK_URI=quack:$SVC:$SVC_PORT
+ok "overlay $HA_DIR: $HA_OVERLAY with generated secrets and $GATEWAY_IMAGE, user $HA_USER"
+
+step "switch from the running gateway to the HA overlay"
+switch_to_ha || die "cannot switch to the HA overlay"
+ok "scaled deployment/$DEPLOY to 0 and applied the HA overlay (deploy/kubernetes/README.md)"
+ensure_client_pod || die "the client pod $CLIENT_POD did not start (image $ENGINE_IMAGE)"
+
+run_scenario h1 "two replicas: exactly one is ready, the holder of the lease" scenario_election
+run_scenario h2 "deleting the leader hands over within seconds; attachments survive" scenario_delete_leader
+if [ -n "$ENGINE_POD" ]; then
+	run_scenario h3 "a frozen leader loses the lease and steps down when it resumes" scenario_frozen_leader
+	run_scenario h4 "a rollout completes with a controlled failover" scenario_rollout
+	run_scenario h5 "the PodDisruptionBudget protects the leader, not the follower" scenario_pdb
+else
+	bad "h3-h5 need the attachments of h2"
+	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h5"
+fi
+close_clients
+
+summary "kind HA e2e" || exit 1

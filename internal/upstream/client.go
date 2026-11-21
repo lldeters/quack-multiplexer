@@ -169,8 +169,13 @@ const (
 )
 
 // IsSessionGone reports whether an engine error means the backend connection
-// no longer exists.
+// no longer exists. Only the server's own texts count: a query error that
+// merely contains them (a table or a value named "Invalid connection id")
+// must not end the session.
 func IsSessionGone(msg string) bool {
-	return strings.Contains(msg, MsgInvalidConnection) || strings.Contains(msg, MsgLeaseExpired) ||
-		strings.Contains(msg, MsgAlreadyClosed)
+	switch msg {
+	case MsgInvalidConnection, MsgLeaseExpired, MsgAlreadyClosed:
+		return true
+	}
+	return false
 }

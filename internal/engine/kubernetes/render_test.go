@@ -1,6 +1,8 @@
 package kubernetes
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"reflect"
 	"strings"
 	"testing"
@@ -62,10 +64,11 @@ func TestRenderPod(t *testing.T) {
 	if !reflect.DeepEqual(pod.Labels, wantLabels) {
 		t.Errorf("labels\n got %v\nwant %v", pod.Labels, wantLabels)
 	}
+	initSum := sha256.Sum256([]byte(engine.RenderInitSQL(prof)))
 	wantAnn := map[string]string{
 		AnnotationKey: userKey.String(), AnnotationUser: "alice", AnnotationProfile: "default",
 		AnnotationSpecHash: "h1", AnnotationTokenSecret: "quack-user-alice-abcde-token", "note": "hello",
-		annotationDefaultContainer: ContainerName,
+		annotationDefaultContainer: ContainerName, AnnotationInitSQLHash: hex.EncodeToString(initSum[:]),
 	}
 	if !reflect.DeepEqual(pod.Annotations, wantAnn) {
 		t.Errorf("annotations\n got %v\nwant %v", pod.Annotations, wantAnn)
@@ -87,7 +90,7 @@ func TestRenderPod(t *testing.T) {
 	if s.ActiveDeadlineSeconds != nil {
 		t.Errorf("activeDeadlineSeconds %d without maxLifetime", *s.ActiveDeadlineSeconds)
 	}
-	if !reflect.DeepEqual(s.NodeSelector, map[string]string{"pool": "engines"}) || len(s.Tolerations) != 1 ||
+	if !reflect.DeepEqual(s.NodeSelector, map[string]string{"pool": "engines"}) || len(s.Tolerations) != 3 ||
 		s.ServiceAccountName != "engine-sa" || s.PriorityClassName != "high" ||
 		!reflect.DeepEqual(s.ImagePullSecrets, []corev1.LocalObjectReference{{Name: "regcred"}}) {
 		t.Errorf("profile scheduling settings not applied: %+v", s)
@@ -125,21 +128,27 @@ func TestRenderPod(t *testing.T) {
 
 	wantEnv := map[string]string{
 		engine.EnvDatabase:   "/data/lake.duckdb",
-		engine.EnvInitSQL:    engine.RenderInitSQL(prof),
 		engine.EnvPort:       "9494",
 		engine.EnvEngineID:   "quack-user-alice-abcde",
 		engine.EnvShareLevel: "USER",
 		engine.EnvOwner:      "alice",
 		engine.EnvSubdomain:  "default",
 		engine.EnvProfile:    "default",
-		"HOME":               "/tmp",
-		"FOO":                "bar",
+		// The default grace period of 30s less the reserve of 5s.
+		engine.EnvStopTimeout: "25",
+		"HOME":                "/tmp",
+		"FOO":                 "bar",
 	}
 	for name, want := range wantEnv {
 		got, n := envVar(&c, name)
 		if n != 1 || got.Value != want || got.ValueFrom != nil {
 			t.Errorf("env %s = %q (%d times), want %q", name, got.Value, n, want)
 		}
+	}
+	// The init SQL comes from the engine's secret, never as a literal.
+	if got, n := envVar(&c, engine.EnvInitSQL); n != 1 || got.Value != "" || got.ValueFrom == nil || got.ValueFrom.SecretKeyRef == nil ||
+		got.ValueFrom.SecretKeyRef.Name != "quack-user-alice-abcde-token" || got.ValueFrom.SecretKeyRef.Key != initSQLDataKey {
+		t.Errorf("env %s = %+v (%d times), want a reference to the engine secret", engine.EnvInitSQL, got, n)
 	}
 	if sql := engine.RenderInitSQL(prof); !strings.Contains(sql, "SET threads = '4';") || !strings.Contains(sql, "ATTACH 'lake.db' AS lake;") {
 		t.Errorf("init SQL %q", sql)
@@ -149,7 +158,7 @@ func TestRenderPod(t *testing.T) {
 		tok.ValueFrom.SecretKeyRef.Name != "quack-user-alice-abcde-token" || tok.ValueFrom.SecretKeyRef.Key != "token" {
 		t.Errorf("QUACK_TOKEN %+v (%d times)", tok, n)
 	}
-	if len(c.Env) != len(wantEnv)+1 || c.Env[0].Name != engine.EnvToken || c.Env[len(c.Env)-1].Name != "FOO" {
+	if len(c.Env) != len(wantEnv)+2 || c.Env[0].Name != engine.EnvToken || c.Env[len(c.Env)-1].Name != "FOO" {
 		t.Errorf("env order: contract variables first, then the profile's: %v", c.Env)
 	}
 
@@ -246,7 +255,8 @@ func TestRenderPodTemplateMerge(t *testing.T) {
 	if !reflect.DeepEqual(s.NodeSelector, map[string]string{"zone": "b", "disk": "ssd"}) {
 		t.Errorf("nodeSelector %v", s.NodeSelector)
 	}
-	if len(s.Tolerations) != 2 || s.Tolerations[0].Key != "a" || s.Tolerations[1].Key != "t" {
+	if len(s.Tolerations) != 4 || s.Tolerations[0].Key != "a" || s.Tolerations[1].Key != "t" ||
+		s.Tolerations[2].Key != "node.kubernetes.io/not-ready" || s.Tolerations[3].Key != "node.kubernetes.io/unreachable" {
 		t.Errorf("tolerations %+v", s.Tolerations)
 	}
 	if !reflect.DeepEqual(s.ImagePullSecrets, []corev1.LocalObjectReference{{Name: "regcred"}, {Name: "other"}}) {
@@ -373,7 +383,7 @@ profiles:
 
 func TestRenderSecret(t *testing.T) {
 	e := newTestEnv(t, testConfig(t, ""))
-	s := e.p.secret("quack-user-alice-abcde", "s3cret")
+	s := e.p.secret("quack-user-alice-abcde", "s3cret", "")
 	if s.Name != "quack-user-alice-abcde-token" || s.Namespace != testNamespace || s.Type != corev1.SecretTypeOpaque ||
 		string(s.Data["token"]) != "s3cret" || s.Immutable == nil || !*s.Immutable {
 		t.Fatalf("secret %+v", s)

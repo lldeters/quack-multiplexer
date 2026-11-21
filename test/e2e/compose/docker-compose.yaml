@@ -24,7 +24,7 @@ x-engine: &engine
   tmpfs:
     - /tmp
   cap_drop: [ALL]
-  security_opt: ["no-new-privileges:true"]
+  security_opt: ["no-new-privileges=true"]
   networks: [e2e]
 
 services:
@@ -73,7 +73,7 @@ services:
     depends_on: [engine-shared, engine-analytics]
     read_only: true
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: ["no-new-privileges=true"]
     networks: [e2e]
 
   gateway-idle:
@@ -93,7 +93,7 @@ services:
     depends_on: [engine-shared, engine-analytics]
     read_only: true
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: ["no-new-privileges=true"]
     networks: [e2e]
 
   client:
@@ -109,7 +109,7 @@ services:
     tmpfs:
       - /tmp
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: ["no-new-privileges=true"]
     networks: [e2e]
 
 networks:

@@ -287,6 +287,22 @@ func TestNewRejectsInvalidEngines(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want an error containing %q", name, err, tc.want)
 		}
+		// Validate ("quackmux validate") finds the same, except what only
+		// reading the token file shows.
+		verr := Validate(baseConfig(t, e))
+		switch name {
+		case "missing token file", "empty token file":
+			if verr != nil {
+				t.Errorf("%s: Validate read the token file: %v", name, verr)
+			}
+		default:
+			if verr == nil || !strings.Contains(verr.Error(), tc.want) {
+				t.Errorf("%s: Validate: got %v, want an error containing %q", name, verr, tc.want)
+			}
+		}
+	}
+	if err := Validate(baseConfig(t)); err == nil {
+		t.Error("Validate: no engines must be rejected")
 	}
 	if _, err := New(baseConfig(t, ok, ok), nil); err == nil || !strings.Contains(err.Error(), "duplicate name") {
 		t.Errorf("duplicate names: %v", err)
@@ -312,6 +328,7 @@ func TestProbeTransitions(t *testing.T) {
 		config.StaticEngine{Name: "a", URL: a.URL, Token: "ta", ShareLevel: "SERVER"},
 		config.StaticEngine{Name: "b", URL: b.URL + "/", Token: "tb", ShareLevel: "USER", Owner: "bob"},
 	)
+	cfg.Provider.Static.FailureThreshold = 1 // every probe decides
 	p, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -392,6 +409,7 @@ func TestProbeTimeoutAndUnreachable(t *testing.T) {
 		config.StaticEngine{Name: "slow", URL: slow.URL, Token: "t", ShareLevel: "SERVER"},
 		config.StaticEngine{Name: "dead", URL: dead, Token: "t", ShareLevel: "SERVER", Subdomain: "other"},
 	)
+	cfg.Provider.Static.FailureThreshold = 1
 	p, err := New(cfg, nil, WithProbeTimeout(100*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
@@ -422,7 +440,7 @@ func TestNotSupported(t *testing.T) {
 	if _, err := p.Launch(context.Background(), engine.LaunchRequest{ID: "x"}); !errors.Is(err, engine.ErrNotSupported) {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := p.Claim(context.Background(), "e", engine.Key{}); !errors.Is(err, engine.ErrNotSupported) {
+	if err := p.Claim(context.Background(), "e", engine.Key{}, "alice"); !errors.Is(err, engine.ErrNotSupported) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := p.Terminate(context.Background(), "e", "admin"); err != nil {
@@ -575,3 +593,36 @@ func TestCoverageWarnings(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
+
+// A single failed probe does not take an engine (and every session on it)
+// out of rotation: only provider.static.failureThreshold failures in a row do.
+func TestProbeFailureThreshold(t *testing.T) {
+	cfg := baseConfig(t, config.StaticEngine{Name: "a", URL: "http://127.0.0.1:1", Token: "ta", ShareLevel: "SERVER"})
+	p, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := p.engines[0]
+	fail := errors.New("GET /: connection refused")
+	apply := func(err error) (engine.Phase, bool) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		ev, sent := p.applyLocked(e, err)
+		return ev.Phase, sent
+	}
+	if ph, _ := apply(nil); ph != engine.PhaseReady {
+		t.Fatalf("healthy probe: %s", ph)
+	}
+	for i := 0; i < 2; i++ { // a hiccup
+		if _, sent := apply(fail); sent || e.inst.Phase != engine.PhaseReady {
+			t.Fatalf("failed probe %d took the engine out of rotation (%s)", i+1, e.inst.Phase)
+		}
+	}
+	apply(nil) // healthy again: the count starts over
+	for i := 0; i < 2; i++ {
+		apply(fail)
+	}
+	if ph, sent := apply(fail); !sent || ph != engine.PhaseFailed {
+		t.Fatalf("third failed probe in a row: %s (sent %v)", ph, sent)
+	}
+}
