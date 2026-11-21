@@ -85,6 +85,8 @@ kubectl apply -k deploy/kubernetes/base
 ```
 
 Details zu Secrets, Images und HA stehen in [deploy/kubernetes/README.md](deploy/kubernetes/README.md).
+Releases veröffentlichen Binaries und Images für amd64 und arm64 (`ghcr.io/lldeters/quackmux`,
+`ghcr.io/lldeters/duckdb-engine`); CI und Release-Ablauf beschreibt [docs/releasing.md](docs/releasing.md).
 
 ## Aufbau
 
@@ -114,4 +116,5 @@ go test ./... -count=1
 
 Die Unit- und Integrationstests laufen gegen einen protokolltreuen Fake-Quack-Server und brauchen weder Docker
 noch DuckDB. Die E2E-Tests in [test/e2e](test/e2e) prüfen das Zusammenspiel mit echten DuckDB-2.0-Clients und
--Engines.
+-Engines. GitHub Actions führt alles bei jedem Pull Request aus, die HA-Szenarien nächtlich
+([docs/releasing.md](docs/releasing.md)).

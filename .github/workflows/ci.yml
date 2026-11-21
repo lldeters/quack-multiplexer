@@ -1,0 +1,140 @@
+# Checks for every pull request and every push to main: formatting, vet, the
+# tests (also with the race detector), cross builds, the shipped
+# configurations and manifests, shell scripts and workflows, and the end to
+# end tests against the released DuckDB with Docker Compose and kind.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The e2e builds verify the DuckDB download with the checksums in the
+  # Makefile (DUCKDB_SHA256_*).
+  KIND_VERSION: v0.33.0
+  KUBECONFORM_VERSION: v0.8.0
+  ACTIONLINT_VERSION: v1.7.12
+
+jobs:
+  checks:
+    name: Format, vet, tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: make fmt-check
+      - name: go vet
+        run: make vet
+      - name: Tests
+        run: go test -count=1 ./...
+      - name: Tests with the race detector
+        run: go test -race -count=1 ./...
+
+  cross-build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: "386" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Build all packages
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build ./... && go vet ./...
+
+  manifests:
+    name: Configs, manifests, scripts, workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Validate the shipped gateway configurations
+        run: |
+          for f in examples/config*.yaml deploy/kubernetes/base/config.yaml deploy/kubernetes/overlays/*/config.yaml \
+            test/e2e/compose/config/gateway*.yaml; do
+            echo "== $f"
+            go run ./cmd/quackmux validate -config "$f"
+          done
+      - name: Render and validate the Kubernetes manifests
+        run: |
+          go install "github.com/yannh/kubeconform/cmd/kubeconform@${KUBECONFORM_VERSION}"
+          for o in deploy/kubernetes/base deploy/kubernetes/overlays/*/; do
+            echo "== $o"
+            kubectl kustomize "$o" | "$(go env GOPATH)/bin/kubeconform" -strict -summary -kubernetes-version 1.30.0 -
+          done
+      - name: Image references name one release
+        run: bash scripts/check-image-refs.sh
+      - name: shellcheck
+        run: shellcheck -x -P SCRIPTDIR test/e2e/lib/*.sh test/e2e/compose/*.sh test/e2e/kind/*.sh images/engine/*.sh scripts/*.sh
+      - name: actionlint
+        run: |
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          "$(go env GOPATH)/bin/actionlint"
+
+  e2e-compose:
+    name: End-to-end (Docker Compose)
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the images and run the scenarios
+        run: bash test/e2e/compose/run.sh
+
+  e2e-kind:
+    name: End-to-end (kind)
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Install kind
+        run: |
+          go install "sigs.k8s.io/kind@${KIND_VERSION}"
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+      - name: Create the cluster, build and load the images, deploy the dev overlay
+        run: bash test/e2e/kind/setup.sh
+      - name: Scenarios k1-k4
+        run: bash test/e2e/kind/test.sh
