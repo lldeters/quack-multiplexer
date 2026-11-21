@@ -303,9 +303,30 @@ func cmdServe(args []string) error {
 	sessions := session.NewManager(cfg, engines, up, sealer, log, met)
 	engines.SetSessionCloser(sessions)
 
+	var elector *ha.Elector
+	if cfg.HA.Enabled {
+		identity := os.Getenv("POD_NAME")
+		if identity == "" {
+			identity, _ = os.Hostname()
+		}
+		elector, err = ha.New(ha.Options{Config: cfg.HA, Client: kube, Namespace: namespace, Identity: identity, Log: log})
+		if err != nil {
+			return err
+		}
+		// Background work that acts on engines runs only while this process
+		// holds a fresh lease: a leader that resumes after a freeze must not
+		// close sessions or stop engines that the new leader serves by now.
+		sessions.SetFence(elector.Fresh)
+		engines.SetFence(elector.Fresh)
+	}
+
 	var leading atomic.Bool
 	var started atomic.Bool
+	var stopping atomic.Bool
 	ready := func() (bool, string) {
+		if stopping.Load() {
+			return false, "shutting down"
+		}
 		if cfg.HA.Enabled && !leading.Load() {
 			return false, "not the leader"
 		}
@@ -348,7 +369,9 @@ func cmdServe(args []string) error {
 		return nil
 	}
 
-	errc := make(chan error, 3)
+	// Room for every sender (both listeners, run, the elector and its
+	// callbacks), so that none of them blocks once nobody reads any more.
+	errc := make(chan error, 8)
 	quackSrv := &http.Server{
 		Addr: cfg.Server.Listen, Handler: gw,
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration,
@@ -363,15 +386,15 @@ func cmdServe(args []string) error {
 		go func() { errc <- serve(adminSrv, cfg.Admin.TLS, "admin", log) }()
 	}
 
-	runCtx, cancelRun := context.WithCancel(ctx)
+	// The serving machinery and the leadership end when the shutdown below
+	// says so, not with the signal (see there).
+	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
-	if cfg.HA.Enabled {
-		identity := os.Getenv("POD_NAME")
-		if identity == "" {
-			identity, _ = os.Hostname()
-		}
+	electorDone := make(chan struct{})
+	if elector != nil {
 		go func() {
-			err := ha.Run(runCtx, cfg.HA, kube, namespace, identity,
+			defer close(electorDone)
+			err := elector.Run(runCtx,
 				func(lctx context.Context) {
 					leading.Store(true)
 					met.IsLeader.Set(1)
@@ -390,12 +413,13 @@ func cmdServe(args []string) error {
 					// Losing the lease while serving: exit so that the pod
 					// restarts as a clean follower.
 					errc <- errors.New("lost leadership")
-				}, log)
+				})
 			if err != nil && !errors.Is(err, context.Canceled) {
 				errc <- err
 			}
 		}()
 	} else {
+		close(electorDone)
 		met.IsLeader.Set(1)
 		go func() {
 			if err := run(runCtx); err != nil {
@@ -425,10 +449,26 @@ func cmdServe(args []string) error {
 	// twice. Fetches and uploads in flight may be repeated safely.
 	abort := time.AfterFunc(timeout-min(timeout/4, 5*time.Second), gw.AbortQueries)
 	defer abort.Stop()
+	stopping.Store(true)
+	if elector != nil {
+		// Hand the lease over first, and wait until it is released: another
+		// replica then takes over within seconds, while this one finishes its
+		// in-flight requests, instead of after the drain or the expiry of the
+		// lease. The background work ends with the leadership (and is fenced
+		// by its freshness anyway).
+		cancelRun()
+		select {
+		case <-electorDone:
+		case <-time.After(cfg.HA.RenewDeadline.Duration + time.Second):
+			log.Warn("leader election did not stop in time; the lease may expire instead of being released")
+		}
+	}
 	_ = quackSrv.Shutdown(shutdownCtx)
 	if adminSrv != nil {
 		_ = adminSrv.Shutdown(shutdownCtx)
 	}
+	// Without HA, the background work (engine events, session keep-alives)
+	// stops only once the in-flight requests are done.
 	cancelRun()
 	sessions.Shutdown()
 	if errors.Is(runErr, http.ErrServerClosed) {
