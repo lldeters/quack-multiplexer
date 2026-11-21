@@ -220,6 +220,23 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 * **HA (optional, `ha.enabled`):** Mehrere Replikas machen Leader-Election über eine Kubernetes-`Lease`. Nur der
   Leader ist `ready` und bekommt über den Service Traffic. Verliert er die Lease, beendet sich der Prozess und
   startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Die Sessions überleben.
+* **Veralteter Leader:** Friert der Leader ein (gestoppter Container oder VM, hängender Node), verlängert er die
+  Lease nicht mehr, und der Follower übernimmt nach `ha.leaseDuration`. Wacht der alte Prozess wieder auf, hält
+  er sich bis zur nächsten Prüfung seines Watchdogs (jede Sekunde) noch für den Leader. Seine Sessions sehen für
+  ihn abgelaufen aus, weil ihre Heartbeats beim neuen Leader angekommen sind. Ohne Schutz schickte er der Engine
+  `DISCONNECT` für Verbindungen, die der neue Leader bedient. Deshalb handeln Session-Reaper und
+  Engine-Reconciler nur mit frischer Lease, also wenn die letzte Verlängerung höchstens `ha.renewDeadline`
+  zurückliegt (`ha.Elector.Fresh`). Eine andere Replika kann die Lease frühestens `ha.leaseDuration` nach der
+  letzten Verlängerung übernehmen. Nach einer Pause des Prozesses überspringt der Reaper außerdem eine Runde,
+  auch ohne HA, damit liegen gebliebene Heartbeats zuerst verarbeitet werden. Gefunden mit
+  `test/e2e/kind/ha.sh`, Szenario h3. Ein aufgeweckter Leader gibt außerdem keine Lease frei, die er nicht mehr
+  hält: client-go (v0.37) entscheidet beim Freigeben nach dem zuletzt beobachteten Stand und hätte die Lease
+  des neuen Leaders geleert. Der Lock-Wrapper schreibt eine Freigabe nur, wenn die gerade gelesene Lease uns
+  gehört.
+* **Geordnete Übergabe:** Beim Herunterfahren meldet sich der Leader sofort nicht mehr ready und gibt die
+  Lease frei. Er wartet auf die Freigabe und lässt erst danach seine laufenden Requests auslaufen. Ein frisch
+  gestarteter Prozess bewirbt sich erst nach `3 × ha.retryPeriod`. So übernimmt der wartende Follower und nicht
+  der Ersatz-Pod; im Rollout hätte der Ersatz-Pod das alte Template und hielte den Rollout wieder an.
 * **Laufende Requests beim Shutdown:** Das Gateway wartet bis zu `server.shutdownTimeout` auf laufende Requests.
   Kurz vor Ablauf (spätestens 5 s davor) beantwortet es Queries, die noch auf ihre Engine warten, mit einem
   Fehler („the gateway is shutting down“) und bricht sie auf der Engine per CANCEL ab. Ein Request, der beim

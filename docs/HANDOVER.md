@@ -1,4 +1,4 @@
-# Übergabe: quackmux weiterbauen (Stand 2026-11-20)
+# Übergabe: quackmux weiterbauen (Stand 2026-11-21)
 
 Diese Datei ist der Übergabeprompt für eine neue Claude-Code-Session in der Cloud. Sie ist vollständig und
 braucht keinen weiteren Kontext.
@@ -22,7 +22,7 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 
 ## Stand
 
-**Verifiziert am 2026-11-20 unter linux/amd64** (Cloud-Sandbox mit Docker und kind):
+**Verifiziert am 2026-11-20 und 2026-11-21 unter linux/amd64** (Cloud-Sandbox mit Docker und kind):
 
 * `go build ./...`, `go vet ./...` und `gofmt -l .` sind sauber. `go test ./... -count=1` und
   `go test -race ./...` sind grün; drei Race-Läufe hintereinander ohne Befund.
@@ -32,6 +32,9 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
   * `test/e2e/compose/run.sh`: alle 8 Szenarien grün.
   * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle 4 Szenarien grün, auch der
     Gateway-Neustart mit Session-Adoption.
+  * `test/e2e/kind/ha.sh` (Overlay `ha`, zwei Replikas, echte Secrets): alle 5 Szenarien grün. Geprüft werden
+    Leader-Wahl, geordnete Übergabe, ein eingefrorener und wieder aufgeweckter Leader, Rollout und
+    PodDisruptionBudget, jeweils mit zwei angehängten Clients.
   * Wire-Codec: 400 mitgeschnittene Nachrichten (Client ↔ Server, Client ↔ Gateway, Gateway ↔ Engine) dekodieren
     und kodieren byte-genau (`internal/wire/testdata/duckdb-v2.0.0`, `realtraffic_test.go`).
   * Der `process`-Provider läuft mit der echten CLI.
@@ -49,11 +52,11 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 | Provider: Kubernetes, process (lokal), static, fake | `internal/engine/*` | fertig; Kubernetes in kind, process mit echter CLI geprüft |
 | Auth: static (SHA-256-Token-Datei, Hot-Reload, SIGHUP), jwt (HS/RS/ES/EdDSA, JWKS), none | `internal/auth` | fertig |
 | Policy (Optionen, Defaults, Overrides, Rechte), Config (YAML-Schema, Defaults, Validierung) | `internal/policy`, `internal/config` | fertig |
-| Admin-API, Metriken, Leader-Election | `internal/admin`, `internal/metrics`, `internal/ha` | fertig; Leader-Election nur mit der fake clientset getestet |
+| Admin-API, Metriken, Leader-Election | `internal/admin`, `internal/metrics`, `internal/ha` | fertig; Leader-Election in kind mit Failover geprüft |
 | Binary | `cmd/quackmux` (`serve`, `validate`, `token`, `hash-token`, `version`) | fertig |
 | Engine-Image (tini, FIFO-Entrypoint, quack/httpfs vorinstalliert), Gateway-Image | `images/engine`, `Dockerfile` | gebaut und mit DuckDB v2.0.0 geprüft |
-| Kustomize (base, overlays `dev` und `ha`), Beispielkonfigurationen | `deploy/kubernetes`, `examples` | `dev` in kind deployt und getestet; `base` und `ha` per `kubectl apply --dry-run=server` geprüft, **`ha` nie wirklich ausgerollt** |
-| E2E-Tests (Docker Compose, kind) | `test/e2e` | ausgeführt und grün (siehe oben) |
+| Kustomize (base, overlays `dev` und `ha`), Beispielkonfigurationen | `deploy/kubernetes`, `examples` | `dev` und `ha` in kind deployt und getestet; `base` per `kubectl apply --dry-run=server` geprüft |
+| E2E-Tests (Docker Compose, kind, kind-HA) | `test/e2e` | ausgeführt und grün (siehe oben) |
 
 ## Harte Randbedingungen
 
@@ -112,6 +115,31 @@ Die Commits auf dem Branch erklären jeden Fix im Detail; hier die Übersicht:
   * Der static-Provider nimmt eine Engine erst nach `failureThreshold` Fehlschlägen aus der Rotation.
   * `quackmux validate` prüft Provider und Leader-Election ohne Cluster.
 
+## Was der HA-Test gefunden hat
+
+`test/e2e/kind/ha.sh` hat vier Fehler gefunden, die die Unit-Tests nicht zeigten. Alle sind behoben, mit
+Regressionstests:
+
+* **Ein aufgeweckter Leader schloss fremde Sessions.** Ein eingefrorener Leader (SIGSTOP) sah nach dem Aufwachen
+  die Heartbeats seiner Sessions fehlen, weil sie beim neuen Leader angekommen waren. Er schloss die Sessions
+  mit `DISCONNECT` an die Engine; der Client mit kurzer Heartbeat-Lease war danach tot. Jetzt handeln
+  Session-Reaper und Engine-Reconciler nur mit frischer Lease (`ha.Elector.Fresh`). Nach einer Prozesspause
+  überspringt der Reaper eine Runde, auch ohne HA.
+* **Derselbe Leader gab die Lease des neuen Leaders frei.** client-go 0.37 (`tryRelease`) liest die Lease und
+  entscheidet dann nach dem zuletzt beobachteten Stand. Das Update ging ohne Konflikt durch. Folge: ein zweiter,
+  unnötiger Failover und kurz zwei Prozesse, die sich für den Leader hielten. Der Lock-Wrapper schreibt eine
+  Freigabe jetzt nur, wenn die gerade gelesene Lease uns gehört.
+* **Beim geordneten Herunterfahren lief die Lease ab, statt freigegeben zu werden.** Der Prozess endete, bevor
+  der Elector die Freigabe geschrieben hatte. `runCtx` hing am Signal-Kontext, Fund R war in diesem Punkt nicht
+  wirklich behoben. Die Übergabe dauerte 17–22 s statt 1–4 s. Jetzt gibt der Leader die Lease zuerst ab,
+  wartet darauf und lässt danach die laufenden Requests auslaufen. Ohne HA stoppt die Hintergrundarbeit erst
+  nach dem Drain.
+* **Der dokumentierte Rollout konnte hängen bleiben.** Die alte ReplicaSet ersetzt den gelöschten Leader durch
+  einen Pod mit altem Template. Der gewann die Lease mitunter gegen den neuen Follower, und der Rollout stand
+  wieder. Ein frisch gestarteter Prozess bewirbt sich jetzt erst nach `3 × ha.retryPeriod`.
+
+Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht mehr ready.
+
 ## Bekannte Grenzen
 
 1. **Zombie-Backend-Verbindungen nach einem Gateway-Neustart** bei geteilten Engines: Clients, die während der
@@ -122,8 +150,10 @@ Die Commits auf dem Branch erklären jeden Fix im Detail; hier die Übersicht:
    davon schreibend öffnen. Nur für read-only angehängte Daten oder ein Profil mit genau einer Engine geeignet
    (`deploy/kubernetes/README.md`, „Persistente Daten“).
 3. **HA: Nur der Leader ist ready.** `kubectl rollout status` meldet nie Erfolg. Ein Rollout braucht einen
-   kontrollierten Failover. Die PDB verhindert den Drain des Leader-Nodes. Alles dokumentiert in
-   `deploy/kubernetes/README.md`, „Hochverfügbarkeit“.
+   kontrollierten Failover. Die PDB verhindert den Drain des Leader-Nodes. Fällt der Leader aus, übernimmt der
+   Follower erst nach Ablauf der Lease (gemessen etwa 20 s). Bei jeder Übergabe hat der Service ein bis drei
+   Sekunden keinen bereiten Endpunkt; Requests darin scheitern mit „Could not connect to server“ und laufen
+   nicht. Alles dokumentiert in `deploy/kubernetes/README.md`, „Hochverfügbarkeit“.
 4. **Innerhalb einer Engine sieht jede Session das Init-SQL** (`/proc/1/environ`) und das Engine-Token
    (`getenv`). Für Zugangsdaten `PROVIDER credential_chain` mit Workload Identity verwenden. `quack_stop(…)`
    bleibt für jede Session aufrufbar, dagegen hilft nur eine `quack_authorization_function`.
@@ -135,8 +165,8 @@ Die Commits auf dem Branch erklären jeden Fix im Detail; hier die Übersicht:
 ## Nächste Schritte (priorisiert)
 
 1. **CI und Release:** GitHub Actions mit build, vet, gofmt, test, race und den Images, optional dem Compose-E2E.
-2. **HA im Cluster erproben:** Overlay `ha` in kind ausrollen, Failover mit angehängtem Client (Leader löschen,
-   Query weiterlaufen lassen) und den dokumentierten Rollout-Ablauf durchspielen.
+2. **HA-Test in CI:** `test/e2e/kind/ha.sh` braucht kind und `docker exec` auf den Node (für das Einfrieren
+   in h3) und läuft etwa zehn Minuten.
 3. **PVCs pro Engine-Schlüssel** (etwa pro Benutzer): ein Volume-Template je Profil, das Gateway legt PVCs pro
    Schlüssel an. Eine Ersatz-Engine darf erst starten, wenn die alte die Datei freigegeben hat.
 4. **HA ohne „nur der Leader ist ready“:** Follower werden ready und leiten an den Leader weiter, oder ein
@@ -162,7 +192,8 @@ make help   # oder Makefile ansehen: build, test, docker-engine, docker-gateway,
 
 * Die Unit- und Integrationstests brauchen weder Docker noch DuckDB. `internal/proxy/harness_test.go` baut ein
   komplettes Gateway mit Fake-Engines und Fake-Uhr.
-* E2E: `test/e2e/compose/run.sh` und `test/e2e/kind/setup.sh` plus `test.sh`; Voraussetzungen und Variablen in
+* E2E: `test/e2e/compose/run.sh` und `test/e2e/kind/setup.sh` plus `test.sh` (Overlay `dev`) und `ha.sh`
+  (Overlay `ha`, stellt danach `dev` wieder her); Voraussetzungen und Variablen in
   [test/e2e/README.md](../test/e2e/README.md).
   * Hinter einem Proxy oder mit Mirrors reicht `DOCKER_BUILD_FLAGS` Flags an beide `docker build` durch (etwa
     `--network host --build-arg GOPROXY=…`). Das Engine-Image nimmt `DUCKDB_EXTENSION_REPOSITORY` als Build-Arg.

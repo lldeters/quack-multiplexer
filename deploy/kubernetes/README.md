@@ -375,12 +375,23 @@ kubectl apply -k deploy/kubernetes/overlays/ha     # bzw. Ihr Overlay auf dieser
   `Available` ist dann erfüllt (`kubectl -n quackmux wait --for=condition=Available deployment/quackmux`).
 * Leader anzeigen: `kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}'`
   (oder die Metrik `quackmux_is_leader`).
-* Fällt der Leader aus, übernimmt der Follower spätestens nach `ha.leaseDuration` (15 s); fährt der Leader
-  geordnet herunter, gibt er die Lease frei und die Übernahme dauert nur Sekunden. Kann ein Leader die Lease
-  nicht verlängern, beendet sich sein Prozess und startet als Follower neu. Der neue Leader findet die Engines
-  wieder und übernimmt die Sessions mit deren nächstem Heartbeat. Die Sessions überleben. Queries, die beim
+* **Geordnetes Herunterfahren** (Pod löschen, Rollout, Drain): Der Leader meldet sich sofort nicht mehr ready, gibt
+  die Lease frei und lässt danach seine laufenden Requests auslaufen. Der wartende Follower übernimmt innerhalb
+  von Sekunden (in kind gemessen: 1–4 s); ein frisch gestarteter Ersatz-Pod bewirbt sich erst nach
+  `3 × ha.retryPeriod` (6 s). Queries, die beim
   Herunterfahren noch laufen, bekommen kurz vor `server.shutdownTimeout` einen Fehler und werden auf der Engine
   abgebrochen, damit libcurl sie nicht unbemerkt ein zweites Mal sendet.
+* **Ausfall des Leaders** (Node weg, Prozess hängt): Der Follower übernimmt, wenn die Lease abgelaufen ist
+  (`ha.leaseDuration`, 15 s, plus Retry und Readiness-Probe; in kind gemessen: etwa 20 s). Kann ein Leader die
+  Lease nicht verlängern, beendet sich sein Prozess und startet als Follower neu. Wacht ein eingefrorener Leader
+  wieder auf, tritt er zurück, ohne Sessions zu schließen oder die Lease des neuen Leaders anzutasten. Clients,
+  deren Verbindung noch zum eingefrorenen Pod führt, warten, bis er aufwacht oder neu gestartet wird.
+* In beiden Fällen findet der neue Leader die Engines wieder und übernimmt die Sessions mit deren nächstem
+  Heartbeat oder Request. Die Sessions überleben. In der kurzen Lücke ohne bereiten Endpunkt (ein bis drei
+  Sekunden, bis der Service den neuen Leader kennt) scheitern Requests mit „Could not connect to server“; sie
+  laufen nicht und können wiederholt werden.
+* Geprüft mit [test/e2e/kind/ha.sh](../../test/e2e/kind/ha.sh): Übergabe, eingefrorener Leader, Rollout und
+  PodDisruptionBudget mit angehängten DuckDB-2.0-Clients.
 * Eine bevorzugte `podAntiAffinity` verteilt die Replikas auf verschiedene Nodes.
 * `overlays/ha/config.yaml` ersetzt `base/config.yaml` vollständig. Halten Sie beide Dateien bis auf den
   Abschnitt `ha` gleich.
@@ -397,6 +408,10 @@ LEADER=$(kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.hold
 kubectl -n quackmux delete pod "$LEADER"      # gibt die Lease frei, der neue Pod übernimmt
 kubectl -n quackmux get deployment quackmux   # fertig bei UP-TO-DATE 2, AVAILABLE 1
 ```
+
+Die alte ReplicaSet ersetzt den gelöschten Leader sofort durch einen Pod mit dem alten Template. Dieser Pod
+bewirbt sich erst nach `3 × ha.retryPeriod` (6 s) um die Lease, wie jeder frisch gestartete Prozess. Bis dahin
+hat der neue Pod sie längst übernommen, und Kubernetes räumt den alten Pod ab.
 
 Wer vollautomatische Rollouts mit kurzer Unterbrechung vorzieht, setzt im eigenen Overlay
 `maxUnavailable: 100%`; dann ersetzt Kubernetes beide Pods auf einmal, wie bei `Recreate`.

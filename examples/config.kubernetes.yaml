@@ -511,7 +511,9 @@ ha:
   # The leader steps down (and the process exits) when it could not renew
   # the lease for this long; must be shorter than leaseDuration.
   renewDeadline: 10s
-  # Interval of renewal and acquisition attempts.
+  # Interval of renewal and acquisition attempts. A process that just started
+  # waits 3 x retryPeriod before it campaigns, so that the replicas that run
+  # already take over first (deploy/kubernetes/README.md, "Rollout").
   retryPeriod: 2s
 
 # -----------------------------------------------------------------------------
