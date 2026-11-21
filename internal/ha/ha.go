@@ -84,13 +84,18 @@ type Elector struct {
 	retryPeriod   time.Duration
 	// watchInterval is the period of the renewal watchdog.
 	watchInterval time.Duration
+	// campaignDelay is how long the first Run waits before it campaigns.
+	campaignDelay time.Duration
 	log           *slog.Logger
 	// clientLog receives client-go's leader election messages.
 	clientLog logr.Logger
 	met       *metrics.Metrics
 
-	running atomic.Bool
-	elector atomic.Pointer[leaderelection.LeaderElector]
+	running   atomic.Bool
+	campaigns atomic.Bool // set by the first Run
+	elector   atomic.Pointer[leaderelection.LeaderElector]
+	// renew tracks the renewals of the current Run (see Fresh).
+	renew atomic.Pointer[renewTracker]
 
 	leaderMu sync.Mutex
 	leader   atomic.Bool
@@ -180,6 +185,7 @@ func New(o Options) (*Elector, error) {
 		renewDeadline: renew,
 		retryPeriod:   retry,
 		watchInterval: watchInterval(lease, renew, retry),
+		campaignDelay: 3 * retry,
 		log:           log,
 		// client-go's own messages are chatty; demote its info messages one
 		// level below Info (errors stay errors).
@@ -252,6 +258,25 @@ func (e *Elector) Lease() string { return e.namespace + "/" + e.name }
 // leadership ends, before onStoppedLeading runs.
 func (e *Elector) IsLeader() bool { return e.leader.Load() }
 
+// Fresh reports whether this replica leads and renewed the lease within
+// RenewDeadline: only then can no other replica have taken it over, since
+// they wait LeaseDuration after the last renewal they saw. Background work
+// that acts on engines (closing sessions, stopping engines) checks it, not
+// IsLeader: a leader that resumes after a freeze (a stopped container or VM,
+// a stalled node) still counts as leader until its watchdog notices the
+// stale lease, and may otherwise act on sessions that the new leader serves.
+func (e *Elector) Fresh() bool {
+	if !e.leader.Load() {
+		return false
+	}
+	t := e.renew.Load()
+	if t == nil {
+		return false
+	}
+	since, ok := t.sinceRenew()
+	return ok && since <= e.renewDeadline
+}
+
 // Leader returns the identity of the last observed lease holder ("" if none
 // was observed yet or the lease was released).
 func (e *Elector) Leader() string {
@@ -311,6 +336,7 @@ func (e *Elector) Run(ctx context.Context, onStartedLeading func(ctx context.Con
 		LockConfig: resourcelock.ResourceLockConfig{Identity: e.identity},
 		Labels:     map[string]string{"app.kubernetes.io/managed-by": "quackmux"},
 	})
+	e.renew.Store(lock)
 
 	// client-go starts the leader callback in a goroutine of its own and does
 	// not wait for it. Track it so that Run never returns while it runs and
@@ -356,6 +382,19 @@ func (e *Elector) Run(ctx context.Context, onStartedLeading func(ctx context.Con
 	}
 	e.elector.Store(le)
 
+	// A process that just started lets the candidates that run already go
+	// first; they ask every retryPeriod (with jitter up to 2.2 times that).
+	// When a leader goes away orderly (a deleted pod, a rollout), the follower
+	// that waited for the lease takes it over, not the pod that replaces the
+	// old leader. In a rollout that pod has the old template (its ReplicaSet
+	// re-creates it), and its leadership would stall the rollout again.
+	if !e.campaigns.Swap(true) && e.campaignDelay > 0 {
+		e.log.Debug("waiting before campaigning", "delay", e.campaignDelay)
+		select {
+		case <-time.After(e.campaignDelay):
+		case <-electCtx.Done():
+		}
+	}
 	e.log.Info("campaigning for leadership", "leaseDuration", e.leaseDuration, "renewDeadline", e.renewDeadline,
 		"retryPeriod", e.retryPeriod)
 	le.Run(klog.NewContext(electCtx, e.clientLog))
@@ -432,12 +471,35 @@ func (e *Elector) watch(ctx context.Context, lock *renewTracker, stepDown contex
 // successfully wrote a lease record that names it as the holder. It measures
 // on the monotonic clock and records the start of the write, the earliest
 // moment the API server can have stored it.
+//
+// It also guards the release. client-go (v0.37) releases on cancel after
+// reading the lease, but decides on the record it observed at its last
+// renewal: a leader that resumes after a freeze, while another candidate
+// took the lease over, still believes it holds it, and its update carries
+// the resourceVersion it just read, so it would succeed and empty the
+// lease of the new leader (seen in test/e2e/kind/ha.sh, h3). A release is
+// only written if the record read right before names this candidate.
 type renewTracker struct {
 	resourcelock.Interface
 	base time.Time
 	// last is the offset from base of the start of the last successful
 	// acquire or renew, or -1 if there was none.
 	last atomic.Int64
+	// holder is the holder in the record read last ("" before any read).
+	holder atomic.Pointer[string]
+}
+
+// errNotHolder refuses the release of a lease that another candidate holds.
+var errNotHolder = errors.New("ha: the lease is held by another candidate, not releasing it")
+
+// Get implements resourcelock.Interface.
+func (t *renewTracker) Get(ctx context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	r, raw, err := t.Interface.Get(ctx)
+	if err == nil && r != nil {
+		h := r.HolderIdentity
+		t.holder.Store(&h)
+	}
+	return r, raw, err
 }
 
 func newRenewTracker(l resourcelock.Interface) *renewTracker {
@@ -456,6 +518,12 @@ func (t *renewTracker) Create(ctx context.Context, r resourcelock.LeaderElection
 
 // Update implements resourcelock.Interface.
 func (t *renewTracker) Update(ctx context.Context, r resourcelock.LeaderElectionRecord) error {
+	if r.HolderIdentity == "" {
+		// A release: client-go read the lease right before.
+		if h := t.holder.Load(); h == nil || *h != t.Identity() {
+			return errNotHolder
+		}
+	}
 	start := time.Since(t.base)
 	err := t.Interface.Update(ctx, r)
 	t.observe(start, r, err)
