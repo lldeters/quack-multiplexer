@@ -337,12 +337,12 @@ profiles:
     description: ""
     # Engine container image: DuckDB 2.0 with the quack and httpfs extensions
     # (images/engine). Without it, the image of the podTemplate's engine
-    # container applies, else quackmux/duckdb-engine:2.0.0. The engine
+    # container applies, else ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0. The engine
     # container contract: the gateway sets QUACK_TOKEN, QUACKMUX_DATABASE,
     # QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494), QUACKMUX_ENGINE_ID,
     # QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER, QUACKMUX_SUBDOMAIN,
     # QUACKMUX_PROFILE and QUACKMUX_STOP_TIMEOUT.
-    image: quackmux/duckdb-engine:2.0.0
+    image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
     # Always | IfNotPresent | Never (without it: the podTemplate's, else
     # IfNotPresent)
     imagePullPolicy: IfNotPresent

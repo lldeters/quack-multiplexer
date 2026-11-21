@@ -54,7 +54,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: quackmux/quackmux:0.1.0
+          image: ghcr.io/lldeters/quackmux:0.1.0
           imagePullPolicy: IfNotPresent
           # The image's entrypoint is the quackmux binary.
           args: ["serve", "-config", "/etc/quackmux/config.yaml"]

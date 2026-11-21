@@ -1,4 +1,7 @@
-# Engine-Image `quackmux/duckdb-engine`
+# Engine-Image `duckdb-engine`
+
+Veröffentlicht als `ghcr.io/lldeters/duckdb-engine:<duckdb>-<quackmux>` (amd64 und arm64, siehe
+[docs/releasing.md](../../docs/releasing.md)), lokal gebaut als `quackmux/duckdb-engine:2.0.0`.
 
 Aus diesem Image startet quackmux seine Engines. Es enthält die DuckDB-CLI 2.0.0 mit vorinstallierten Extensions
 (`quack`, `httpfs`), `tini` als PID 1 und den Entrypoint `quackmux-engine`. Der Entrypoint setzt den
@@ -117,7 +120,8 @@ Init-Statement mit `SIGINT`.
 
 ```sh
 docker build -t quackmux/duckdb-engine:2.0.0 images/engine
-make docker-engine        # dasselbe, Variablen ENGINE_IMAGE, ENGINE_TAG, DUCKDB_VERSION, PLATFORM
+make docker-engine        # mit geprüftem Download (DUCKDB_SHA256_* im Makefile); Variablen ENGINE_IMAGE,
+                          # ENGINE_TAG, DUCKDB_VERSION, PLATFORM
 ```
 
 Der Build-Kontext ist `images/engine`. Beim Bauen lädt Docker das Release von GitHub und die Extensions von

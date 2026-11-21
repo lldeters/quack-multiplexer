@@ -451,8 +451,9 @@ func setInt(i *int, def int) {
 // DefaultProfileName is used when no profile is configured or requested.
 const DefaultProfileName = "default"
 
-// DefaultEngineImage is the image built from images/engine.
-const DefaultEngineImage = "quackmux/duckdb-engine:2.0.0"
+// DefaultEngineImage is the published image built from images/engine: DuckDB
+// 2.0.0 for this release (scripts/set-version.sh, docs/releasing.md).
+const DefaultEngineImage = "ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0"
 
 // ApplyDefaults fills unset fields. Zero durations that mean "disabled" are
 // only defaulted where documented.

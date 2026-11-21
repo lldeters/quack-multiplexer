@@ -248,7 +248,7 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 ## 7. Engines in Kubernetes
 
 * Pod `quack-<level>-<owner>-<rand>` mit Container `engine` (Image und Pull-Policy aus dem Profil, sonst aus dem
-  `podTemplate`, sonst `quackmux/duckdb-engine:2.0.0` mit `IfNotPresent`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
+  `podTemplate`, sonst `ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0` mit `IfNotPresent`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
   startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP. Das Token kommt aus der Umgebungsvariable
   `QUACK_TOKEN`.
 * Token: 32 Zufallsbytes pro Engine, in einem Secret `<pod>-token`. Das Secret wird zuerst angelegt und danach
