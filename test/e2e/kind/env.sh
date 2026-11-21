@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 #
-# Settings and helpers shared by setup.sh, test.sh and teardown.sh (sourced,
+# Settings and helpers shared by setup.sh, test.sh, ha.sh and teardown.sh (sourced,
 # not executed). Every setting can be overridden through the environment:
 #
 #   KIND_CLUSTER     kind cluster name (default quackmux)
@@ -128,4 +128,79 @@ diagnostics() {
 	kctl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 25 >&2 || true
 	say "gateway log (last 150 lines):"
 	kctl -n "$NS" logs "deployment/$DEPLOY" --tail=150 >&2 || true
+}
+
+# Engine pods ------------------------------------------------------------------
+
+# Engine pods of sessions; warm-pool pods (not yet claimed) do not count.
+ENGINE_SELECTOR='app.kubernetes.io/component=engine,quackmux.io/warm!=true'
+
+# engine_pods prints the names of the engine pods that are neither warm nor
+# terminating, sorted.
+engine_pods() {
+	kctl -n "$NS" get pods -l "$ENGINE_SELECTOR" \
+		-o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' |
+		awk 'NF == 1 { print $1 }' | LC_ALL=C sort
+}
+
+# new_pods BEFORE_FILE prints the engine pods that are not in BEFORE_FILE.
+new_pods() { engine_pods | LC_ALL=C comm -13 "$1" -; }
+
+# Client pod -----------------------------------------------------------------
+
+CLIENT_POD=${CLIENT_POD:-quackmux-e2e-client}
+CLIENT_UID=${CLIENT_UID:-1000}
+
+# ensure_client_pod (re)creates the pod CLIENT_POD with the DuckDB CLI of the
+# engine image; the scenarios start their clients in it with kubectl exec.
+ensure_client_pod() {
+	kctl -n "$NS" delete pod "$CLIENT_POD" --ignore-not-found --wait=true >/dev/null
+	kctl -n "$NS" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $CLIENT_POD
+  labels:
+    app.kubernetes.io/name: quackmux-e2e-client
+    app.kubernetes.io/part-of: quackmux-e2e
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: $CLIENT_UID
+    runAsGroup: $CLIENT_UID
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: duckdb
+      image: $ENGINE_IMAGE
+      imagePullPolicy: IfNotPresent
+      # A DuckDB CLI that waits on its (open) stdin keeps the pod running;
+      # the test starts further CLIs in it with kubectl exec.
+      command: ["/usr/local/bin/duckdb"]
+      stdin: true
+      env:
+        - name: HOME
+          value: /tmp
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          memory: 1Gi
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
+EOF
+	kctl -n "$NS" wait --for=condition=Ready "pod/$CLIENT_POD" --timeout=120s >/dev/null
 }

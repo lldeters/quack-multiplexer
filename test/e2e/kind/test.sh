@@ -35,14 +35,10 @@ trap '' PIPE
 resolve_names
 resolve_images
 RUN_ID=${RUN_ID:-$(date +%s)}
-CLIENT_POD=${CLIENT_POD:-quackmux-e2e-client}
-CLIENT_UID=${CLIENT_UID:-1000}
 ADMIN_LOCAL_PORT=${ADMIN_LOCAL_PORT:-19695}
 ADMIN_URL=http://127.0.0.1:$ADMIN_LOCAL_PORT
 ATTACH_TIMEOUT=${ATTACH_TIMEOUT:-180}
 POD_GONE_TIMEOUT=${POD_GONE_TIMEOUT:-30}
-# Engine pods of sessions; warm-pool pods (not yet claimed) do not count.
-ENGINE_SELECTOR='app.kubernetes.io/component=engine,quackmux.io/warm!=true'
 CLIENT_CMD=(kubectl --context "$KUBE_CONTEXT" -n "$NS" exec -i "$CLIENT_POD" -- /usr/local/bin/duckdb)
 
 E2E_WORK=$(make_workdir)
@@ -88,17 +84,6 @@ pf_start() {
 }
 
 # Engine pods ------------------------------------------------------------------
-
-# engine_pods prints the names of the engine pods that are neither warm nor
-# terminating, sorted.
-engine_pods() {
-	kctl -n "$NS" get pods -l "$ENGINE_SELECTOR" \
-		-o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' |
-		awk 'NF == 1 { print $1 }' | LC_ALL=C sort
-}
-
-# new_pods BEFORE_FILE prints the engine pods that are not in BEFORE_FILE.
-new_pods() { engine_pods | LC_ALL=C comm -13 "$1" -; }
 
 # terminate_engine POD ends an engine through the admin API (the engine id is
 # the pod name) and waits until its pod is gone. The scenarios clean up their
@@ -148,58 +133,6 @@ SELECT '$1-detached' AS result;" || return 1
 		bad "the client of session $1 exited with status $rc"
 		return 1
 	fi
-}
-
-ensure_client_pod() {
-	kctl -n "$NS" delete pod "$CLIENT_POD" --ignore-not-found --wait=true >/dev/null
-	kctl -n "$NS" apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $CLIENT_POD
-  labels:
-    app.kubernetes.io/name: quackmux-e2e-client
-    app.kubernetes.io/part-of: quackmux-e2e
-spec:
-  restartPolicy: Never
-  automountServiceAccountToken: false
-  terminationGracePeriodSeconds: 1
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: $CLIENT_UID
-    runAsGroup: $CLIENT_UID
-    seccompProfile:
-      type: RuntimeDefault
-  containers:
-    - name: duckdb
-      image: $ENGINE_IMAGE
-      imagePullPolicy: IfNotPresent
-      # A DuckDB CLI that waits on its (open) stdin keeps the pod running;
-      # the test starts further CLIs in it with kubectl exec.
-      command: ["/usr/local/bin/duckdb"]
-      stdin: true
-      env:
-        - name: HOME
-          value: /tmp
-      securityContext:
-        allowPrivilegeEscalation: false
-        readOnlyRootFilesystem: true
-        capabilities:
-          drop: ["ALL"]
-      resources:
-        requests:
-          cpu: 50m
-          memory: 128Mi
-        limits:
-          memory: 1Gi
-      volumeMounts:
-        - name: tmp
-          mountPath: /tmp
-  volumes:
-    - name: tmp
-      emptyDir: {}
-EOF
-	kctl -n "$NS" wait --for=condition=Ready "pod/$CLIENT_POD" --timeout=120s >/dev/null
 }
 
 # Cleanup ----------------------------------------------------------------------

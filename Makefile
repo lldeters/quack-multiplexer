@@ -41,11 +41,12 @@ docker_platform     = $(if $(PLATFORM),--platform $(PLATFORM))
 E2E_COMPOSE ?= test/e2e/compose/run.sh
 KIND_UP     ?= test/e2e/kind/setup.sh
 KIND_TEST   ?= test/e2e/kind/test.sh
+KIND_HA     ?= test/e2e/kind/ha.sh
 KIND_DOWN   ?= test/e2e/kind/teardown.sh
 
 .DEFAULT_GOAL := build
 .PHONY: build test vet fmt-check check docker docker-gateway docker-engine \
-	e2e-compose kind-up kind-test kind-down clean help
+	e2e-compose kind-up kind-test kind-ha kind-down clean help
 
 build: export CGO_ENABLED := 0
 build: ## Build the gateway binary into bin/
@@ -85,6 +86,9 @@ kind-up: ## Create the kind cluster for the end-to-end tests
 
 kind-test: ## Run the end-to-end tests in kind
 	$(BASH_BIN) $(KIND_TEST)
+
+kind-ha: ## Run the high availability tests in kind (overlays/ha)
+	$(BASH_BIN) $(KIND_HA)
 
 kind-down: ## Delete the kind cluster
 	$(BASH_BIN) $(KIND_DOWN)

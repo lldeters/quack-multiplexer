@@ -113,6 +113,7 @@ HTTP).
 ```bash
 bash test/e2e/kind/setup.sh      # Cluster "quackmux", Images bauen und laden, Overlay dev ausrollen
 bash test/e2e/kind/test.sh       # Szenarien k1–k4 (beliebig oft wiederholbar)
+bash test/e2e/kind/ha.sh         # Hochverfügbarkeit: Szenarien h1–h5 mit overlays/ha
 bash test/e2e/kind/teardown.sh   # Cluster löschen
 ```
 
@@ -162,6 +163,44 @@ Port 9494, Platz für mindestens zwei gleichzeitige Engines (`limits.maxEngines`
 | `ATTACH_TIMEOUT` | 180 | Sekunden für ein `ATTACH` inklusive Start eines Engine-Pods |
 | `POD_GONE_TIMEOUT` | 30 | Sekunden, bis der `CONNECTION`-Pod nach dem `DETACH` verschwunden sein muss |
 | `KEEP_CLIENT` | – | `1`: Client-Pod nach dem Lauf behalten |
+
+### Hochverfügbarkeit (ha.sh)
+
+**ha.sh** prüft `deploy/kubernetes/overlays/ha` mit echten DuckDB-2.0-Clients im Cluster von setup.sh. Es geht vor
+wie ein Betreiber nach [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md):
+
+1. Es erzeugt ein Overlay auf `overlays/ha` mit frischen Secrets (Session-Key, Admin-Token, `users.yaml` mit einem
+   Token für den Testbenutzer) und dem lokal gebauten Gateway-Image. Das Overlay liegt in
+   `test/e2e/kind/.work/ha-overlay` (von Git ignoriert) und wird danach gelöscht.
+2. Es skaliert das laufende Gateway auf 0 und rollt das Overlay aus.
+3. Am Ende stellt es das Dev-Overlay wieder her, damit test.sh wie gewohnt läuft.
+
+Zwei Clients desselben Benutzers bleiben über alle Szenarien angehängt (`share_level=user`, eine gemeinsame
+Engine). Der erste nutzt den Default-Heartbeat-Timeout (60 s). Der zweite nutzt `HEARTBEAT_TIMEOUT 5`; seine
+Session-Lease (5 s plus `session.heartbeatGrace` 15 s) ist kürzer, als h3 den Leader einfriert. Nach jedem
+Failover müssen beide ihre Tabelle auf der Engine weiter lesen können. Eine Query, die während eines Failovers
+unterwegs ist, darf scheitern (nie doppelt laufen); das Skript wiederholt sie bis zu zweimal und warnt.
+
+| | Ablauf | Was es beweist |
+|---|---|---|
+| h1 | Overlay ausrollen | Zwei Replikas, genau eine ist ready und hält die Lease `quackmux-default`. Der Follower meldet `not the leader` und `quackmux_is_leader 0`. Das Deployment ist `Available` bei `UP-TO-DATE 2, AVAILABLE 1`. |
+| h2 | `kubectl delete pod` des Leaders | Der alte Leader gibt die Lease beim Herunterfahren frei, und der wartende Follower führt nach höchstens `HA_HANDOVER_SECONDS` (gemessen 1–4 s). Der Ersatz-Pod bewirbt sich erst nach `3 × ha.retryPeriod`. Der neue Leader adoptiert beide Sessions auf derselben Engine. |
+| h3 | Den Gateway-Prozess des Leaders auf dem kind-Node mit `SIGSTOP` einfrieren, nach `HA_FREEZE_SECONDS` mit `SIGCONT` wecken | Der Follower übernimmt nach Ablauf der Lease (`ha.leaseDuration`, gemessen etwa 20 s). Der aufgeweckte Prozess merkt, dass er die Lease verloren hat, beendet sich und startet als Follower neu. Dabei schließt er keine Session und gibt die Lease des neuen Leaders nicht frei. Danach arbeiten beide Clients weiter. |
+| h4 | `kubectl rollout restart`, dann den alten Leader löschen | Der Rollout ersetzt zuerst den Follower und wartet (`kubectl rollout status` meldet keinen Erfolg). Das Löschen des alten Leaders schließt ihn ab: Der neue Follower übernimmt, nicht der Pod mit altem Template, den die alte ReplicaSet als Ersatz startet. Danach `UP-TO-DATE 2, AVAILABLE 1`, und die Clients arbeiten weiter. |
+| h5 | Eviction-API wie `kubectl drain` | Die PodDisruptionBudget lehnt die Räumung des Leaders ab, der Follower darf gehen und wird ersetzt. |
+
+h3 braucht `docker exec` auf dem kind-Node (`crictl inspect` liefert die PID des Gateway-Containers). Wer
+Fehler untersuchen will, lässt das HA-Deployment mit `KEEP_HA=1` stehen; das erzeugte Overlay mit seinen Secrets
+bleibt dann ebenfalls liegen.
+
+| Variable | Default | Bedeutung |
+|---|---|---|
+| `HA_OVERLAY` | `../../../../../deploy/kubernetes/overlays/ha` | das geprüfte Overlay, relativ zum erzeugten |
+| `HA_LEASE` | `quackmux-default` | Name der Lease |
+| `HA_HANDOVER_SECONDS` | 12 | Höchstdauer der Übergabe in h2 (eine ablaufende statt freigegebene Lease bräuchte mindestens 15 s) |
+| `HA_FREEZE_SECONDS` | 45 | Dauer des Einfrierens in h3: länger als die Session-Lease des zweiten Clients, kürzer als die Liveness-Probe des Gateways toleriert (etwa 60 s) |
+| `ADMIN_LOCAL_PORT` | 19696 | lokaler Port des Port-Forwards auf die Admin-API eines bestimmten Pods |
+| `KEEP_HA` | – | `1`: HA-Deployment und erzeugtes Overlay nach dem Lauf behalten |
 
 ## Konsistenz der Fixtures
 
