@@ -316,6 +316,7 @@ session_send() {
 		indent "$E2E_WORK/$id.log"
 		return 1
 	fi
+	# shellcheck disable=SC2034 # read through the eval below
 	size=$(wc -c <"$E2E_WORK/$id.log" | tr -d ' ')
 	eval "SESSION_OFF_$id=\$size"
 	if ! printf '%s\n' "$*" >&"$fd"; then
@@ -370,7 +371,7 @@ session_end() {
 	pid=$(session_get PID "$id")
 	[ -n "$pid" ] || return 0
 	if [ -n "$fd" ]; then
-		printf '.quit\n' >&"$fd" 2>/dev/null || true
+		printf '.quit\n' 1>&"$fd" 2>/dev/null || true
 		eval "exec $fd>&-"
 		SESSION_USED_FDS=$(list_remove "$SESSION_USED_FDS" "$fd")
 		SESSION_FREE_FDS="${SESSION_FREE_FDS:+$SESSION_FREE_FDS }$fd"
@@ -446,9 +447,16 @@ summary() {
 build_images() {
 	[ -f "$REPO_ROOT/images/engine/Dockerfile" ] || die "$REPO_ROOT/images/engine/Dockerfile not found"
 	[ -f "$REPO_ROOT/Dockerfile" ] || die "$REPO_ROOT/Dockerfile not found"
-	say "building engine image $1 (images/engine)"
+	local v sha_amd64 sha_arm64
+	# The DuckDB version and the checksums of its CLI archives (Makefile).
+	v=$(sed -n 's/^DUCKDB_VERSION *?= *//p' "$REPO_ROOT/Makefile")
+	sha_amd64=$(sed -n 's/^DUCKDB_SHA256_AMD64 *?= *//p' "$REPO_ROOT/Makefile")
+	sha_arm64=$(sed -n 's/^DUCKDB_SHA256_ARM64 *?= *//p' "$REPO_ROOT/Makefile")
+	say "building engine image $1 (images/engine, DuckDB ${v:-default})"
 	# shellcheck disable=SC2086 # DOCKER_BUILD_FLAGS is a list of flags
-	docker build ${DOCKER_BUILD_FLAGS:-} -t "$1" "$REPO_ROOT/images/engine"
+	docker build ${DOCKER_BUILD_FLAGS:-} ${v:+--build-arg DUCKDB_VERSION=$v} \
+		${sha_amd64:+--build-arg DUCKDB_SHA256_AMD64=$sha_amd64} ${sha_arm64:+--build-arg DUCKDB_SHA256_ARM64=$sha_arm64} \
+		-t "$1" "$REPO_ROOT/images/engine"
 	say "building gateway image $2 (Dockerfile)"
 	# shellcheck disable=SC2086
 	docker build ${DOCKER_BUILD_FLAGS:-} -t "$2" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"

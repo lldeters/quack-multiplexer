@@ -29,6 +29,11 @@ BINARY     = $(BIN_DIR)/quackmux$(shell $(GO) env GOEXE)
 
 # Images. PLATFORM and DOCKER_BUILD_FLAGS are passed to docker build.
 DUCKDB_VERSION     ?= 2.0.0
+# SHA-256 of the DuckDB CLI archives of DUCKDB_VERSION; update them together
+# (the engine build verifies the download, the e2e tests and workflows read
+# them from here).
+DUCKDB_SHA256_AMD64 ?= c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc
+DUCKDB_SHA256_ARM64 ?= 859e1875d2a9515fbb4bf8871061437a14af82320da68c753f094c4b776348fe
 GATEWAY_IMAGE      ?= quackmux/quackmux
 GATEWAY_TAG        ?= $(VERSION)
 ENGINE_IMAGE       ?= quackmux/duckdb-engine
@@ -59,7 +64,7 @@ vet: ## Run go vet
 	$(GO) vet ./...
 
 fmt-check: ## Fail if a Go file is not gofmt-formatted
-	@files="$$($(GOFMT) -l .)"; \
+	@files="$$($(GOFMT) -l $$($(GO) list -f '{{.Dir}}' ./...))"; \
 	if [ -n "$$files" ]; then \
 		echo "not gofmt-formatted (run gofmt -w on these files):" >&2; \
 		echo "$$files" >&2; \
@@ -76,6 +81,7 @@ docker-gateway: ## Build the gateway image (GATEWAY_IMAGE, GATEWAY_TAG)
 
 docker-engine: ## Build the engine image (ENGINE_IMAGE, ENGINE_TAG)
 	$(DOCKER) build $(docker_platform) $(DOCKER_BUILD_FLAGS) --build-arg DUCKDB_VERSION=$(DUCKDB_VERSION) \
+		--build-arg DUCKDB_SHA256_AMD64=$(DUCKDB_SHA256_AMD64) --build-arg DUCKDB_SHA256_ARM64=$(DUCKDB_SHA256_ARM64) \
 		-t $(ENGINE_IMAGE):$(ENGINE_TAG) images/engine
 
 e2e-compose: ## Run the end-to-end tests with Docker Compose

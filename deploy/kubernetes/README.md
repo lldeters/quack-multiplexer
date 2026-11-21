@@ -23,11 +23,14 @@ Alle Konfigurationsoptionen mit ihren Defaults stehen in
 * Ein CNI, das NetworkPolicies durchsetzt (Calico, Cilium …). Sonst wirken die Policies nicht, und Pods im
   Cluster könnten Engines unter Umgehung des Gateways erreichen.
 * Images:
-  * Gateway `quackmux/quackmux:0.1.0`. Der Entrypoint des Images muss das `quackmux`-Binary sein; das
+  * Gateway `ghcr.io/lldeters/quackmux:0.1.0`. Der Entrypoint des Images muss das `quackmux`-Binary sein; das
     Deployment übergibt nur die Argumente `serve -config /etc/quackmux/config.yaml`.
-  * Engine `quackmux/duckdb-engine:2.0.0` aus [images/engine](../../images/engine), je Profil in
-    `config.yaml` eingetragen (`profiles.<name>.image`).
-  * Eigene Registry: das Gateway-Image per `kustomize edit set image quackmux/quackmux=registry.example.com/quackmux:1.2.3`
+  * Engine `ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0` (DuckDB 2.0.0 für quackmux 0.1.0) aus [images/engine](../../images/engine),
+    je Profil in `config.yaml` eingetragen (`profiles.<name>.image`).
+  * Beide Images veröffentlicht der Release-Workflow für amd64 und arm64 auf der GitHub Container Registry
+    ([docs/releasing.md](../../docs/releasing.md)). Die Tags sind unveränderlich; ein neues Release ändert die
+    Referenzen im Repository.
+  * Eigene Registry: das Gateway-Image per `kustomize edit set image ghcr.io/lldeters/quackmux=registry.example.com/quackmux:1.2.3`
     (bzw. `images:` im Overlay), das Engine-Image in `config.yaml`. Private Registries brauchen
     `imagePullSecrets`: für das Gateway per Patch des Deployments, für Engines in `profiles.<name>.imagePullSecrets`.
 

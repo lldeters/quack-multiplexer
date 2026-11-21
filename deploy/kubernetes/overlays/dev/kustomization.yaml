@@ -25,9 +25,11 @@ configMapGenerator:
     files:
       - config.yaml
 
-# The locally built gateway image (see README.md, "Entwicklung mit kind").
+# The locally built gateway image instead of the published one (see
+# README.md, "Entwicklung mit kind").
 images:
-  - name: quackmux/quackmux
+  - name: ghcr.io/lldeters/quackmux
+    newName: quackmux/quackmux
     newTag: dev
 
 patches:

@@ -1,0 +1,68 @@
+# CI und Releases
+
+## Automatische Prüfungen
+
+| Workflow | Auslöser | Inhalt |
+|---|---|---|
+| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go vet`, Tests, Tests mit Race-Detector, Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind |
+| [nightly.yml](../.github/workflows/nightly.yml) | täglich 03:17 UTC auf `main`, von Hand für jeden Branch | HA-Szenarien in kind (`test/e2e/kind/ha.sh`) und die Tests fünfmal mit Race-Detector |
+| [release.yml](../.github/workflows/release.yml) | Tag `vX.Y.Z` | Release (siehe unten) |
+
+Alle Actions sind auf Commit-SHAs gepinnt, die Werkzeuge (kind, kubeconform, actionlint) auf Versionen. Der
+Engine-Build prüft den DuckDB-Download gegen die Prüfsummen im Makefile (`DUCKDB_SHA256_AMD64`,
+`DUCKDB_SHA256_ARM64`); die E2E-Skripte und Workflows lesen sie von dort.
+
+## Was ein Release veröffentlicht
+
+Ein Tag `vX.Y.Z` startet `release.yml`:
+
+1. Die Checks laufen noch einmal, und `scripts/check-image-refs.sh X.Y.Z` prüft, dass das Repository genau dieses
+   Release referenziert.
+2. Ein GitHub-Release mit den Binaries für linux, darwin und windows (amd64 und arm64) als `tar.gz` bzw. `zip`
+   und `SHA256SUMS`.
+3. Images für amd64 und arm64 auf der GitHub Container Registry:
+
+| Image | Tags |
+|---|---|
+| `ghcr.io/lldeters/quackmux` | `X.Y.Z`, `X.Y`, `latest` |
+| `ghcr.io/lldeters/duckdb-engine` | `<duckdb>-X.Y.Z`, `<duckdb>` (zum Beispiel `2.0.0-0.1.0`, `2.0.0`) |
+
+Vorabversionen (`vX.Y.Z-rc.1`) bekommen nur die vollen Tags und werden als Pre-Release markiert.
+
+Die Manifeste, die Beispielkonfiguration und das Default-Engine-Image im Code (`config.DefaultEngineImage`)
+referenzieren die **unveränderlichen** Tags eines Releases: `ghcr.io/lldeters/quackmux:X.Y.Z` und
+`ghcr.io/lldeters/duckdb-engine:<duckdb>-X.Y.Z`. Gateway und Engine-Image gehören zusammen. Der Entrypoint des
+Engine-Images setzt den Engine-Container-Vertrag um (etwa `QUACKMUX_STOP_TIMEOUT`); ein bewegliches Tag wie
+`2.0.0` könnte auf einem Node mit `IfNotPresent` noch eine ältere Fassung liefern.
+
+## Ablauf
+
+```sh
+scripts/set-version.sh 0.2.0     # alle Image-Referenzen auf das neue Release
+git commit -am "release: 0.2.0"  # über einen Pull Request nach main, CI muss grün sein
+```
+
+Nach dem Merge auf `main`:
+
+```sh
+git tag -a v0.2.0 -m "quackmux 0.2.0"
+git push origin v0.2.0
+```
+
+Danach den Workflow unter „Actions“ verfolgen. Beim ersten Release legt GitHub die Pakete an. Ist eines
+privat, stellt man es unter „Packages“ → Paket → „Package settings“ → „Change visibility“ auf öffentlich, sonst
+brauchen Cluster ein Pull-Secret.
+
+## DuckDB-Version wechseln
+
+1. `DUCKDB_VERSION` im Makefile setzen und die Prüfsummen der beiden CLI-Archive eintragen:
+
+   ```sh
+   for a in amd64 arm64; do
+     curl -fsSLO "https://github.com/duckdb/duckdb/releases/download/v<version>/duckdb-cli-linux-$a.tar.gz"
+     sha256sum "duckdb-cli-linux-$a.tar.gz"
+   done
+   ```
+
+2. `scripts/set-version.sh <nächste quackmux-Version>` setzt auch das Engine-Tag (`<duckdb>-<version>`).
+3. Die Research-Notes und die E2E-Tests gegen die neue Version prüfen (docs/research-notes.md).

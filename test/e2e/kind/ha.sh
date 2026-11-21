@@ -44,7 +44,7 @@ set -euo pipefail
 # shellcheck source=env.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
-need kubectl curl docker mkfifo awk sed grep od tr
+need kubectl kind curl docker mkfifo awk sed grep od tr
 # Writing to a session whose client died must fail the check, not kill the run.
 trap '' PIPE
 
@@ -120,7 +120,7 @@ kind: Kustomization
 resources:
   - $HA_OVERLAY
 images:
-  - name: quackmux/quackmux
+  - name: ghcr.io/lldeters/quackmux
     newName: $name
     newTag: $tag
 secretGenerator:
@@ -143,6 +143,7 @@ EOF
 
 gateway_selector() {
 	local s
+	# shellcheck disable=SC2016 # a Go template, not shell
 	s=$(kctl -n "$NS" get deployment "$DEPLOY" \
 		-o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}') || return 1
 	printf '%s' "${s%,}"
@@ -153,6 +154,7 @@ gateway_selector() {
 gateway_status() {
 	local selector
 	selector=$(gateway_selector) || return 1
+	# shellcheck disable=SC2016 # a Go template, not shell
 	kctl -n "$NS" get pods -l "$selector" -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{if eq .status.phase "Running"}}{{.metadata.name}} {{$r := "False"}}{{range .status.conditions}}{{if eq .type "Ready"}}{{$r = .status}}{{end}}{{end}}{{$r}}{{"\n"}}{{end}}{{end}}{{end}}'
 }
 
@@ -609,6 +611,15 @@ case $OVERLAY_RENDERED in
 *"kind: PodDisruptionBudget"*) ;;
 *) die "$HA_OVERLAY does not look like overlays/ha (no PodDisruptionBudget)" ;;
 esac
+# The HA configuration names the published engine image; the cluster runs the
+# locally built one (setup.sh) under that name (imagePullPolicy IfNotPresent).
+HA_ENGINE_IMAGE=$(printf '%s\n' "$OVERLAY_RENDERED" | awk '$1 == "image:" && $2 ~ /duckdb-engine/ { print $2; exit }')
+if [ -n "$HA_ENGINE_IMAGE" ] && [ "$HA_ENGINE_IMAGE" != "$ENGINE_IMAGE" ]; then
+	docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1 || die "engine image $ENGINE_IMAGE not found locally: run setup.sh first"
+	docker tag "$ENGINE_IMAGE" "$HA_ENGINE_IMAGE"
+	kind load docker-image --name "$KIND_CLUSTER" "$HA_ENGINE_IMAGE" >/dev/null || die "kind load docker-image $HA_ENGINE_IMAGE failed"
+	ok "the cluster runs the local $ENGINE_IMAGE as $HA_ENGINE_IMAGE (the engine image of the HA configuration)"
+fi
 SVC=${QMX_SERVICE:-quackmux}
 SVC_PORT=${QMX_SERVICE_PORT:-9494}
 QUACK_URI=quack:$SVC:$SVC_PORT

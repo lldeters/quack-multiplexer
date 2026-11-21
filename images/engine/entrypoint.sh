@@ -64,6 +64,7 @@ positive_int() {
 	[[ $1 =~ ^[0-9]{1,9}$ ]] && ((10#$1 > 0))
 }
 
+# shellcheck disable=SC2317 # called by the traps below
 on_signal() {
 	signal_count=$((signal_count + 1))
 	if ((stop_requested)); then
@@ -75,6 +76,7 @@ on_signal() {
 	fi
 }
 
+# shellcheck disable=SC2317 # called by the EXIT trap
 cleanup() {
 	if [[ -n $workdir ]]; then
 		rm -rf -- "$workdir" || true

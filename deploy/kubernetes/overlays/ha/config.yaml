@@ -70,7 +70,7 @@ provider:
 profiles:
   default:
     description: "Standard engine: 1-2 CPUs, 4 GiB memory"
-    image: quackmux/duckdb-engine:2.0.0
+    image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
     imagePullPolicy: IfNotPresent
     database: ":memory:"
     settings:

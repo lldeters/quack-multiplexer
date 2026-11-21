@@ -1,0 +1,173 @@
+# Release for a tag vX.Y.Z (see docs/releasing.md): the checks, cross-compiled
+# binaries with SHA256SUMS as a GitHub release, and multi-arch images on GHCR:
+#   ghcr.io/<owner>/quackmux:X.Y.Z                (also :X.Y and :latest)
+#   ghcr.io/<owner>/duckdb-engine:<duckdb>-X.Y.Z  (also :<duckdb>)
+# Pre-releases (vX.Y.Z-rc.1) get only the full version tags.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      duckdb: ${{ steps.version.outputs.duckdb }}
+      sha256_amd64: ${{ steps.version.outputs.sha256_amd64 }}
+      sha256_arm64: ${{ steps.version.outputs.sha256_arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Version from the tag, DuckDB from the Makefile
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
+            exit 1
+          fi
+          prerelease=false
+          if [[ $version == *-* ]]; then prerelease=true; fi
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "duckdb=$(sed -n 's/^DUCKDB_VERSION *?= *//p' Makefile)"
+            echo "sha256_amd64=$(sed -n 's/^DUCKDB_SHA256_AMD64 *?= *//p' Makefile)"
+            echo "sha256_arm64=$(sed -n 's/^DUCKDB_SHA256_ARM64 *?= *//p' Makefile)"
+          } >>"$GITHUB_OUTPUT"
+      - name: The manifests reference this release
+        run: bash scripts/check-image-refs.sh "${{ steps.version.outputs.version }}"
+      - name: Tests
+        run: |
+          make check
+          go test -race -count=1 ./...
+
+  binaries:
+    name: Binaries and GitHub release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          mkdir dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            ext=
+            if [ "$goos" = windows ]; then ext=.exe; fi
+            name="quackmux_${VERSION}_${goos}_${goarch}"
+            mkdir "dist/$name"
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" -o "dist/$name/quackmux$ext" ./cmd/quackmux
+            cp README.md "dist/$name/"
+            if [ "$goos" = windows ]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            fi
+            rm -r "dist/${name:?}"
+          done
+          (cd dist && sha256sum -- * >SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          flags=(--verify-tag --title "quackmux $GITHUB_REF_NAME" --generate-notes)
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${flags[@]}" dist/*
+
+  images:
+    name: Images on GHCR
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image names and tags
+        id: tags
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          DUCKDB: ${{ needs.verify.outputs.duckdb }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          gateway=ghcr.io/$owner/quackmux
+          engine=ghcr.io/$owner/duckdb-engine
+          gateway_tags=$gateway:$VERSION
+          engine_tags=$engine:$DUCKDB-$VERSION
+          if [ "$PRERELEASE" = false ]; then
+            gateway_tags+=",$gateway:${VERSION%.*},$gateway:latest"
+            engine_tags+=",$engine:$DUCKDB"
+          fi
+          {
+            echo "gateway=$gateway_tags"
+            echo "engine=$engine_tags"
+          } >>"$GITHUB_OUTPUT"
+      - name: Gateway image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.gateway }}
+          build-args: VERSION=${{ needs.verify.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Engine image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: images/engine
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.engine }}
+          build-args: |
+            DUCKDB_VERSION=${{ needs.verify.outputs.duckdb }}
+            DUCKDB_SHA256_AMD64=${{ needs.verify.outputs.sha256_amd64 }}
+            DUCKDB_SHA256_ARM64=${{ needs.verify.outputs.sha256_arm64 }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.duckdb }}-${{ needs.verify.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}

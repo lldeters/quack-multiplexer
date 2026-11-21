@@ -302,6 +302,7 @@ scenario_gateway_restart() {
 		bad "cannot list the gateway pods"
 		return 1
 	}
+	# shellcheck disable=SC2086 # one pod name per word
 	say "  kubectl rollout restart deployment/$DEPLOY (pods: $(printf '%s ' $old_pods))"
 	kctl -n "$NS" rollout restart "deployment/$DEPLOY" >/dev/null || return 1
 	kctl -n "$NS" rollout status "deployment/$DEPLOY" --timeout=180s || return 1
