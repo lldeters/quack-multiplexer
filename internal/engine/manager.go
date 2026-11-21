@@ -165,6 +165,8 @@ type Manager struct {
 	log  *slog.Logger
 	met  *metrics.Metrics
 	now  func() time.Time
+	// fence, if set, must report true for Reconcile to act (see SetFence).
+	fence func() bool
 
 	mu            sync.RWMutex
 	engines       map[string]*engine
@@ -205,6 +207,12 @@ func (m *Manager) SetClock(now func() time.Time) { m.now = now }
 
 // SetSessionCloser wires the session manager.
 func (m *Manager) SetSessionCloser(c SessionCloser) { m.closer = c }
+
+// SetFence makes Reconcile do nothing while fence reports false. With leader
+// election it reports whether this process still holds a fresh lease
+// (ha.Elector.Fresh): a leader that resumes after a freeze must not stop or
+// launch engines on its outdated view. Call it before Start.
+func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
 
 // Provider returns the underlying provider.
 func (m *Manager) Provider() Provider { return m.prov }
@@ -1015,6 +1023,10 @@ func (m *Manager) reconcileLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// Both cases may be ready at once, and select picks at random.
+			if ctx.Err() != nil {
+				return
+			}
 			m.Reconcile()
 		}
 	}
@@ -1023,6 +1035,10 @@ func (m *Manager) reconcileLoop(ctx context.Context) {
 // Reconcile applies timeouts and keeps warm pools filled. It runs
 // periodically and may be called directly (tests).
 func (m *Manager) Reconcile() {
+	if m.fence != nil && !m.fence() {
+		m.log.Debug("not reconciling engines: the leader lease is not fresh")
+		return
+	}
 	now := m.now()
 	var drainClose []string
 	m.mu.Lock()

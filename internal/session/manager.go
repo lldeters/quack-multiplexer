@@ -134,6 +134,8 @@ type Manager struct {
 	log     *slog.Logger
 	met     *metrics.Metrics
 	now     func() time.Time
+	// fence, if set, must report true for Reap to act (see SetFence).
+	fence func() bool
 
 	mu         sync.RWMutex
 	sessions   map[string]*Session
@@ -169,6 +171,13 @@ func NewManager(cfg *config.Config, engines Engines, backend Backend, sealer *Se
 
 // SetClock replaces the clock (tests).
 func (m *Manager) SetClock(now func() time.Time) { m.now = now }
+
+// SetFence makes Reap do nothing while fence reports false. With leader
+// election it reports whether this process still holds a fresh lease
+// (ha.Elector.Fresh): a leader that resumes after a freeze sees the
+// heartbeats of its sessions missing, because the new leader received them,
+// and must not close those sessions on the engines. Call it before Run.
+func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
 
 // Reservation holds a slot under the session limits while a connect is in
 // progress. Exactly one of Open or Cancel must be called.
@@ -589,6 +598,10 @@ func (m *Manager) byEngine(engineID string) []*Session {
 // Reap applies session timeouts. It runs periodically (Run) and may be
 // called directly (tests).
 func (m *Manager) Reap() {
+	if m.fence != nil && !m.fence() {
+		m.log.Debug("not applying session timeouts: the leader lease is not fresh")
+		return
+	}
 	now := m.now()
 	sc := m.cfg.Session
 	m.mu.RLock()
@@ -671,18 +684,38 @@ func (m *Manager) keepAlive(s *Session, now time.Time) {
 }
 
 // Run reaps sessions until ctx is cancelled.
+//
+// After a pause of the whole process (a stopped container or VM, a stalled
+// node) one round is skipped, so that the heartbeats that queued up in the
+// meantime are processed before the sessions are judged by them.
 func (m *Manager) Run(ctx context.Context) {
-	t := time.NewTicker(m.cfg.Session.CheckInterval.Duration)
+	every := m.cfg.Session.CheckInterval.Duration
+	t := time.NewTicker(every)
 	defer t.Stop()
+	last := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m.Reap()
+			// Both cases may be ready at once, and select picks at random.
+			if ctx.Err() != nil {
+				return
+			}
+			if gap := time.Since(last); paused(gap, every) {
+				m.log.Warn("the gateway was paused, skipping one round of session timeouts", "paused", gap.Round(time.Second))
+			} else {
+				m.Reap()
+			}
+			last = time.Now()
 		}
 	}
 }
+
+// paused reports whether gap, the time between the end of a Run round and
+// the next tick of its ticker (period every), means that the process stood
+// still rather than that it was busy.
+func paused(gap, every time.Duration) bool { return gap > 2*every+time.Second }
 
 // Get returns a snapshot of an open session.
 func (m *Manager) Get(id string) (View, bool) {
