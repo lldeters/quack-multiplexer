@@ -109,6 +109,7 @@ resolve_images() {
 # gateway_pods prints the names of the pods of the gateway Deployment.
 gateway_pods() {
 	local selector
+	# shellcheck disable=SC2016 # a Go template, not shell
 	selector=$(kctl -n "$NS" get deployment "$DEPLOY" \
 		-o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}') || return 1
 	kctl -n "$NS" get pods -l "${selector%,}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
