@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
 	"quackmux/internal/metrics"
 )
@@ -352,7 +353,9 @@ func TestLabelerAbsentNeedsConfirmation(t *testing.T) {
 	if l.Absent() || !strings.Contains(l.Status(), "injected") {
 		t.Fatalf("Absent %v, status %q", l.Absent(), l.Status())
 	}
-	ok, why := StandbyReady(nil, l)
+	e := newElector(t, fake.NewSimpleClientset(), testPod, shortTimings(), nil)
+	e.campaigning.Store(true)
+	ok, why := StandbyReady(e, l)
 	if ok || !strings.Contains(why, LeaderLabel) || !strings.Contains(why, "not yet removed") || !strings.Contains(why, "injected") {
 		t.Fatalf("StandbyReady = %v, %q", ok, why)
 	}
@@ -455,6 +458,40 @@ func TestLabelerCloseRemovesForGood(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if labelled(t, client, testPod) {
 		t.Fatal("the label was set again after Close")
+	}
+}
+
+// Close keeps to its deadline while a set is under way (a resync on a slow
+// API server); Run removes the label once that set has landed.
+func TestLabelerCloseGivesUpOnASetUnderWay(t *testing.T) {
+	client := fake.NewSimpleClientset(gatewayPod(testPod, false))
+	release := make(chan struct{})
+	var sets atomic.Int32
+	client.PrependReactor("patch", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if strings.Contains(string(a.(k8stesting.PatchAction).GetPatch()), `"true"`) && sets.Add(1) == 1 {
+			<-release
+		}
+		return false, nil, nil
+	})
+	var want atomic.Bool
+	want.Store(true)
+	l := newLabeler(t, client, &want, nil)
+	runLabeler(t, l)
+	waitFor(t, "the set to be under way", func() bool { return sets.Load() == 1 })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := l.Close(ctx); err == nil || !strings.Contains(err.Error(), "under way") {
+		t.Fatalf("Close = %v, want an error about the patch under way", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("Close took %s", d)
+	}
+	close(release) // the set lands after Close gave up
+	waitFor(t, "Run to remove the label after the set", func() bool { return !labelled(t, client, testPod) && l.Absent() })
+	if sets.Load() != 1 {
+		t.Fatalf("%d sets, want 1", sets.Load())
 	}
 }
 
@@ -563,6 +600,16 @@ func TestStandbyReady(t *testing.T) {
 	e.campaigning.Store(true)
 	if ok, why := StandbyReady(e, l); !ok || why != "" {
 		t.Fatalf("ready follower: %v %q", ok, why)
+	}
+	// A leader whose lease went stale (it resumed after a freeze) steps
+	// down: never ready, although its label is absent and it campaigns.
+	tr := newRenewTracker(&resourcelock.LeaseLock{LockConfig: resourcelock.ResourceLockConfig{Identity: "gw-a"}})
+	tr.led.Store(true)
+	tr.observe(time.Since(tr.base)-2*e.renewDeadline, resourcelock.LeaderElectionRecord{HolderIdentity: "gw-a"}, nil)
+	e.renew.Store(tr)
+	e.setLeader(true)
+	if ok, why := StandbyReady(e, l); ok || !strings.Contains(why, "stepping down") {
+		t.Fatalf("stale leader: %v %q", ok, why)
 	}
 }
 

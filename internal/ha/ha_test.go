@@ -1018,6 +1018,49 @@ func TestCampaigningWhileFollowing(t *testing.T) {
 	}
 }
 
+// A leader whose term ends (its renewals fail) steps down for good; a
+// follower and a fresh leader do not.
+func TestSteppingDown(t *testing.T) {
+	cfg := timings(2*time.Second, time.Second, 200*time.Millisecond)
+	client := fake.NewSimpleClientset()
+	var failing atomic.Bool
+	client.PrependReactor("*", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failing.Load() {
+			return true, nil, errors.New("injected: API server unreachable")
+		}
+		return false, nil, nil
+	})
+	a := newElector(t, client, "gw-a", cfg, nil)
+	a.campaignDelay = 0
+	if a.SteppingDown() {
+		t.Fatal("stepping down before Run")
+	}
+	ca := start(t, a, true)
+	lctx := ca.waitLeading(t)
+	b := newElector(t, client, "gw-b", cfg, nil)
+	b.campaignDelay = 0
+	start(t, b, true)
+	waitFor(t, "the follower to campaign", b.Campaigning)
+	if a.SteppingDown() || b.SteppingDown() {
+		t.Fatalf("stepping down: leader %v, follower %v", a.SteppingDown(), b.SteppingDown())
+	}
+	failing.Store(true)
+	select {
+	case <-lctx.Done():
+	case <-time.After(waitTimeout):
+		t.Fatal("leader context not cancelled after renewals failed")
+	}
+	if !a.SteppingDown() {
+		t.Fatal("the former leader does not step down")
+	}
+	if !errors.Is(ca.wait(t), ErrLeadershipLost) || !a.SteppingDown() {
+		t.Fatalf("after Run: stepping down %v", a.SteppingDown())
+	}
+	if b.SteppingDown() {
+		t.Fatal("the follower steps down")
+	}
+}
+
 func TestDisplaced(t *testing.T) {
 	lease := func(holder string, renewed time.Time) *coordinationv1.Lease {
 		d := int32(1)

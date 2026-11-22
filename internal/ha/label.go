@@ -147,9 +147,10 @@ type Labeler struct {
 
 	kick chan struct{}
 
-	// opMu serialises the patches of the own pod, so that the removal in
-	// Close cannot be overtaken by a set that is already under way.
-	opMu sync.Mutex
+	// op serialises the patches of the own pod (a semaphore that a context
+	// can give up on), so that the removal in Close cannot be overtaken by a
+	// set that is already under way.
+	op chan struct{}
 
 	mu      sync.Mutex
 	closed  bool
@@ -180,7 +181,7 @@ func NewLabeler(o LabelerOptions) (*Labeler, error) {
 		log:  log.With("component", "ha", "pod", ns+"/"+pod, "label", LeaderLabel),
 		poll: labelPoll, resync: labelResync, requestTimeout: labelRequestTimeout,
 		minBackoff: labelMinBackoff, maxBackoff: labelMaxBackoff,
-		kick: make(chan struct{}, 1),
+		kick: make(chan struct{}, 1), op: make(chan struct{}, 1),
 	}
 	if l.met != nil {
 		l.met.RegisterLeaderLabel()
@@ -252,11 +253,15 @@ func (l *Labeler) Status() string {
 }
 
 // StandbyReady is the readiness of a replica with leader election that does
-// not serve (a follower, or a leader that is starting up or stepping down):
-// ready once the label is confirmed absent from its pod, so that the Service
-// cannot route to it, and once it campaigns, so that it can take over at
-// once. A replica that serves is ready without asking.
+// not serve (a follower, a leader that is starting up, or one that steps
+// down): ready once the label is confirmed absent from its pod, so that the
+// Service cannot route to it, and once it campaigns, so that it can take over
+// at once. A leader that steps down (Elector.SteppingDown) is never ready: it
+// is about to restart. A replica that serves is ready without asking.
 func StandbyReady(e *Elector, l *Labeler) (bool, string) {
+	if e.SteppingDown() {
+		return false, "stepping down: the lease is no longer fresh"
+	}
 	if !l.Absent() {
 		return false, "label " + LeaderLabel + " of pod " + l.Pod() + " " + l.Status()
 	}
@@ -303,8 +308,10 @@ func (l *Labeler) Run(ctx context.Context) {
 }
 
 // Close stops setting the label and removes it from the own pod. It returns
-// once the removal succeeded, or with the last error when ctx ends. The
-// gateway calls it when it shuts down, before it releases the lease.
+// once the removal succeeded, or with the last error when ctx ends. A set
+// that is under way lands first; if ctx ends before that, Run removes the
+// label afterwards. The gateway calls Close when it shuts down, before it
+// releases the lease.
 func (l *Labeler) Close(ctx context.Context) error {
 	l.mu.Lock()
 	l.closed = true
@@ -375,8 +382,12 @@ func (l *Labeler) desired() bool {
 
 // apply sets the label on the own pod or removes it.
 func (l *Labeler) apply(ctx context.Context, set bool) error {
-	l.opMu.Lock()
-	defer l.opMu.Unlock()
+	select {
+	case l.op <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("ha: gave up waiting for the patch of pod %s that is under way: %w", l.Pod(), context.Cause(ctx))
+	}
+	defer func() { <-l.op }()
 	l.mu.Lock()
 	before := l.state
 	l.mu.Unlock()

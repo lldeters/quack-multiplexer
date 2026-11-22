@@ -289,6 +289,17 @@ func (e *Elector) Fresh() bool {
 // ready).
 func (e *Elector) Campaigning() bool { return e.campaigning.Load() }
 
+// SteppingDown reports whether this replica led during the current Run and
+// its lease is no longer fresh: its term ended, or its watchdog is about to
+// end it (a leader that resumed after a freeze). Run then returns without
+// campaigning again, and the gateway restarts. Such a replica cannot take
+// over, so it does not report ready (StandbyReady), even while Campaigning
+// still holds.
+func (e *Elector) SteppingDown() bool {
+	t := e.renew.Load()
+	return t != nil && t.led.Load() && !e.Fresh()
+}
+
 // Displaced returns the holder whose expired lease this replica took over at
 // the start of its current term, or "" if the lease was free (released by its
 // holder, or never held) or held by this replica itself. The pod of that
@@ -456,6 +467,7 @@ func (e *Elector) lead(leCtx context.Context, lock *renewTracker, stepDown conte
 	defer cancel()
 
 	e.setLeader(true)
+	lock.led.Store(true) // after setLeader: a term that starts is fresh
 	e.log.Info("became leader")
 	watchdog := make(chan struct{})
 	go func() {
@@ -519,6 +531,8 @@ type renewTracker struct {
 	// displaced is the holder of an expired lease that this candidate took
 	// over (see Elector.Displaced); nil if there was none.
 	displaced atomic.Pointer[string]
+	// led is set when this candidate's term starts (see Elector.SteppingDown).
+	led atomic.Bool
 }
 
 // errNotHolder refuses the release of a lease that another candidate holds.
