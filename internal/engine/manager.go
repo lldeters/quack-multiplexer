@@ -486,9 +486,13 @@ func (m *Manager) Acquire(ctx context.Context, key Key, user string) (*Lease, er
 	if key.ShareLevel != ShareConnection && prof.Pool.Size > 1 {
 		key.PoolIndex = m.selectPoolIndex(key.Base(), prof.Pool)
 	}
-	// One startup budget for the whole call, including the wait for the
-	// previous engine of a persistent key (see reserve).
-	deadline := time.Now().Add(m.cfg.EngineStartupTimeout(key.Profile))
+	// A persistent key has one startup budget for the whole call, including
+	// the wait for its previous engine (see reserve). Other keys keep a
+	// budget per engine.
+	var deadline time.Time
+	if prof.Persistence != nil {
+		deadline = time.Now().Add(m.cfg.EngineStartupTimeout(key.Profile))
+	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		e, err := m.reserve(ctx, key, user, prof, deadline)
@@ -805,11 +809,15 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 	}()
 }
 
-// wait blocks until a reserved engine is ready. On failure the reservation is
-// dropped. errRetry asks Acquire to pick another engine.
+// wait blocks until a reserved engine is ready, at most until deadline if
+// that is set. On failure the reservation is dropped. errRetry asks Acquire
+// to pick another engine.
 func (m *Manager) wait(ctx context.Context, e *engine, deadline time.Time) (*Lease, error) {
 	timeout := m.cfg.EngineStartupTimeout(e.ProfileName)
-	remaining := min(timeout-m.now().Sub(e.startedAt()), time.Until(deadline))
+	remaining := timeout - m.now().Sub(e.startedAt())
+	if !deadline.IsZero() {
+		remaining = min(remaining, time.Until(deadline))
+	}
 	if remaining < time.Second {
 		remaining = time.Second
 	}

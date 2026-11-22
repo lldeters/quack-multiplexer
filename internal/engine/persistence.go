@@ -210,11 +210,13 @@ func (m *Manager) replacementDueLocked(e *engine, now time.Time) string {
 func (m *Manager) replaceLocked(e *engine, why string, now time.Time, idle bool) bool {
 	if e.replaceSince.IsZero() {
 		e.replaceSince = now
-		e.Message = "replacement pending: " + why
 		m.log.Info("engine replacement pending: it is replaced once it has no sessions", "engine", e.ID,
 			"key", e.Key.String(), "reason", why, "sessions", e.Sessions,
 			"deadline", now.Add(m.cfg.Engine.DrainTimeout.Duration))
 	}
+	// Every time: provider events may have replaced the message, which tells
+	// the operator why the engine still runs.
+	e.Message = "replacement pending: " + why
 	switch {
 	case idle:
 		m.terminateLocked(e, "replaced: "+why)
