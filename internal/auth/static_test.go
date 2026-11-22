@@ -49,11 +49,18 @@ users:
 // that tests do not depend on the file system's timestamp resolution.
 func rewrite(t *testing.T, path, content string, version int) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	// Write a temporary file and rename it over path, so that a poll never
+	// sees the file truncated or half written: os.WriteFile truncates first,
+	// and a poll in between read an empty, invalid users file.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	mtime := time.Date(2026, 1, 1, 0, 0, version, 0, time.UTC)
-	if err := os.Chtimes(path, mtime, mtime); err != nil {
+	if err := os.Chtimes(tmp, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		t.Fatal(err)
 	}
 }
