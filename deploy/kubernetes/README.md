@@ -675,7 +675,8 @@ alte Datei übernehmen, während keine Clients arbeiten:
 3. Einen Hilfs-Pod starten, der das alte PVC und den neuen Claim mountet (etwa unter `/alt` und `/neu`; Pod
    Security `restricted` verlangt einen gehärteten Security-Context), und kopieren:
    `cp /alt/<datei>.duckdb /neu/engine.duckdb`, eine `<datei>.duckdb.wal` daneben als `/neu/engine.duckdb.wal`.
-4. Den Hilfs-Pod löschen; solange er den Claim mountet, startet keine Engine des Schlüssels. Dann attachen.
+4. Den Hilfs-Pod löschen, dann attachen. Solange er den Claim mountet, plant der Scheduler mit `ReadWriteOncePod`
+   keine Engine des Schlüssels ein; mit `ReadWriteOnce` könnte eine starten, deshalb bis hierher keine Clients.
 
 ### Gemeinsame Daten read-only anhängen
 
