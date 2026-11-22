@@ -177,6 +177,12 @@ profiles:
         containers: [{name: engine, volumeMounts: [{name: other, mountPath: /data}]}]
         volumes: [{name: other, emptyDir: {}}]
 `,
+		"mount below the mount path": `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers: [{name: engine, volumeMounts: [{name: other, mountPath: /data/sub/}]}]
+        volumes: [{name: other, emptyDir: {}}]
+`,
 		"data volume mounted by the template": `    persistence: {size: 1Gi}
     podTemplate:
       spec:
@@ -212,6 +218,16 @@ profiles:
 `
 	if err := Validate(testConfig(t, head+sidecar)); err != nil {
 		t.Fatalf("sidecar with the data volume rejected: %v", err)
+	}
+	// A mount next to the data volume, or one above it, hides nothing.
+	beside := `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers: [{name: engine, volumeMounts: [{name: a, mountPath: /data2}, {name: b, mountPath: /var/lib}]}]
+        volumes: [{name: a, emptyDir: {}}, {name: b, emptyDir: {}}]
+`
+	if err := Validate(testConfig(t, head+beside)); err != nil {
+		t.Fatalf("mounts beside the data volume rejected: %v", err)
 	}
 }
 
@@ -284,8 +300,51 @@ func TestLaunchReusesClaimOfTheKey(t *testing.T) {
 	if pvc.Annotations[AnnotationUser] != "bob" || pvc.Annotations[AnnotationLastLaunch] == old.Format(time.RFC3339) {
 		t.Errorf("annotations after reuse: %v", pvc.Annotations)
 	}
-	if !strings.Contains(e.logs.String(), "keeps the access modes") {
+	if !strings.Contains(e.logs.String(), "keeps the access mode and storage class") {
 		t.Error("no warning about the access mode of the existing claim")
+	}
+}
+
+// The settings of a profile apply to new claims only. A launch that reuses a
+// claim with another storage class warns, and for a claim that never bound
+// (no data) it says how to create the claim anew: that is what unblocks a
+// claim that stays Pending with the class it was created with.
+func TestLaunchWarnsAboutClaimWithOtherClass(t *testing.T) {
+	for what, c := range map[string]struct {
+		class, volume string
+		profile       string // replaces "storageClassName: fast"
+		want          string // "" for no warning
+	}{
+		"pending, other class":  {class: "does-not-exist", want: "holds no data"},
+		"bound, other class":    {class: "slow", volume: "pv-1", want: "apply to new claims only"},
+		"same class":            {class: "fast"},
+		"profile without class": {class: "whatever", profile: "storageClassName: \"\"", want: ""},
+	} {
+		t.Run(what, func(t *testing.T) {
+			yaml := persistentYAML
+			if c.profile != "" {
+				yaml = strings.Replace(yaml, "storageClassName: fast", c.profile, 1)
+			}
+			e := newTestEnv(t, testConfig(t, yaml))
+			ps := e.p.cfg.Profiles["personal"].Persistence
+			existing := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice", ps, time.Now())
+			existing.Spec.StorageClassName = &c.class
+			existing.Spec.VolumeName = c.volume
+			e.add(t, existing)
+			if _, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123")); err != nil {
+				t.Fatal(err)
+			}
+			logs := e.logs.String()
+			if c.want == "" {
+				if strings.Contains(logs, "keeps the access mode and storage class") {
+					t.Fatalf("unexpected warning: %s", logs)
+				}
+				return
+			}
+			if !strings.Contains(logs, "keeps the access mode and storage class") || !strings.Contains(logs, c.want) {
+				t.Fatalf("want a warning with %q, got: %s", c.want, logs)
+			}
+		})
 	}
 }
 

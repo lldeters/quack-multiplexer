@@ -139,12 +139,18 @@ func (r *renderer) validatePersistence(name string, prof config.Profile, pod *co
 			base.Child("podTemplate"), dataVolumeName))
 	}
 	// addDataVolume appended the last mount; any other one at the mount
-	// path comes from the template and would be a duplicate mount path.
+	// path comes from the template and would be a duplicate mount path, and
+	// one below it would hide that part of the data volume: files written
+	// there would be lost with the pod.
 	c := &pod.Spec.Containers[engineContainer(&pod.Spec)]
 	for _, m := range c.VolumeMounts[:len(c.VolumeMounts)-1] {
-		if path.Clean(m.MountPath) == ps.MountPath {
+		switch p := path.Clean(m.MountPath); {
+		case p == ps.MountPath:
 			errs = append(errs, fmt.Errorf("%s: the podTemplate's engine container already mounts %s at %s",
 				base.Child("persistence", "mountPath"), m.Name, ps.MountPath))
+		case strings.HasPrefix(p, ps.MountPath+"/"):
+			errs = append(errs, fmt.Errorf("%s: the podTemplate's engine container mounts %s at %s, inside the data volume at %s",
+				base.Child("persistence", "mountPath"), m.Name, p, ps.MountPath))
 		}
 	}
 	if pod.Spec.NodeName != "" {
@@ -198,10 +204,7 @@ func (p *Provider) ensureDataClaim(ctx context.Context, req engine.LaunchRequest
 	if err := p.checkDataClaim(got, req.Key); err != nil {
 		return "", err
 	}
-	if m := got.Spec.AccessModes; len(m) != 1 || m[0] != ps.AccessMode {
-		p.warnOnce(name, "the data volume claim keeps the access modes it was created with",
-			"claim", name, "accessModes", m, "profile", ps.AccessMode)
-	}
+	p.warnClaimDiffers(got, ps)
 	patch, _ := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]string{
 		AnnotationLastLaunch: now.UTC().Format(time.RFC3339),
 	}}})
@@ -209,6 +212,36 @@ func (p *Provider) ensureDataClaim(ctx context.Context, req engine.LaunchRequest
 		p.log.Debug("recording the launch on the data volume claim failed", "claim", name, "err", err)
 	}
 	return name, nil
+}
+
+// warnClaimDiffers warns (once per claim) when an existing claim has another
+// access mode or storage class than the profile asks for: the settings
+// apply to new claims only. A profile without a storage class means the
+// cluster's default, which the gateway cannot read (RBAC); that is not
+// compared. A claim that was never bound holds no data, so it can be
+// deleted to apply the profile; that is what fixes a claim that stays
+// Pending because of the settings it was created with.
+func (p *Provider) warnClaimDiffers(pvc *corev1.PersistentVolumeClaim, ps *config.PersistenceConfig) {
+	modes := pvc.Spec.AccessModes
+	modeDiffers := len(modes) != 1 || modes[0] != ps.AccessMode
+	var class string
+	if pvc.Spec.StorageClassName != nil {
+		class = *pvc.Spec.StorageClassName
+	}
+	classDiffers := ps.StorageClassName != "" && class != ps.StorageClassName
+	if !modeDiffers && !classDiffers {
+		return
+	}
+	attrs := []any{"claim", pvc.Name, "accessModes", modes, "storageClass", class,
+		"profileAccessMode", ps.AccessMode, "profileStorageClass", ps.StorageClassName, "phase", pvc.Status.Phase}
+	if pvc.Spec.VolumeName == "" {
+		p.warnOnce(pvc.Name, "the data volume claim keeps the access mode and storage class it was created with; "+
+			"it is not bound yet and holds no data: to create it with the settings of the profile, terminate its engine "+
+			"(DELETE /api/v1/engines/{id}) and delete the claim (DELETE /api/v1/volumes/{name})", attrs...)
+		return
+	}
+	p.warnOnce(pvc.Name, "the data volume claim keeps the access mode and storage class it was created with "+
+		"(the settings of the profile apply to new claims only)", attrs...)
 }
 
 // checkSoleEngine makes sure that no other pod of the key that mounts its
