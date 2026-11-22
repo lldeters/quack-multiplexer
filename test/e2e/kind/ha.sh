@@ -25,7 +25,10 @@
 #       status" succeeds) with exactly one handover, to a new pod
 #   h5  the PodDisruptionBudget lets the leader be evicted while the follower
 #       is ready (it hands over), but never the last ready replica
-#   h6  both clients detach cleanly
+#   h6  a rollout whose pods could never lead (the gateway may not use the
+#       lease in their ha.namespace) stalls: the new pod refuses to start,
+#       and the old ones keep serving without a handover
+#   h7  both clients detach cleanly
 #
 # Two clients of one user stay attached through all scenarios: one with the
 # default heartbeat timeout (60 s) and one with HEARTBEAT_TIMEOUT 5, whose
@@ -100,6 +103,7 @@ FROZEN_NODE='' FROZEN_PID=''
 CLIENTS_OPEN=''
 GAP_PID='' GAP=''
 LOG_PID=''
+BROKEN_CONFIG=''
 
 # Generated overlay ----------------------------------------------------------------
 
@@ -673,6 +677,9 @@ cleanup() {
 	if [ -n "$SWITCHED" ] && [ -z "${KEEP_HA:-}" ]; then
 		restore_dev || rc=1
 	fi
+	if [ -n "$BROKEN_CONFIG" ] && [ -z "${KEEP_HA:-}" ]; then
+		kctl -n "$NS" delete configmap "$BROKEN_CONFIG" --ignore-not-found >/dev/null 2>&1 || rc=1
+	fi
 	if [ -z "${KEEP_HA:-}" ]; then rm -rf "$HA_WORK"; fi
 	rm -rf "$E2E_WORK"
 	exit "$rc"
@@ -910,6 +917,88 @@ scenario_pdb() {
 	expect_adopted "the leader $LEADER after the evictions" || return 1
 }
 
+# pod_ready POD prints the status of the Ready condition of POD (True or
+# False).
+pod_ready() { kctl -n "$NS" get pod "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'; }
+
+# break_lease_access SOURCE FILE NAMESPACE writes the configuration of the
+# ConfigMap SOURCE to FILE with ha.namespace set to NAMESPACE.
+break_lease_access() {
+	kctl -n "$NS" get configmap "$1" -o go-template='{{index .data "config.yaml"}}' |
+		awk -v ns="$3" '
+			/^ha:[ \t]*$/ { print; print "  namespace: " ns; inha = 1; next }
+			inha && /^[^ \t#]/ { inha = 0 }
+			inha && /^[ \t]+namespace:/ { next }
+			{ print }' >"$2" || return 1
+	grep -qx "  namespace: $3" "$2"
+}
+
+# h6: a rollout whose pods could never lead stalls. Its configuration moves
+# the lease to a namespace in which the gateway has no Role (ha.namespace;
+# the same happens when provider.kubernetes.namespace moves without its Role,
+# deploy/kubernetes/README.md, "Konfiguration ändern"). The new pod refuses
+# to start, so the rollout (maxUnavailable 0) keeps both old pods, and the
+# old leader serves on without a handover. Applying the overlay again rolls
+# back.
+scenario_broken_rollout() {
+	local live conf=$E2E_WORK/h6-config.yaml ns=default old_leader old_follower transitions pod log=$E2E_WORK/h6-new.log
+	[ "$NS" != default ] || ns=kube-public
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	old_leader=$LEADER old_follower=$FOLLOWER transitions=$(lease_transitions)
+	live=$(kctl -n "$NS" get deployment "$DEPLOY" -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}') || return 1
+	if ! break_lease_access "$live" "$conf" "$ns"; then
+		bad "cannot set ha.namespace in config.yaml of configmap/$live (no block 'ha:')"
+		return 1
+	fi
+	BROKEN_CONFIG=quackmux-e2e-broken-$RUN_ID
+	kctl -n "$NS" create configmap "$BROKEN_CONFIG" --from-file=config.yaml="$conf" >/dev/null || return 1
+	say "  roll out a configuration that moves the lease to namespace $ns, where the gateway has no Role"
+	kctl -n "$NS" patch deployment "$DEPLOY" \
+		-p "{\"spec\":{\"template\":{\"spec\":{\"volumes\":[{\"name\":\"config\",\"configMap\":{\"name\":\"$BROKEN_CONFIG\"}}]}}}}" >/dev/null || return 1
+	if kctl -n "$NS" rollout status "deployment/$DEPLOY" --timeout=30s >/dev/null 2>&1; then
+		bad "kubectl rollout status reports success for pods that could never lead"
+		return 1
+	fi
+	ok "kubectl rollout status does not report success (30s)"
+	pod=$(gateway_pods | grep -vxF -e "$old_leader" -e "$old_follower" | head -n 1)
+	if [ -z "$pod" ]; then
+		bad "the rollout started no new pod"
+		return 1
+	fi
+	{
+		kctl -n "$NS" logs "$pod" --previous 2>/dev/null || true
+		kctl -n "$NS" logs "$pod" 2>/dev/null || true
+	} >"$log"
+	expect_output "$log" "ha: this replica could never lead: the gateway may not get leases.coordination.k8s.io $ns/$HA_LEASE" \
+		"the new pod $pod refuses to start: it may not use the lease in namespace $ns" || {
+		indent "$log"
+		return 1
+	}
+	expect_eq "$(pod_ready "$pod")" False "the new pod is not ready" || return 1
+	expect_eq "$(deployment_counts)" "3 1 2" "the Deployment keeps both old replicas available (REPLICAS 3, UP-TO-DATE 1, AVAILABLE 2)" || return 1
+	if ! leader_is "$old_leader" || [ "$(pod_ready "$old_follower")" != True ]; then
+		bad "$old_leader does not lead any more, or $old_follower is not ready"
+		return 1
+	fi
+	ok "$old_leader still leads and is the only endpoint of service/$SVC; $old_follower is ready"
+	expect_eq "$(lease_transitions)" "$transitions" "the lease did not change hands" || return 1
+	expect_both_attached h6-stalled || return 1
+	say "  kubectl apply -k (the generated overlay) rolls back"
+	if ! kctl apply -k "$HA_DIR" >"$E2E_WORK/apply.log" 2>&1; then
+		indent "$E2E_WORK/apply.log"
+		return 1
+	fi
+	wait_for 120 "two ready replicas of the previous template" rollout_done || return 1
+	expect_eq "$LEADER" "$old_leader" "after the rollback $old_leader still leads" || return 1
+	expect_eq "$(lease_transitions)" "$transitions" "the lease did not change hands" || return 1
+	kctl -n "$NS" delete configmap "$BROKEN_CONFIG" --ignore-not-found >/dev/null || return 1
+	BROKEN_CONFIG=''
+	expect_both_attached h6-after || return 1
+}
+
 # Main -------------------------------------------------------------------------------
 
 step "prerequisites"
@@ -948,10 +1037,11 @@ if [ -n "$ENGINE_POD" ]; then
 	run_scenario h3 "a frozen leader loses the lease and steps down when it resumes" scenario_frozen_leader
 	run_scenario h4 "a rollout completes on its own with one handover" scenario_rollout
 	run_scenario h5 "the PodDisruptionBudget lets the leader go while the follower is ready" scenario_pdb
+	run_scenario h6 "a rollout of pods that could never lead stalls; the old pods keep serving" scenario_broken_rollout
 else
-	bad "h3-h5 need the attachments of h2"
-	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h5"
+	bad "h3-h6 need the attachments of h2"
+	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h5 h6"
 fi
-run_scenario h6 "both clients detach cleanly" close_clients
+run_scenario h7 "both clients detach cleanly" close_clients
 
 summary "kind HA e2e" || exit 1
