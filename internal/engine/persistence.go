@@ -33,7 +33,9 @@ import (
 // The provider must report an engine gone only once no process of it can
 // still open the volume (the Kubernetes provider: the pod object is deleted,
 // which the kubelet does after the containers stopped and the volumes were
-// unmounted).
+// unmounted). The manager never asks it to terminate an engine whose launch
+// has not returned yet (terminateLocked): the instance could appear after
+// the provider reported it gone.
 
 // Errors of persistent keys and data volumes.
 var (

@@ -79,6 +79,9 @@ type engine struct {
 
 	ready chan struct{} // closed exactly once, when the engine leaves STARTING
 	gone  chan struct{} // closed exactly once, when the engine leaves the registry
+	// launched is closed when the provider's Launch call returned; nil for
+	// engines this process did not launch (see terminateLocked).
+	launched chan struct{}
 }
 
 func (e *engine) touch(now time.Time) { e.lastUsed.Store(now.UnixNano()) }
@@ -755,6 +758,7 @@ func (m *Manager) newEngineLocked(key Key, user string, warm bool) *engine {
 		StateSince:  now,
 		ready:       make(chan struct{}),
 		gone:        make(chan struct{}),
+		launched:    make(chan struct{}),
 	}
 	e.touch(now)
 	m.addLocked(e)
@@ -780,6 +784,7 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 		ctx, cancel := context.WithTimeout(context.Background(), m.cfg.EngineStartupTimeout(e.ProfileName))
 		defer cancel()
 		inst, err := m.prov.Launch(ctx, req)
+		close(e.launched)
 		if err != nil {
 			m.mu.Lock()
 			if m.engines[e.ID] == e && e.State == StateStarting {
@@ -999,8 +1004,23 @@ func (m *Manager) terminateLocked(e *engine, reason string) {
 		m.log.Info("terminating engine", "engine", e.ID, "key", e.Key.String(), "reason", reason)
 	}
 	e.terminateAt = now
-	id := e.ID
+	id, launched := e.ID, e.launched
+	launchTimeout := m.cfg.EngineStartupTimeout(e.ProfileName)
 	go func() {
+		if launched != nil {
+			// While the launch is under way, the instance may not exist yet:
+			// the provider would find nothing to stop and report the engine
+			// gone, and the instance could appear afterwards, next to a
+			// successor (for a persistent key: on the same data volume).
+			t := time.NewTimer(launchTimeout + time.Minute)
+			defer t.Stop()
+			select {
+			case <-launched:
+			case <-t.C:
+				m.log.Warn("terminate engine postponed: its launch has not returned (will retry)", "engine", id)
+				return
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		if err := m.prov.Terminate(ctx, id, reason); err != nil {

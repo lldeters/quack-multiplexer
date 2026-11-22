@@ -48,6 +48,7 @@ type guardedProvider struct {
 	vols     map[string]engine.Volume
 	block    chan struct{} // DeleteVolume waits for it if set
 	entered  chan struct{} // DeleteVolume signals here before it waits
+	gate     chan struct{} // Launch waits for it if set (a slow API server)
 }
 
 func newGuarded() *guardedProvider {
@@ -70,7 +71,11 @@ func (g *guardedProvider) Launch(ctx context.Context, req engine.LaunchRequest) 
 		}
 	}
 	g.order = append(g.order, "launch "+req.ID)
+	gate := g.gate
 	g.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	return g.Provider.Launch(ctx, req)
 }
 
@@ -448,6 +453,51 @@ func TestPersistentLaunchNeedsFreshLease(t *testing.T) {
 	}
 	if g.Launches() != 0 {
 		t.Fatal("launched without a fresh lease")
+	}
+}
+
+// An engine whose launch is still under way is told to stop only once the
+// launch returned: before, the provider may find nothing to delete and
+// report the engine gone, and the instance would appear afterwards (adopted
+// as a second engine of the key, next to a successor on the same volume).
+func TestTerminateWaitsForRunningLaunch(t *testing.T) {
+	g := newGuarded()
+	gate := make(chan struct{})
+	g.gate = gate
+	m, _ := startPersistent(t, g, newTestClock(), nil, "")
+	done := make(chan error, 1)
+	go func() {
+		_, err := acquire(t, m, 10*time.Second)
+		done <- err
+	}()
+	var id string
+	waitUntil(t, "the launch", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if len(g.order) == 0 {
+			return false
+		}
+		id = strings.TrimPrefix(g.order[0], "launch ")
+		return true
+	})
+	if err := m.Terminate(id, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("the session got the terminated engine")
+	}
+	time.Sleep(200 * time.Millisecond)
+	g.mu.Lock()
+	calls := strings.Join(g.order, ", ")
+	g.mu.Unlock()
+	if calls != "launch "+id {
+		t.Fatalf("provider calls while the launch runs: %s", calls)
+	}
+	close(gate)
+	waitUntil(t, "the engine to be gone", func() bool { _, ok := m.Exists(id); return !ok })
+	time.Sleep(100 * time.Millisecond) // a late event of the instance would register it again
+	if ids := g.IDs(); len(ids) != 0 || len(m.List()) != 0 {
+		t.Fatalf("left behind: instances %v, engines %d", ids, len(m.List()))
 	}
 }
 
