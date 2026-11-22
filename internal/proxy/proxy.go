@@ -66,6 +66,10 @@ type Gateway struct {
 	abort    context.CancelFunc
 
 	inFlight atomic.Int64
+
+	// notLeaderWarned is when a replica that does not lead last logged that
+	// Quack traffic reached it (UnixNano, see warnNotLeader).
+	notLeaderWarned atomic.Int64
 }
 
 // Options wires a Gateway.
@@ -77,7 +81,12 @@ type Options struct {
 	Upstream *upstream.Client
 	Log      *slog.Logger
 	Metrics  *metrics.Metrics
-	// Ready reports whether this replica may serve (synced and leader).
+	// Ready reports whether this replica serves Quack requests (synced, not
+	// shutting down and, with leader election, the leader with a fresh
+	// lease); requests are answered with an error otherwise. With leader
+	// election this is not the readiness of the pod: every healthy replica
+	// is ready, and the Service selects the leader by its label. A replica
+	// that does not lead gives the reason ReasonNotLeader.
 	Ready func() (bool, string)
 }
 
@@ -204,8 +213,7 @@ func (g *Gateway) handleQuack(w http.ResponseWriter, r *http.Request) {
 		defer g.met.InFlight.Dec()
 	}
 	if ok, why := g.ready(); !ok {
-		writeError(w, "quackmux: gateway is not ready: "+why, wire.ExceptionConnection, false)
-		g.count(wire.TypeInvalid, "not_ready", start)
+		g.refuseNotReady(w, r, why, start)
 		return
 	}
 	// Until the client has shown a valid session id or delivered its whole
