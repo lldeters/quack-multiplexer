@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 )
 
@@ -334,7 +337,8 @@ type Profile struct {
 	// ImagePullPolicy likewise replaces the podTemplate's (default
 	// IfNotPresent).
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
-	// Database is the DuckDB database path inside the engine (":memory:").
+	// Database is the DuckDB database path inside the engine (":memory:";
+	// with Persistence <mountPath>/engine.duckdb).
 	Database string `json:"database,omitempty"`
 	// InitSQL runs before the Quack server starts (ATTACH, SET, secrets...).
 	InitSQL string `json:"initSQL,omitempty"`
@@ -348,6 +352,14 @@ type Profile struct {
 	AllowedShareLevels []string `json:"allowedShareLevels,omitempty"`
 	AllowedUsers       []string `json:"allowedUsers,omitempty"`
 	AllowedGroups      []string `json:"allowedGroups,omitempty"`
+	// AllowedSubdomains restricts the subdomains of USER, GROUP and SERVER
+	// sessions. Required with Persistence: every subdomain of an owner gets
+	// a volume of its own, and an open list would let users create volumes
+	// without bound.
+	AllowedSubdomains []string `json:"allowedSubdomains,omitempty"`
+	// Persistence gives every engine key of the profile its own
+	// PersistentVolumeClaim (Kubernetes provider only).
+	Persistence *PersistenceConfig `json:"persistence,omitempty"`
 	// Lifecycle overrides (nil = engine.* defaults).
 	StartupTimeout *Duration `json:"startupTimeout,omitempty"`
 	IdleTimeout    *Duration `json:"idleTimeout,omitempty"`
@@ -379,6 +391,39 @@ type PoolConfig struct {
 type WarmPoolConfig struct {
 	Size int `json:"size,omitempty"`
 }
+
+// PersistenceConfig gives every engine key of a profile (every user, group
+// or subdomain) a PersistentVolumeClaim of its own, mounted at MountPath.
+// The gateway creates the claim before the first engine of the key and keeps
+// it when engines end. There is never more than one engine per key: a
+// successor starts only after its predecessor's pod is gone.
+type PersistenceConfig struct {
+	// Size is the storage request of new claims, e.g. 10Gi (required).
+	Size resource.Quantity `json:"size"`
+	// StorageClassName of new claims; empty means the cluster's default.
+	StorageClassName string `json:"storageClassName,omitempty"`
+	// AccessMode of new claims: ReadWriteOncePod (default) or ReadWriteOnce.
+	AccessMode corev1.PersistentVolumeAccessMode `json:"accessMode,omitempty"`
+	// MountPath of the volume in the engine container (default /data).
+	MountPath string `json:"mountPath,omitempty"`
+	// Labels and Annotations are added to new claims (e.g. for backups).
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// Persistence defaults.
+const (
+	DefaultPersistenceMountPath = "/data"
+	// DefaultPersistentDatabase is the database file in the mount path.
+	DefaultPersistentDatabase = "engine.duckdb"
+)
+
+// subdomainRE restricts subdomains to label-safe names, like Kyuubi's
+// [a-zA-Z_0-9-]{1,14} rule but a little more permissive in length.
+var subdomainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`)
+
+// ValidSubdomain reports whether s is an acceptable subdomain.
+func ValidSubdomain(s string) bool { return subdomainRE.MatchString(s) }
 
 // AuditConfig controls the query audit log.
 type AuditConfig struct {
@@ -581,6 +626,13 @@ func (c *Config) ApplyDefaults() {
 	for name, prof := range c.Profiles {
 		// Image and ImagePullPolicy stay empty: the Kubernetes provider
 		// takes them from the profile's podTemplate, else the defaults.
+		if ps := prof.Persistence; ps != nil {
+			setStr(&ps.MountPath, DefaultPersistenceMountPath)
+			if ps.AccessMode == "" {
+				ps.AccessMode = corev1.ReadWriteOncePod
+			}
+			setStr(&prof.Database, path.Join(ps.MountPath, DefaultPersistentDatabase))
+		}
 		setStr(&prof.Database, ":memory:")
 		setInt(&prof.Pool.Size, 1)
 		setStr(&prof.Pool.SelectPolicy, "RANDOM")
@@ -730,6 +782,14 @@ func (c *Config) Validate() error {
 		for _, l := range p.AllowedShareLevels {
 			checkLevel(fmt.Sprintf("profiles.%s.allowedShareLevels", name), l)
 		}
+		for _, s := range p.AllowedSubdomains {
+			if !ValidSubdomain(s) {
+				add("profiles.%s.allowedSubdomains: %q is not a valid subdomain (lower-case letters, digits and '-', at most 32 characters)", name, s)
+			}
+		}
+		if p.Persistence != nil {
+			errs = append(errs, validatePersistence(name, p, c.Provider.Type)...)
+		}
 		for k := range p.Settings {
 			if !isIdentifier(k) {
 				add("profiles.%s.settings: %q is not a valid setting name", name, k)
@@ -749,6 +809,46 @@ func (c *Config) Validate() error {
 		add("log.level must be debug, info, warn or error")
 	}
 	return errors.Join(errs...)
+}
+
+// validatePersistence checks a profile with persistence: only keys that are
+// reused (USER, GROUP, SERVER) and only one engine per key.
+func validatePersistence(name string, p Profile, providerType string) []error {
+	var errs []error
+	add := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+	ps := p.Persistence
+	if providerType != "kubernetes" {
+		add("profiles.%s.persistence needs provider.type kubernetes", name)
+	}
+	if len(p.AllowedShareLevels) == 0 {
+		add("profiles.%s.allowedShareLevels must be set with persistence (USER, GROUP and/or SERVER)", name)
+	}
+	for _, l := range p.AllowedShareLevels {
+		if strings.EqualFold(l, "CONNECTION") {
+			add("profiles.%s.allowedShareLevels: CONNECTION cannot be used with persistence (every session would get a volume of its own)", name)
+		}
+	}
+	if len(p.AllowedSubdomains) == 0 {
+		add("profiles.%s.allowedSubdomains must be set with persistence (every subdomain gets volumes of its own)", name)
+	}
+	if p.Pool.Size != 1 {
+		add("profiles.%s.pool.size must be 1 with persistence (only one engine may open the data of a key)", name)
+	}
+	if p.WarmPool.Size != 0 {
+		add("profiles.%s.warmPool.size must be 0 with persistence (warm engines serve CONNECTION sessions)", name)
+	}
+	if ps.Size.Sign() <= 0 {
+		add("profiles.%s.persistence.size is required (for example 10Gi)", name)
+	}
+	switch ps.AccessMode {
+	case corev1.ReadWriteOncePod, corev1.ReadWriteOnce:
+	default:
+		add("profiles.%s.persistence.accessMode must be ReadWriteOncePod or ReadWriteOnce, got %q", name, ps.AccessMode)
+	}
+	if mp := ps.MountPath; !path.IsAbs(mp) || path.Clean(mp) != mp || mp == "/" || mp == "/tmp" {
+		add("profiles.%s.persistence.mountPath %q must be a clean absolute path other than / and /tmp", name, mp)
+	}
+	return errs
 }
 
 func isIdentifier(s string) bool {

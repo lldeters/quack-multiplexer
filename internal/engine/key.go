@@ -7,8 +7,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
+
+	"quackmux/internal/config"
 )
 
 // ShareLevel decides which sessions share an engine (as in Apache Kyuubi).
@@ -44,12 +45,9 @@ func ParseShareLevel(s string) (ShareLevel, error) {
 	return "", fmt.Errorf("unknown share level %q (want CONNECTION, USER, GROUP or SERVER)", s)
 }
 
-// subdomainRE restricts subdomains to label-safe names, like Kyuubi's
-// [a-zA-Z_0-9-]{1,14} rule but a little more permissive in length.
-var subdomainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`)
-
-// ValidSubdomain reports whether s is an acceptable subdomain.
-func ValidSubdomain(s string) bool { return subdomainRE.MatchString(s) }
+// ValidSubdomain reports whether s is an acceptable subdomain (the rule
+// lives in config, which validates profiles.<name>.allowedSubdomains).
+func ValidSubdomain(s string) bool { return config.ValidSubdomain(s) }
 
 // Key identifies the engine a session must use. Sessions with equal keys share
 // an engine; for CONNECTION share level the owner is the session id, so no two
