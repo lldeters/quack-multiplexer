@@ -211,6 +211,31 @@ func (p *Provider) ensureDataClaim(ctx context.Context, req engine.LaunchRequest
 	return name, nil
 }
 
+// checkSoleEngine makes sure that no other pod of the key exists before the
+// pod of a persistent key is created; it asks the API server, not the cache.
+// The manager launches an engine for such a key only when its registry holds
+// no other engine of the key. This also covers the pods the registry does not
+// know: one that the initial List skipped because its token could not be
+// read, or one that another gateway process created. Such a pod is replayed
+// to the manager, which adopts it once its token can be read.
+func (p *Provider) checkSoleEngine(ctx context.Context, req engine.LaunchRequest) error {
+	sel := labels.SelectorFromSet(labels.Set{
+		LabelManagedBy: managedByValue, LabelInstance: p.instance, LabelKeyHash: req.Key.Hash(),
+	})
+	list, err := p.client.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+	if err != nil {
+		return fmt.Errorf("list the engine pods of key %s: %w", req.Key.String(), err)
+	}
+	for i := range list.Items {
+		if pod := &list.Items[i]; pod.Name != req.ID {
+			p.requestReplay(nil)
+			return fmt.Errorf("%w (engine pod %s exists; only one engine may mount data volume claim %s)",
+				engine.ErrHandover, pod.Name, dataClaimName(p.instance, req.Key))
+		}
+	}
+	return nil
+}
+
 // checkDataClaim verifies that an existing claim is the data volume of key
 // and usable.
 func (p *Provider) checkDataClaim(pvc *corev1.PersistentVolumeClaim, key engine.Key) error {

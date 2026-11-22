@@ -426,7 +426,9 @@ func (p *Provider) List(ctx context.Context) ([]engine.Instance, error) {
 }
 
 // Launch implements engine.Provider: it creates the token secret and the
-// pod and returns the instance in PhaseStarting.
+// pod and returns the instance in PhaseStarting. For a profile with
+// persistence it first makes sure that the data volume claim of the key
+// exists and that no other pod of the key does (volume.go).
 func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine.Instance, error) {
 	if errs := validation.IsDNS1123Label(req.ID); len(errs) > 0 {
 		return engine.Instance{}, fmt.Errorf("kubernetes provider: invalid engine id %q: %s", req.ID, strings.Join(errs, "; "))
@@ -447,6 +449,9 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 	if req.Profile.Persistence != nil {
 		// The claim before the pod, which would otherwise wait for it.
 		if _, err := p.ensureDataClaim(ctx, req); err != nil {
+			return engine.Instance{}, err
+		}
+		if err := p.checkSoleEngine(ctx, req); err != nil {
 			return engine.Instance{}, err
 		}
 	}

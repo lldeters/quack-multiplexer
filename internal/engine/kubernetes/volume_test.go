@@ -230,7 +230,7 @@ func TestLaunchCreatesClaimBeforePod(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Join(actionsOf(e), ", ")
-	if !strings.HasPrefix(got, "get persistentvolumeclaims, create persistentvolumeclaims, create secrets, create pods") {
+	if !strings.HasPrefix(got, "get persistentvolumeclaims, create persistentvolumeclaims, list pods, create secrets, create pods") {
 		t.Fatalf("actions: %s", got)
 	}
 	pvc, err := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, dataClaimName("default", personalKey), metav1.GetOptions{})
@@ -314,6 +314,35 @@ func TestLaunchRefusesUnusableClaims(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A pod of the key that the registry does not know (one the initial List
+// skipped because its token could not be read, or one another gateway
+// process created) keeps a second pod of the key from being created, and it
+// is replayed to the manager.
+func TestLaunchRefusesSecondPodOfKey(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	other, _ := e.enginePod("quack-user-alice-older", personalKey, false, "tok-old")
+	e.add(t, other)
+	ctx := context.Background()
+	_, err := e.p.Launch(ctx, launchRequest(e.p, personalKey, false, "alice", "tok-123"))
+	if !errors.Is(err, engine.ErrHandover) || !strings.Contains(err.Error(), other.Name) {
+		t.Fatalf("launch next to another pod of the key: %v", err)
+	}
+	for _, a := range actionsOf(e) {
+		if a == "create pods" || a == "create secrets" {
+			t.Fatalf("%s next to another pod of the key", a)
+		}
+	}
+	if len(e.p.replayCh) != 1 {
+		t.Error("the pod of the key was not replayed to the manager")
+	}
+	// Pods of other keys do not matter.
+	bob := personalKey
+	bob.Owner = "bob"
+	if _, err := e.p.Launch(ctx, launchRequest(e.p, bob, false, "bob", "tok-456")); err != nil {
+		t.Fatalf("launch for another key: %v", err)
 	}
 }
 
