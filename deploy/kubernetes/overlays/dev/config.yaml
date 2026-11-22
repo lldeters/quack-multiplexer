@@ -78,7 +78,6 @@ profiles:
     #   kind load docker-image quackmux/duckdb-engine:2.0.0
     image: quackmux/duckdb-engine:2.0.0
     imagePullPolicy: IfNotPresent
-    database: ":memory:"
     settings:
       memory_limit: 700MB
       threads: "1"

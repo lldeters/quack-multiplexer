@@ -346,10 +346,11 @@ profiles:
     # Always | IfNotPresent | Never (without it: the podTemplate's, else
     # IfNotPresent)
     imagePullPolicy: IfNotPresent
-    # DuckDB database inside the engine. ":memory:" is lost with the pod; a
-    # file needs a volume of its own per engine key (see persistence; with
-    # persistence the default is <mountPath>/engine.duckdb).
-    database: ":memory:"
+    # DuckDB database inside the engine ("" = ":memory:", which is lost with
+    # the pod; with persistence <mountPath>/engine.duckdb on the data volume
+    # of the engine key). An explicit ":memory:" also applies with
+    # persistence (validate warns about it).
+    database: ""
     # SQL that runs before the Quack server starts (after settings), e.g.
     # ATTACH data sources or create views. A failing statement fails the
     # engine.
