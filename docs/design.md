@@ -223,10 +223,13 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
     `quackmux.io/leader=true` und die Löschkosten `controller.kubernetes.io/pod-deletion-cost: "100"`. Der
     Service des HA-Overlays wählt das Label zusätzlich aus; beim Herunterskalieren (Rollout) entfernt Kubernetes
     wegen der Löschkosten zuerst die Follower.
-  * Ein Follower ist ready, sobald er sich um die Lease bewirbt und die API bestätigt hat, dass sein Pod das
-    Label nicht trägt (ein Label eines früheren Containers entfernt er beim Start). Ein Pod, der das Label trägt,
-    aber nicht bedient, ist also nie ready, und der Service routet nur auf bereite Pods: Das Label lenkt, die
-    Readiness sichert ab. Die Readiness des Leaders hängt nie an Label-Patches.
+  * Ein Follower ist ready, sobald er sofort übernehmen könnte: Er bewirbt sich um die Lease, eine Anfrage an die
+    Lease ist gelungen (die letzte höchstens `2 × ha.leaseDuration` her), und die API hat bestätigt, dass sein Pod
+    das Label nicht trägt (ein Label eines früheren Containers entfernt er beim Start). Ein Leader ist erst ready,
+    wenn er bedient: Solange er die Lease verlängert, kann niemand sonst übernehmen; ein Leader, der nicht in den
+    Dienst findet (etwa ohne Rechte auf die Engine-Pods), fällt so auf. Ein Pod, der das Label trägt, aber nicht
+    bedient, ist nie ready, und der Service routet nur auf bereite Pods: Das Label lenkt, die Readiness sichert
+    ab. Die Readiness des Leaders hängt nie an Label-Patches.
   * Requests, die trotzdem bei einem Follower ankommen, beantwortet er mit HTTP 200 und `ERROR_RESPONSE`
     „quackmux: gateway is not ready: not the leader“, ohne den Body zu lesen oder etwas auszuführen.
   * Übernimmt ein Leader eine abgelaufene Lease, entfernt er das Label vom Pod des vorigen Halters
@@ -234,6 +237,9 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
     (`node-monitor-grace-period` des Node-Controllers).
   * Das Gateway muss dafür als Pod laufen und dessen Namen und Namespace kennen (`POD_NAME`, `POD_NAMESPACE` aus
     der Downward-API); sonst, oder wenn es seinen Pod nicht patchen darf, startet es mit `ha.enabled` nicht.
+    Ebenso wenig, wenn die API (per SelfSubjectAccessReview) verneint, dass es die Lease lesen, anlegen und
+    ändern und die Engine-Pods auflisten und beobachten darf: Ohne das könnte es nie bedienen. Ein Rollout mit
+    fehlenden Rechten oder falschem Namespace bleibt so stehen, statt die alten Pods zu ersetzen.
   * Verliert der Leader die Lease, beendet sich der Prozess und startet als Follower neu. Der neue Leader
     übernimmt per Discovery und Adoption. Die Sessions überleben.
 * **Veralteter Leader:** Friert der Leader ein (gestoppter Container oder VM, hängender Node), verlängert er die
@@ -258,9 +264,10 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   erst nach `3 × ha.retryPeriod` und ist erst dann ready. So übernimmt ein Follower, der schon wartet; ein
   Rollout entfernt den alten Leader erst, wenn seine Ersatz-Pods bereit sind. Bis kube-proxy die Regeln erneuert
   hat (`minSyncPeriod` 1 s), leitet er neue Verbindungen noch zum alten Pod. Der hält seinen Listener deshalb
-  noch `ha.deregistrationDelay` (3 s) nach dem Entfernen des Labels offen und beantwortet sie mit einem Fehler;
-  ein beendeter Pod ließe sie bis zum Timeout des Verbindungsaufbaus hängen (in kind gemessen; ein hängender
-  Heartbeat blockiert das `DETACH` des Clients).
+  noch `ha.deregistrationDelay` (3 s, höchstens die Hälfte von `server.shutdownTimeout`) nach dem Entfernen des
+  Labels offen und beantwortet sie mit einem Fehler; ein beendeter Pod ließe sie bis zum Timeout des
+  Verbindungsaufbaus hängen (in kind gemessen; ein hängender Heartbeat blockiert das `DETACH` des Clients).
+  `test/e2e/kind/ha.sh` prüft die Verzögerung am Log des alten Leaders (h2, h4).
 * **Laufende Requests beim Shutdown:** Das Gateway wartet bis zu `server.shutdownTimeout` auf laufende Requests.
   Kurz vor Ablauf (spätestens 5 s davor) beantwortet es Queries, die noch auf ihre Engine warten, mit einem
   Fehler („the gateway is shutting down“) und bricht sie auf der Engine per CANCEL ab. Ein Request, der beim

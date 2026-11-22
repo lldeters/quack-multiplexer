@@ -28,7 +28,9 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
-  # Leader election (ha.enabled).
+  # Leader election (ha.enabled). With it the gateway checks at start-up that
+  # it may get, create and update its lease and list and watch the engine
+  # pods, and does not start otherwise.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update]

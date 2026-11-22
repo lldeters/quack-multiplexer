@@ -86,9 +86,10 @@ spec:
               containerPort: 9495
               protocol: TCP
           # Ready once the engine registry is synced. With ha.enabled
-          # (overlays/ha) every healthy replica is ready: the leader, and a
-          # follower once it campaigns and its pod is known to carry no
-          # leader label; the Service selects the label of the leader.
+          # (overlays/ha) every healthy replica is ready: the leader once it
+          # serves, and a follower once it campaigns, has used the lease and
+          # its pod is known to carry no leader label; the Service selects
+          # the label of the leader.
           readinessProbe:
             httpGet:
               path: /readyz
