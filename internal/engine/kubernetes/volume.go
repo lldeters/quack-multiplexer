@@ -211,13 +211,16 @@ func (p *Provider) ensureDataClaim(ctx context.Context, req engine.LaunchRequest
 	return name, nil
 }
 
-// checkSoleEngine makes sure that no other pod of the key exists before the
-// pod of a persistent key is created; it asks the API server, not the cache.
-// The manager launches an engine for such a key only when its registry holds
-// no other engine of the key. This also covers the pods the registry does not
-// know: one that the initial List skipped because its token could not be
-// read, or one that another gateway process created. Such a pod is replayed
-// to the manager, which adopts it once its token can be read.
+// checkSoleEngine makes sure that no other pod of the key that mounts its
+// data volume exists before the pod of a persistent key is created; it asks
+// the API server, not the cache. The manager launches an engine for such a
+// key only when its registry holds no other engine of the key that uses the
+// volume. This also covers the pods the registry does not know: one that the
+// initial List skipped because its token could not be read, or one that
+// another gateway process created. Such a pod is replayed to the manager,
+// which adopts it once its token can be read. Pods of the key without the
+// volume (started before persistence was switched on for the profile) do
+// not count.
 func (p *Provider) checkSoleEngine(ctx context.Context, req engine.LaunchRequest) error {
 	sel := labels.SelectorFromSet(labels.Set{
 		LabelManagedBy: managedByValue, LabelInstance: p.instance, LabelKeyHash: req.Key.Hash(),
@@ -226,11 +229,12 @@ func (p *Provider) checkSoleEngine(ctx context.Context, req engine.LaunchRequest
 	if err != nil {
 		return fmt.Errorf("list the engine pods of key %s: %w", req.Key.String(), err)
 	}
+	claim := dataClaimName(p.instance, req.Key)
 	for i := range list.Items {
-		if pod := &list.Items[i]; pod.Name != req.ID {
+		if pod := &list.Items[i]; pod.Name != req.ID && mountsClaim(pod, claim) {
 			p.requestReplay(nil)
 			return fmt.Errorf("%w (engine pod %s exists; only one engine may mount data volume claim %s)",
-				engine.ErrHandover, pod.Name, dataClaimName(p.instance, req.Key))
+				engine.ErrHandover, pod.Name, claim)
 		}
 	}
 	return nil

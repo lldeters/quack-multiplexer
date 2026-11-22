@@ -583,3 +583,16 @@ func TestDeleteVolumeFence(t *testing.T) {
 		t.Fatalf("delete with a fresh lease: %v", err)
 	}
 }
+
+// A pod of the key that does not mount its data volume (an engine started
+// before persistence was switched on for the profile) does not keep the
+// first engine with the volume from starting: the manager drains it.
+func TestLaunchIgnoresPodOfKeyWithoutVolume(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	memory, _ := e.enginePod("quack-user-alice-memory", personalKey, false, "tok-old")
+	memory.Spec.Volumes = nil
+	e.add(t, memory)
+	if _, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123")); err != nil {
+		t.Fatalf("launch next to a pod of the key without the volume: %v", err)
+	}
+}

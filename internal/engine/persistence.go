@@ -29,6 +29,9 @@ import (
 //   - Launches for persistent keys, and the terminations and waits that make
 //     room for them, need a fresh leader lease (SetFence) and no deletion of
 //     the key's volume in progress (DeleteVolume).
+//   - All this concerns the engines that use the volume (mountsVolumeLocked).
+//     Engines of the profile without it, started before persistence was
+//     switched on, are drained like outdated engines of other profiles.
 //
 // The provider must report an engine gone only once no process of it can
 // still open the volume (the Kubernetes provider: the pod object is deleted,
@@ -107,6 +110,16 @@ func (m *Manager) persistent(profile string) bool {
 	return ok && p.Persistence != nil
 }
 
+// mountsVolumeLocked reports whether e is an engine of a persistent profile
+// that uses the data volume of its key: one this process launched (with the
+// profile it has now), or one whose instance mounts the volume. Engines of
+// the profile without it were started before persistence was switched on:
+// they take no sessions of the key (their data would be lost) and do not
+// hold up its successor, like engines of other profiles after a change.
+func (m *Manager) mountsVolumeLocked(e *engine) bool {
+	return m.persistent(e.ProfileName) && (e.Volume != "" || e.launched != nil)
+}
+
 // awaitPredecessorLocked runs with m.mu held when a session of a persistent
 // key found no engine to join. It returns (false, nil) with m.mu still held
 // when the key may get a new engine now. Otherwise it releases m.mu and
@@ -140,7 +153,7 @@ func (m *Manager) holderLocked(key Key) *engine {
 	var holder *engine
 	inRecovery := m.now().Before(m.recoveryUntil)
 	for _, e := range m.engines {
-		if e.Warm || e.Key != key {
+		if e.Warm || e.Key != key || !m.mountsVolumeLocked(e) {
 			continue
 		}
 		idle := e.Sessions == 0 && e.Reserved == 0 && e.inFlight.Load() == 0
@@ -195,9 +208,14 @@ func (m *Manager) persistentLaunchAllowedLocked(key Key) error {
 }
 
 // replacementDueLocked returns why a READY engine must be replaced, or "".
+// An engine of a persistent profile without the data volume is replaced
+// even with engine.replaceOnSpecChange off: it may not take sessions.
 func (m *Manager) replacementDueLocked(e *engine, now time.Time) string {
 	if max := m.cfg.EngineMaxLifetime(e.ProfileName); max > 0 && now.Sub(e.CreatedAt) > max {
 		return fmt.Sprintf("max lifetime %s reached", max)
+	}
+	if m.persistent(e.ProfileName) && !m.mountsVolumeLocked(e) {
+		return "it has no data volume (started before persistence was switched on for its profile)"
 	}
 	if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
 		return "profile changed"
@@ -248,7 +266,7 @@ func (m *Manager) Volumes(ctx context.Context) ([]Volume, error) {
 	}
 	m.mu.RLock()
 	for i := range vols {
-		vols[i].Engine = m.engineOfKeyLocked(vols[i].EngineKey)
+		vols[i].Engine = m.volumeEngineLocked(vols[i].EngineKey)
 	}
 	m.mu.RUnlock()
 	sort.Slice(vols, func(i, j int) bool { return vols[i].Name < vols[j].Name })
@@ -257,9 +275,19 @@ func (m *Manager) Volumes(ctx context.Context) ([]Volume, error) {
 
 // engineOfKeyLocked returns the id of an engine of key ("" if none).
 func (m *Manager) engineOfKeyLocked(key Key) string {
+	return m.oldestEngineLocked(key, func(*engine) bool { return true })
+}
+
+// volumeEngineLocked returns the id of the engine of key that uses its data
+// volume ("" if none).
+func (m *Manager) volumeEngineLocked(key Key) string {
+	return m.oldestEngineLocked(key, m.mountsVolumeLocked)
+}
+
+func (m *Manager) oldestEngineLocked(key Key, match func(*engine) bool) string {
 	var found *engine
 	for _, e := range m.engines {
-		if !e.Warm && e.Key == key && (found == nil || olderEngine(e, found)) {
+		if !e.Warm && e.Key == key && match(e) && (found == nil || olderEngine(e, found)) {
 			found = e
 		}
 	}

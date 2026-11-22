@@ -608,10 +608,13 @@ func (m *Manager) servesNewLocked(e *engine, key Key) bool {
 	if e.Warm || e.Key != key || (e.State != StateReady && e.State != StateStarting) {
 		return false
 	}
-	// The engine of a persistent key is the only one that may open its data
-	// volume, so it keeps taking sessions until it is replaced (Reconcile,
-	// replaceLocked).
-	return m.persistent(e.ProfileName) || m.specCurrentLocked(e) || !m.replaceOnSpecChange()
+	if m.persistent(e.ProfileName) {
+		// The engine of a persistent key is the only one that may open its
+		// data volume, so it keeps taking sessions until it is replaced
+		// (Reconcile, replaceLocked). One without the volume takes none.
+		return m.mountsVolumeLocked(e)
+	}
+	return m.specCurrentLocked(e) || !m.replaceOnSpecChange()
 }
 
 // olderEngine orders engines by creation, then by id.
@@ -1147,7 +1150,7 @@ func (m *Manager) Reconcile() {
 				continue // see maintainWarmPoolsLocked
 			}
 			if why := m.replacementDueLocked(e, now); why != "" {
-				if !m.persistent(e.ProfileName) {
+				if !m.mountsVolumeLocked(e) {
 					m.drainLocked(e, why)
 				} else if m.replaceLocked(e, why, now, idle && !protected) {
 					drainClose = append(drainClose, e.ID)

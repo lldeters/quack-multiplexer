@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -32,6 +33,9 @@ profiles:
 
 var personalKey = engine.Key{ShareLevel: engine.ShareUser, Owner: "alice", Subdomain: "default", Profile: "personal"}
 
+// aliceVolume is the data volume that the engines of personalKey mount.
+const aliceVolume = "quackmux-data-user-alice-default-personal"
+
 // guardedProvider wraps the fake provider. It records every launch for a key
 // while another instance of that key still exists (an overlap: two engines on
 // one data volume), it can hold back terminations like a pod in its grace
@@ -50,10 +54,14 @@ type guardedProvider struct {
 	entered  chan struct{}   // DeleteVolume signals here before it waits
 	gate     chan struct{}   // Launch waits for it if set (a slow API server)
 	fenced   map[string]bool // launches that carried a fence
+	// memoryOnly names instances that do not mount the data volume (started
+	// before persistence was switched on); they do not count as overlaps.
+	memoryOnly map[string]bool
 }
 
 func newGuarded() *guardedProvider {
-	return &guardedProvider{Provider: fake.New(), vols: map[string]engine.Volume{}, fenced: map[string]bool{}}
+	return &guardedProvider{Provider: fake.New(), vols: map[string]engine.Volume{}, fenced: map[string]bool{},
+		memoryOnly: map[string]bool{}}
 }
 
 func (g *guardedProvider) List(ctx context.Context) ([]engine.Instance, error) {
@@ -67,7 +75,7 @@ func (g *guardedProvider) Launch(ctx context.Context, req engine.LaunchRequest) 
 	live, _ := g.Provider.List(ctx)
 	g.mu.Lock()
 	for _, inst := range live {
-		if inst.Key == req.Key {
+		if inst.Key == req.Key && !g.memoryOnly[inst.ID] {
 			g.overlaps = append(g.overlaps, req.ID+" next to "+inst.ID)
 		}
 	}
@@ -191,7 +199,7 @@ func recoverOutdated(t *testing.T, g *guardedProvider, clock *testClock) string 
 	srv := g.AddReady(id, personalKey, "tok")
 	t.Cleanup(srv.Close)
 	g.list = []engine.Instance{{
-		ID: id, Key: personalKey, ProfileName: "personal", SpecHash: "old", Phase: engine.PhaseReady,
+		ID: id, Key: personalKey, ProfileName: "personal", SpecHash: "old", Phase: engine.PhaseReady, Volume: aliceVolume,
 		Endpoint: srv.URL(), Token: "tok", CreatedAt: clock.Now().Add(-time.Hour), User: "alice",
 	}}
 	return id
@@ -320,6 +328,59 @@ func TestPersistentConcurrentConnectsShareSuccessor(t *testing.T) {
 	g.checkNoOverlap(t)
 }
 
+// An engine of a persistent profile that does not mount the data volume (it
+// was started before persistence was switched on for its profile) takes no
+// new sessions of the key: their tables would live in memory and be lost.
+// It is drained like an outdated engine of another profile, also with
+// engine.replaceOnSpecChange off, and the next session gets an engine with
+// the volume at once instead of waiting for it.
+func TestPersistentEngineWithoutVolumeTakesNoSessions(t *testing.T) {
+	for _, replace := range []bool{true, false} {
+		t.Run(fmt.Sprintf("replaceOnSpecChange=%v", replace), func(t *testing.T) {
+			g := newGuarded()
+			g.vols[aliceVolume] = engine.Volume{Name: aliceVolume, Key: personalKey.String(), EngineKey: personalKey}
+			clock := newTestClock()
+			const old = "quack-user-alice-memory"
+			srv := g.AddReady(old, personalKey, "tok")
+			t.Cleanup(srv.Close)
+			g.memoryOnly[old] = true
+			g.list = []engine.Instance{{
+				ID: old, Key: personalKey, ProfileName: "personal", SpecHash: "old", Phase: engine.PhaseReady,
+				Endpoint: srv.URL(), Token: "tok", CreatedAt: clock.Now().Add(-time.Hour), User: "alice",
+			}}
+			yaml := persistentConfig
+			if !replace {
+				yaml = strings.Replace(yaml, "drainTimeout: 10m", "drainTimeout: 10m\n  replaceOnSpecChange: false", 1)
+			}
+			m, _ := startPersistent(t, g, clock, nil, yaml)
+			m.AttachAdopted(old, "session-from-before", "alice")
+			clock.Advance(10 * time.Minute) // past engine.recoveryGrace
+			m.Reconcile()
+			if v, _ := m.Get(old); v.State != engine.StateDraining || !strings.Contains(v.Message, "no data volume") {
+				t.Fatalf("engine without the data volume: %s %q", v.State, v.Message)
+			}
+			start := time.Now()
+			l, err := acquire(t, m, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			l.Commit()
+			if l.ID == old || g.Launches() != 1 || time.Since(start) > 3*time.Second {
+				t.Fatalf("new session on %s after %d launches and %s, want a new engine with the volume at once",
+					l.ID, g.Launches(), time.Since(start))
+			}
+			if s := state(m, old); s != engine.StateDraining {
+				t.Fatalf("the engine without the volume is %s, want DRAINING until its session ends", s)
+			}
+			vols, err := m.Volumes(context.Background())
+			if err != nil || len(vols) != 1 || vols[0].Engine != l.ID {
+				t.Fatalf("volumes %+v %v, want the volume used by %s", vols, err, l.ID)
+			}
+			g.checkNoOverlap(t)
+		})
+	}
+}
+
 // engine.maxLifetime replaces the engine of a persistent key like a profile
 // change: it keeps serving (instead of draining) until it is idle.
 func TestPersistentMaxLifetimeKeepsServing(t *testing.T) {
@@ -411,7 +472,7 @@ func TestPersistentFailedEngineMakesRoom(t *testing.T) {
 	srv := g.AddReady("quack-user-alice-failed", personalKey, "tok")
 	defer srv.Close()
 	g.list = []engine.Instance{{
-		ID: "quack-user-alice-failed", Key: personalKey, ProfileName: "personal", Phase: engine.PhaseFailed,
+		ID: "quack-user-alice-failed", Key: personalKey, ProfileName: "personal", Phase: engine.PhaseFailed, Volume: aliceVolume,
 		Token: "tok", CreatedAt: clock.Now(), Message: "pod is being deleted",
 	}}
 	m, _ := startPersistent(t, g, clock, nil, "")
@@ -565,7 +626,7 @@ func TestPersistentStaleLeaderLeavesHolderAlone(t *testing.T) {
 	srv := g.AddReady("quack-user-alice-failed", personalKey, "tok")
 	defer srv.Close()
 	g.list = []engine.Instance{{
-		ID: "quack-user-alice-failed", Key: personalKey, ProfileName: "personal", Phase: engine.PhaseFailed,
+		ID: "quack-user-alice-failed", Key: personalKey, ProfileName: "personal", Phase: engine.PhaseFailed, Volume: aliceVolume,
 		Token: "tok", CreatedAt: clock.Now(), Message: "pod is being deleted",
 	}}
 	var fresh atomic.Bool
@@ -736,7 +797,7 @@ func TestPersistentHolderRespectsRecoveryGrace(t *testing.T) {
 	srv := g.AddReady("quack-user-alice-recovered", personalKey, "tok")
 	defer srv.Close()
 	g.list = []engine.Instance{{
-		ID: "quack-user-alice-recovered", Key: personalKey, ProfileName: "personal", Phase: engine.PhaseReady,
+		ID: "quack-user-alice-recovered", Key: personalKey, ProfileName: "personal", Phase: engine.PhaseReady, Volume: aliceVolume,
 		Endpoint: srv.URL(), Token: "tok", CreatedAt: clock.Now().Add(-time.Hour),
 	}}
 	m, _ := startPersistent(t, g, clock, nil, strings.Replace(persistentConfig, "startupTimeout: 30s", "startupTimeout: 2s", 1))
