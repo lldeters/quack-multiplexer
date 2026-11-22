@@ -15,7 +15,9 @@
 #   h1  both replicas are ready; the leader alone carries the label
 #       quackmux.io/leader and is the only endpoint of the Service; a client
 #       that connects to the follower directly gets a Quack error
-#   h2  deleting the leader hands over within seconds; attachments survive
+#   h2  deleting the leader hands over within seconds; attachments survive;
+#       the old leader answers until ha.deregistrationDelay after it removed
+#       its label
 #   h3  a frozen leader (SIGSTOP) loses the lease and its label to the
 #       follower; when it resumes it steps down without closing the sessions
 #       it still knows and comes back as a ready follower
@@ -23,6 +25,7 @@
 #       status" succeeds) with exactly one handover, to a new pod
 #   h5  the PodDisruptionBudget lets the leader be evicted while the follower
 #       is ready (it hands over), but never the last ready replica
+#   h6  both clients detach cleanly
 #
 # Two clients of one user stay attached through all scenarios: one with the
 # default heartbeat timeout (60 s) and one with HEARTBEAT_TIMEOUT 5, whose
@@ -45,6 +48,10 @@
 #   HA_GAP_SECONDS     how long the Service may lack a ready endpoint during
 #                      an orderly handover (h2, h4, h5; default 8: a follower
 #                      tries every ha.retryPeriod plus jitter, up to 4.4 s)
+#   HA_DEREGISTRATION_SECONDS  ha.deregistrationDelay of the overlay under
+#                      test (default 3): how long a leader that shuts down
+#                      keeps its Quack listener open after it removed its
+#                      label (h2, h4)
 #   ADMIN_LOCAL_PORT   local port of the admin port-forward (default 19696)
 #   ATTACH_TIMEOUT     seconds an ATTACH may take (default 180)
 #   KEEP_HA=1          keep the HA deployment and the generated overlay (with
@@ -74,6 +81,7 @@ HA_LEASE=${HA_LEASE:-quackmux-default}
 HA_FREEZE_SECONDS=${HA_FREEZE_SECONDS:-45}
 HA_HANDOVER_SECONDS=${HA_HANDOVER_SECONDS:-12}
 HA_GAP_SECONDS=${HA_GAP_SECONDS:-8}
+HA_DEREGISTRATION_SECONDS=${HA_DEREGISTRATION_SECONDS:-3}
 LEADER_LABEL=quackmux.io/leader
 RUN_ID=${RUN_ID:-$(date +%s)}
 HA_USER=e2e-ha-$RUN_ID
@@ -91,6 +99,7 @@ SWITCHED=''
 FROZEN_NODE='' FROZEN_PID=''
 CLIENTS_OPEN=''
 GAP_PID='' GAP=''
+LOG_PID=''
 
 # Generated overlay ----------------------------------------------------------------
 
@@ -387,7 +396,7 @@ expect_gap() {
 # log_events FILE prints "TIME MESSAGE" for the leadership and shutdown events
 # in a gateway log (JSON lines).
 log_events() {
-	grep -E '"msg":"(shutting down|became leader|stopped leading|stopped campaigning|lost leadership|gateway ready|labelled this pod as the leader|the leader label is absent from this pod)"' "$1" |
+	grep -E '"msg":"(shutting down|became leader|stopped leading|stopped campaigning|lost leadership|gateway ready|labelled this pod as the leader|the leader label is absent from this pod|closing the Quack listener)"' "$1" |
 		sed -n 's/.*"time":"\([^"]*\)".*"msg":"\([^"]*\)".*/\1 \2/p'
 }
 
@@ -404,6 +413,61 @@ expect_before() {
 	bad "$4: '$2' (line ${a:-none}) does not come before '$3' (line ${b:-none})"
 	return 1
 }
+
+# log_seconds FILE MESSAGE prints the time of day in seconds, with the
+# fraction of the log, of the first line of FILE (a gateway log in JSON)
+# with the message MESSAGE; nothing if there is none.
+log_seconds() {
+	grep -F "\"msg\":\"$2\"" "$1" | head -n 1 |
+		sed -n 's/.*"time":"[0-9-]*T\([0-9]*\):\([0-9]*\):\([0-9.]*\)[^"]*".*/\1 \2 \3/p' |
+		awk '{ printf "%.6f\n", $1 * 3600 + $2 * 60 + $3 }'
+}
+
+# expect_deregistration FILE DESCRIPTION: the log of a leader that shut down
+# (FILE) shows that it kept its Quack listener open for at least
+# HA_DEREGISTRATION_SECONDS after it removed its label. Until kube-proxy has
+# caught up, new connections still go to the old pod; without the delay they
+# would hang in connect once it is gone (docs/design.md, "Geordnete
+# Übergabe").
+expect_deregistration() {
+	local removed closed d
+	removed=$(log_seconds "$1" "the leader label is absent from this pod")
+	closed=$(log_seconds "$1" "closing the Quack listener")
+	if [ -z "$removed" ] || [ -z "$closed" ]; then
+		bad "$2: the log lacks the removal of the label (${removed:-missing}) or the closing of the Quack listener (${closed:-missing})"
+		return 1
+	fi
+	d=$(awk -v a="$removed" -v b="$closed" 'BEGIN { d = b - a; if (d < 0) d += 86400; printf "%.3f\n", d }')
+	if awk -v d="$d" -v min="$HA_DEREGISTRATION_SECONDS" 'BEGIN { exit !(d >= min) }'; then
+		ok "$2 closed its Quack listener ${d}s after it removed its label (ha.deregistrationDelay ${HA_DEREGISTRATION_SECONDS}s)"
+		return 0
+	fi
+	bad "$2 closed its Quack listener ${d}s after it removed its label, before ha.deregistrationDelay (${HA_DEREGISTRATION_SECONDS}s) was over"
+	return 1
+}
+
+# log_follow POD FILE streams the log of POD to FILE from now on, until
+# log_stop (or the end of the pod).
+log_follow() {
+	log_stop
+	(
+		close_session_fds
+		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" logs -f "pod/$1" --since=5s
+	) >"$2" 2>&1 &
+	LOG_PID=$!
+}
+
+log_stop() {
+	if [ -n "$LOG_PID" ]; then
+		kill "$LOG_PID" 2>/dev/null || true
+		wait "$LOG_PID" 2>/dev/null || true
+		LOG_PID=''
+	fi
+}
+
+# closed_listener FILE succeeds once the gateway log FILE says that the Quack
+# listener closes.
+closed_listener() { grep -qF '"msg":"closing the Quack listener"' "$1"; }
 
 # Clients ----------------------------------------------------------------------------
 
@@ -469,16 +533,25 @@ expect_adopted() {
 	expect_eq "$(json_count "$list" engineId "\"$ENGINE_POD\"")" 2 "$1: both run on engine pod $ENGINE_POD" || return 1
 }
 
+# close_clients detaches every client and ends its CLI. It fails if a client
+# does not end cleanly, for instance because its DETACH hangs: a heartbeat
+# that hangs in connect to a pod that is gone blocks it.
 close_clients() {
-	local id rc
+	local id rc failed=''
 	for id in $CLIENTS_OPEN; do
 		rc=0
 		session_send "$id" "DETACH remote;
 SELECT '$id-detached' AS result;" && session_wait "$id" "$id-detached" 60 '' || rc=1
 		session_end "$id" || [ -n "$(eval "printf '%s' \"\${ERRORS_$id:-}\"")" ] || rc=1
-		[ "$rc" = 0 ] || warn "client $id did not end cleanly"
+		if [ "$rc" = 0 ]; then
+			ok "client $id detached and ended cleanly"
+		else
+			bad "client $id did not end cleanly"
+			failed=1
+		fi
 	done
 	CLIENTS_OPEN=''
+	[ -z "$failed" ]
 }
 
 # expect_follower_refuses POD: a client that connects to POD directly, not
@@ -586,6 +659,7 @@ cleanup() {
 	local rc=$?
 	trap - EXIT
 	gap_watch_kill
+	log_stop
 	if [ -n "$FROZEN_PID" ]; then
 		docker exec "$FROZEN_NODE" kill -CONT "$FROZEN_PID" 2>/dev/null || true
 	fi
@@ -651,7 +725,7 @@ scenario_election() {
 # campaigns only after 3 x ha.retryPeriod) and adopts the sessions of both
 # clients.
 scenario_delete_leader() {
-	local before=$E2E_WORK/h2.before old follower start took logpid transitions
+	local before=$E2E_WORK/h2.before old follower start took transitions
 	engine_pods >"$before" || return 1
 	one_leader || {
 		bad "no single leader"
@@ -668,11 +742,7 @@ SELECT 'c1-created' AS result;" || return 1
 	expect_both_attached h2-before || return 1
 	expect_sessions "$ADMIN_URL" "$HA_USER" 2 "the leader lists both sessions" || return 1
 	old=$LEADER follower=$FOLLOWER transitions=$(lease_transitions)
-	(
-		close_session_fds
-		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" logs -f "pod/$old" --since=5s
-	) >"$E2E_WORK/h2-old.log" 2>&1 &
-	logpid=$!
+	log_follow "$old" "$E2E_WORK/h2-old.log"
 	sleep 2
 	gap_watch_start h2
 	say "  kubectl delete pod $old (the leader) at $(date -u +%H:%M:%S)"
@@ -681,8 +751,8 @@ SELECT 'c1-created' AS result;" || return 1
 	wait_for 60 "another replica to take over" leader_other_than "$old" || return 1
 	took=$(($(now) - start))
 	expect_gap h2 "deleting the leader" || return 1
-	kill "$logpid" 2>/dev/null || true
-	wait "$logpid" 2>/dev/null || true
+	wait_for 30 "the old leader to close its Quack listener" closed_listener "$E2E_WORK/h2-old.log" || true
+	log_stop
 	kctl -n "$NS" logs "$NEW_LEADER" --since=2m >"$E2E_WORK/h2-new.log" 2>&1 || true
 	say "  old leader: $(log_events "$E2E_WORK/h2-old.log" | tr '\n' ';')"
 	say "  new leader: $(log_events "$E2E_WORK/h2-new.log" | tr '\n' ';')"
@@ -693,6 +763,7 @@ SELECT 'c1-created' AS result;" || return 1
 	ok "$NEW_LEADER leads ${took}s after the delete: the old leader released the lease"
 	expect_before "$E2E_WORK/h2-old.log" '"msg":"the leader label is absent from this pod"' '"msg":"stopped leading"' \
 		"the old leader removed its label before it released the lease" || return 1
+	expect_deregistration "$E2E_WORK/h2-old.log" "the old leader" || return 1
 	expect_eq "$NEW_LEADER" "$follower" "the waiting follower took over, not the pod that replaces the deleted one" || return 1
 	expect_eq "$(lease_transitions)" $((transitions + 1)) "the lease changed hands once" || return 1
 	wait_for 120 "two replicas with one leader again" one_leader || return 1
@@ -767,6 +838,7 @@ scenario_rollout() {
 		return 1
 	}
 	old_leader=$LEADER old_follower=$FOLLOWER old_hash=$(template_hash "$LEADER") transitions=$(lease_transitions)
+	log_follow "$old_leader" "$E2E_WORK/h4-old.log"
 	gap_watch_start h4
 	say "  kubectl rollout restart deployment/$DEPLOY"
 	start=$(now)
@@ -782,6 +854,10 @@ scenario_rollout() {
 	# left the Service (kubectl rollout status does not wait for that).
 	wait_for 60 "the old leader $old_leader to go" pod_gone "$old_leader" || return 1
 	wait_for 60 "the old follower $old_follower to go" pod_gone "$old_follower" || return 1
+	wait_for 10 "the log of the old leader to end" closed_listener "$E2E_WORK/h4-old.log" || true
+	log_stop
+	say "  old leader: $(log_events "$E2E_WORK/h4-old.log" | tr '\n' ';')"
+	expect_deregistration "$E2E_WORK/h4-old.log" "the old leader $old_leader" || return 1
 	if [ "$(template_hash "$LEADER")" = "$old_hash" ]; then
 		bad "the leader $LEADER still runs the old template"
 		return 1
@@ -876,6 +952,6 @@ else
 	bad "h3-h5 need the attachments of h2"
 	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h5"
 fi
-close_clients
+run_scenario h6 "both clients detach cleanly" close_clients
 
 summary "kind HA e2e" || exit 1
