@@ -596,3 +596,39 @@ func TestLaunchIgnoresPodOfKeyWithoutVolume(t *testing.T) {
 		t.Fatalf("launch next to a pod of the key without the volume: %v", err)
 	}
 }
+
+// The replacement deadline is an annotation of the engine pod; instances
+// read it back after a restart.
+func TestRecordReplacementDue(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	pod, _ := e.enginePod("quack-user-alice-abcde", personalKey, false, "tok")
+	e.add(t, pod)
+	ctx := context.Background()
+	due := time.Date(2026, 11, 22, 10, 30, 0, 0, time.UTC)
+	if err := e.p.RecordReplacementDue(ctx, pod.Name, due.In(time.FixedZone("CET", 3600))); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := e.client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if v := got.Annotations[AnnotationReplaceDue]; v != "2026-11-22T10:30:00Z" {
+		t.Fatalf("annotation %q", v)
+	}
+	if inst, err := instanceFromPod(got); err != nil || !inst.ReplaceDue.Equal(due) {
+		t.Fatalf("instance: %v %v", inst.ReplaceDue, err)
+	}
+	if err := e.p.RecordReplacementDue(ctx, pod.Name, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = e.client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if v, ok := got.Annotations[AnnotationReplaceDue]; ok {
+		t.Fatalf("annotation %q left after clearing", v)
+	}
+	if got.Annotations[AnnotationKey] != personalKey.String() {
+		t.Error("clearing the deadline touched other annotations")
+	}
+	if inst, _ := instanceFromPod(got); !inst.ReplaceDue.IsZero() {
+		t.Errorf("instance deadline %v after clearing", inst.ReplaceDue)
+	}
+	if err := e.p.RecordReplacementDue(ctx, "quack-user-nobody-x", due); err == nil {
+		t.Error("recording on a missing pod succeeded")
+	}
+}

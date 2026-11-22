@@ -5,6 +5,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +47,8 @@ func instanceFromPod(pod *corev1.Pod) (engine.Instance, error) {
 			volume = v.PersistentVolumeClaim.ClaimName
 		}
 	}
+	// An unreadable value counts as none: the deadline starts again.
+	replaceDue, _ := time.Parse(time.RFC3339, pod.Annotations[AnnotationReplaceDue])
 	return engine.Instance{
 		ID:          pod.Name,
 		Key:         key,
@@ -58,6 +61,7 @@ func instanceFromPod(pod *corev1.Pod) (engine.Instance, error) {
 		CreatedAt:   pod.CreationTimestamp.Time,
 		Message:     msg,
 		Volume:      volume,
+		ReplaceDue:  replaceDue,
 	}, nil
 }
 

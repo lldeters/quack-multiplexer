@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -99,9 +100,22 @@ type VolumeProvider interface {
 	DeleteVolume(ctx context.Context, name string, fence func() bool) error
 }
 
+// ReplacementRecorder is implemented by providers that can record on an
+// instance when its replacement fell due (Instance.ReplaceDue), so that the
+// replacement deadline of a persistent engine (replaceLocked) survives a
+// gateway restart. Otherwise every restart would grant an engine that keeps
+// getting new sessions another engine.drainTimeout. A zero time removes the
+// record.
+type ReplacementRecorder interface {
+	RecordReplacementDue(ctx context.Context, id string, due time.Time) error
+}
+
 // holderRecheck bounds a wait for the previous engine of a persistent key:
 // the wait re-evaluates the registry at least this often.
 const holderRecheck = time.Second
+
+// recordTimeout bounds recording a replacement deadline on an instance.
+const recordTimeout = 30 * time.Second
 
 // persistent reports whether a profile keeps a data volume per key. The
 // configuration does not change at runtime.
@@ -227,18 +241,26 @@ func (m *Manager) replacementDueLocked(e *engine, now time.Time) string {
 // replacement. Its successor may start only once it is gone, so it keeps
 // serving until it is idle and is terminated then. engine.drainTimeout after
 // the replacement fell due it is drained; the result is true then, and the
-// caller closes its sessions.
-func (m *Manager) replaceLocked(e *engine, why string, now time.Time, idle bool) bool {
+// caller closes its sessions. The moment it fell due is recorded on the
+// instance and read again after a restart (ReplacementRecorder): the
+// deadline does not move with gateway restarts. A recovered engine is left
+// alone during engine.recoveryGrace (protected), when its sessions may not
+// have re-attached yet.
+func (m *Manager) replaceLocked(e *engine, why string, now time.Time, idle, protected bool) bool {
 	if e.replaceSince.IsZero() {
 		e.replaceSince = now
-		m.log.Info("engine replacement pending: it is replaced once it has no sessions", "engine", e.ID,
-			"key", e.Key.String(), "reason", why, "sessions", e.Sessions,
-			"deadline", now.Add(m.cfg.Engine.DrainTimeout.Duration))
+		m.recordReplacementDue(e.ID, now)
 	}
 	// Every time: provider events may have replaced the message, which tells
 	// the operator why the engine still runs.
-	e.Message = "replacement pending: " + why
+	if msg := "replacement pending: " + why; e.Message != msg {
+		e.Message = msg
+		m.log.Info("engine replacement pending: it is replaced once it has no sessions", "engine", e.ID,
+			"key", e.Key.String(), "reason", why, "sessions", e.Sessions, "since", e.replaceSince,
+			"deadline", e.replaceSince.Add(m.cfg.Engine.DrainTimeout.Duration))
+	}
 	switch {
+	case protected:
 	case idle:
 		m.terminateLocked(e, "replaced: "+why)
 	case now.Sub(e.replaceSince) >= m.cfg.Engine.DrainTimeout.Duration:
@@ -246,6 +268,35 @@ func (m *Manager) replaceLocked(e *engine, why string, now time.Time, idle bool)
 		return true
 	}
 	return false
+}
+
+// replacementCancelledLocked forgets the replacement of a READY engine of a
+// persistent key that is no longer due: a restarted gateway found the record
+// of an earlier process, whose profile has been changed back since.
+func (m *Manager) replacementCancelledLocked(e *engine) {
+	m.log.Info("engine replacement no longer due", "engine", e.ID, "key", e.Key.String(), "since", e.replaceSince)
+	e.replaceSince = time.Time{}
+	if strings.HasPrefix(e.Message, "replacement pending: ") {
+		e.Message = ""
+	}
+	m.recordReplacementDue(e.ID, time.Time{})
+}
+
+// recordReplacementDue records on the instance when its replacement fell
+// due (zero: removes the record), in the background and best effort.
+func (m *Manager) recordReplacementDue(id string, due time.Time) {
+	rr, ok := m.prov.(ReplacementRecorder)
+	if !ok {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+		defer cancel()
+		if err := rr.RecordReplacementDue(ctx, id, due); err != nil {
+			m.log.Warn("recording the replacement deadline on the engine failed; a restart of the gateway restarts it",
+				"engine", id, "err", err)
+		}
+	}()
 }
 
 // Volumes lists the data volumes of the provider, each with the engine of

@@ -296,8 +296,10 @@ func (m *Manager) registerLocked(inst Instance, now time.Time, recovered bool) *
 		Message:     inst.Message,
 		Recovered:   recovered,
 		Volume:      inst.Volume,
-		ready:       make(chan struct{}),
-		gone:        make(chan struct{}),
+		// Recorded by an earlier gateway process (see replaceLocked).
+		replaceSince: inst.ReplaceDue,
+		ready:        make(chan struct{}),
+		gone:         make(chan struct{}),
 	}
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = now
@@ -1152,10 +1154,13 @@ func (m *Manager) Reconcile() {
 			if why := m.replacementDueLocked(e, now); why != "" {
 				if !m.mountsVolumeLocked(e) {
 					m.drainLocked(e, why)
-				} else if m.replaceLocked(e, why, now, idle && !protected) {
+				} else if m.replaceLocked(e, why, now, idle, protected) {
 					drainClose = append(drainClose, e.ID)
 				}
 				continue
+			}
+			if !e.replaceSince.IsZero() {
+				m.replacementCancelledLocked(e)
 			}
 			if s := serving[e.Key]; s != nil && s != e {
 				m.drainLocked(e, "duplicate engine: "+s.ID+" serves "+e.Key.String())

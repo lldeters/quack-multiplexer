@@ -57,11 +57,14 @@ type guardedProvider struct {
 	// memoryOnly names instances that do not mount the data volume (started
 	// before persistence was switched on); they do not count as overlaps.
 	memoryOnly map[string]bool
+	// dues holds the recorded replacement deadlines; dueCalls the calls.
+	dues     map[string]time.Time
+	dueCalls []string
 }
 
 func newGuarded() *guardedProvider {
 	return &guardedProvider{Provider: fake.New(), vols: map[string]engine.Volume{}, fenced: map[string]bool{},
-		memoryOnly: map[string]bool{}}
+		memoryOnly: map[string]bool{}, dues: map[string]time.Time{}}
 }
 
 func (g *guardedProvider) List(ctx context.Context) ([]engine.Instance, error) {
@@ -104,6 +107,25 @@ func (g *guardedProvider) Terminate(ctx context.Context, id, reason string) erro
 	}
 	g.mu.Unlock()
 	return g.Provider.Terminate(ctx, id, reason)
+}
+
+func (g *guardedProvider) RecordReplacementDue(_ context.Context, id string, due time.Time) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if due.IsZero() {
+		delete(g.dues, id)
+		g.dueCalls = append(g.dueCalls, "clear "+id)
+	} else {
+		g.dues[id] = due
+		g.dueCalls = append(g.dueCalls, "record "+id)
+	}
+	return nil
+}
+
+func (g *guardedProvider) due(id string) time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.dues[id]
 }
 
 // release lets held terminations finish (the pods disappear).
@@ -462,6 +484,89 @@ func TestPersistentReplacementDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.checkNoOverlap(t)
+}
+
+// The moment the replacement of a persistent engine fell due is recorded on
+// the instance, and a restarted gateway keeps the deadline: otherwise every
+// restart (a profile change, a failover) would grant an engine that keeps
+// getting new sessions another engine.drainTimeout, without end. During
+// engine.recoveryGrace the restarted gateway leaves it alone, then drains
+// it and closes its sessions at once.
+func TestPersistentReplacementDeadlineSurvivesRestart(t *testing.T) {
+	g := newGuarded()
+	clock := newTestClock()
+	old := recoverOutdated(t, g, clock)
+	m, _ := startPersistent(t, g, clock, nil, "")
+	m.AttachAdopted(old, "session-1", "alice")
+	clock.Advance(10 * time.Minute) // past engine.recoveryGrace
+	m.Reconcile()
+	due := clock.Now()
+	waitUntil(t, "the replacement deadline recorded on the instance", func() bool { return g.due(old).Equal(due) })
+
+	// The gateway restarts 9 minutes later (engine.drainTimeout is 10m) and
+	// finds the record on the instance.
+	clock.Advance(9 * time.Minute)
+	g2 := newGuarded()
+	srv := g2.AddReady(old, personalKey, "tok")
+	t.Cleanup(srv.Close)
+	inst := g.list[0]
+	inst.Endpoint, inst.ReplaceDue = srv.URL(), g.due(old)
+	g2.list = []engine.Instance{inst}
+	m2, rec := startPersistent(t, g2, clock, nil, "")
+	m2.AttachAdopted(old, "session-1", "alice")
+	m2.Reconcile()
+	if v, _ := m2.Get(old); v.State != engine.StateReady || !strings.Contains(v.Message, "replacement pending") {
+		t.Fatalf("during the recovery grace: %s %q", v.State, v.Message)
+	}
+	clock.Advance(4 * time.Minute) // past the recovery grace (3m) and the deadline
+	m2.Reconcile()
+	if s := state(m2, old); s != engine.StateDraining {
+		t.Fatalf("engine past its recorded deadline is %s, want DRAINING", s)
+	}
+	rec.mu.Lock()
+	drained := strings.Join(rec.drain, ",")
+	rec.mu.Unlock()
+	if drained != old {
+		t.Fatalf("sessions closed for %q, want %s", drained, old)
+	}
+	g2.mu.Lock()
+	defer g2.mu.Unlock()
+	if len(g2.dueCalls) != 0 {
+		t.Errorf("the restarted gateway recorded a new deadline (%v) instead of keeping %s", g2.dueCalls, due)
+	}
+}
+
+// A record of an earlier gateway process whose replacement is no longer due
+// (the profile was changed back) is removed: a later replacement starts its
+// own deadline instead of being overdue at once.
+func TestPersistentReplacementRecordClearedWhenNoLongerDue(t *testing.T) {
+	g := newGuarded()
+	clock := newTestClock()
+	const id = "quack-user-alice-current"
+	srv := g.AddReady(id, personalKey, "tok")
+	t.Cleanup(srv.Close)
+	g.list = []engine.Instance{{
+		ID: id, Key: personalKey, ProfileName: "personal", Phase: engine.PhaseReady, Volume: aliceVolume,
+		Endpoint: srv.URL(), Token: "tok", CreatedAt: clock.Now().Add(-2 * time.Hour), User: "alice",
+		ReplaceDue: clock.Now().Add(-time.Hour), Message: "replacement pending: profile changed",
+	}}
+	m, rec := startPersistent(t, g, clock, nil, "")
+	m.AttachAdopted(id, "session-1", "alice")
+	clock.Advance(10 * time.Minute)
+	m.Reconcile()
+	waitUntil(t, "the record removed", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return strings.Join(g.dueCalls, ",") == "clear "+id
+	})
+	if v, _ := m.Get(id); v.State != engine.StateReady || v.Message != "" {
+		t.Fatalf("engine whose replacement is no longer due: %s %q", v.State, v.Message)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.drain) != 0 {
+		t.Fatalf("sessions closed: %v", rec.drain)
+	}
 }
 
 // A failed engine of a persistent key (kept for engine.failedRetention

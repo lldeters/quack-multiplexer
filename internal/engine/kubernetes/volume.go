@@ -376,3 +376,26 @@ func mountsClaim(pod *corev1.Pod, claim string) bool {
 	}
 	return false
 }
+
+var _ engine.ReplacementRecorder = (*Provider)(nil)
+
+// RecordReplacementDue implements engine.ReplacementRecorder: it annotates
+// the engine pod with the moment its replacement fell due
+// (AnnotationReplaceDue), or removes the annotation for a zero time.
+func (p *Provider) RecordReplacementDue(ctx context.Context, id string, due time.Time) error {
+	var value any // JSON null removes the annotation (merge patch)
+	if !due.IsZero() {
+		value = due.UTC().Format(time.RFC3339)
+	}
+	data, err := json.Marshal(map[string]any{"metadata": map[string]any{
+		"annotations": map[string]any{AnnotationReplaceDue: value},
+	}})
+	if err != nil {
+		return err
+	}
+	if _, err := p.client.CoreV1().Pods(p.namespace).Patch(ctx, id, types.MergePatchType, data,
+		metav1.PatchOptions{FieldManager: eventComponent}); err != nil {
+		return fmt.Errorf("record the replacement deadline on engine pod %s: %w", id, err)
+	}
+	return nil
+}

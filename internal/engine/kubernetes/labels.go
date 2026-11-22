@@ -30,6 +30,10 @@ const (
 	// AnnotationLastLaunch on a data volume claim records the last launch
 	// of an engine with that volume (RFC 3339).
 	AnnotationLastLaunch = "quackmux.io/last-launch"
+	// AnnotationReplaceDue on the pod of a persistent engine records when
+	// its replacement fell due (RFC 3339), so that the deadline survives a
+	// gateway restart (engine.ReplacementRecorder).
+	AnnotationReplaceDue = "quackmux.io/replace-due"
 
 	// annotationDefaultContainer makes kubectl logs/exec pick the engine
 	// container when a pod template adds sidecars.

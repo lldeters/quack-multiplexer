@@ -50,6 +50,10 @@ type Instance struct {
 	// Volume names the data volume of an engine of a persistent profile
 	// (the PersistentVolumeClaim its pod mounts); empty otherwise.
 	Volume string
+	// ReplaceDue is when the replacement of an engine of a persistent
+	// profile fell due, as recorded on the instance (see
+	// ReplacementRecorder); zero if it did not.
+	ReplaceDue time.Time
 }
 
 // LaunchRequest asks a provider to start an engine.
