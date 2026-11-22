@@ -252,21 +252,35 @@ func (l *Labeler) Status() string {
 	return s
 }
 
+// ReasonSteppingDown is why a replica that led in its current term, and
+// whose lease is no longer fresh, neither serves nor reports ready: its term
+// ended, or it resumed after a freeze and its watchdog is about to end it.
+// It restarts as a follower.
+const ReasonSteppingDown = "stepping down: the lease is no longer fresh"
+
 // StandbyReady is the readiness of a replica with leader election that does
-// not serve (a follower, a leader that is starting up, or one that steps
-// down): ready once the label is confirmed absent from its pod, so that the
-// Service cannot route to it, and once it campaigns, so that it can take over
-// at once. A leader that steps down (Elector.SteppingDown) is never ready: it
-// is about to restart. A replica that serves is ready without asking.
+// not serve. Only a follower that could take over at once is ready: it
+// campaigns for the lease (after the campaign delay of a fresh process), a
+// request for the lease succeeded recently (it may use the lease, and the
+// API server answers it), and the label is confirmed absent from its pod,
+// so that the Service cannot route to it. A leader is no standby: nobody
+// else may take the lease over while it renews it. So a leader that does not
+// serve yet (its engine registry has not synced) is not ready, and neither is
+// one that steps down (Elector.SteppingDown), which is about to restart. A
+// replica that serves is ready without asking.
 func StandbyReady(e *Elector, l *Labeler) (bool, string) {
-	if e.SteppingDown() {
-		return false, "stepping down: the lease is no longer fresh"
-	}
-	if !l.Absent() {
+	switch {
+	case e.SteppingDown():
+		return false, ReasonSteppingDown
+	case e.IsLeader():
+		return false, "leading, but not serving yet"
+	case !l.Absent():
 		return false, "label " + LeaderLabel + " of pod " + l.Pod() + " " + l.Status()
-	}
-	if !e.Campaigning() {
+	case !e.Campaigning():
 		return false, "waiting to campaign for leadership"
+	}
+	if ok, why := e.leaseUsable(); !ok {
+		return false, why
 	}
 	return true, ""
 }

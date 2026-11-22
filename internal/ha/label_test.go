@@ -584,6 +584,21 @@ func TestRemoveStale(t *testing.T) {
 	})
 }
 
+// tracker gives e the lease tracker of a Run that is not running.
+func tracker(e *Elector) *renewTracker {
+	tr := newRenewTracker(&resourcelock.LeaseLock{LockConfig: resourcelock.ResourceLockConfig{Identity: e.Identity()}})
+	e.renew.Store(tr)
+	return tr
+}
+
+// answered gives e a tracker that records a successful request for the
+// lease, as client-go makes them while it campaigns.
+func answered(e *Elector) *renewTracker {
+	tr := tracker(e)
+	tr.answer(nil)
+	return tr
+}
+
 func TestStandbyReady(t *testing.T) {
 	e := newElector(t, fake.NewSimpleClientset(), "gw-a", shortTimings(), nil)
 	var want atomic.Bool
@@ -598,18 +613,103 @@ func TestStandbyReady(t *testing.T) {
 		t.Fatalf("not campaigning: %v %q", ok, why)
 	}
 	e.campaigning.Store(true)
+	tr := tracker(e)
+	if ok, why := StandbyReady(e, l); ok || !strings.Contains(why, "has succeeded yet") {
+		t.Fatalf("no request for the lease yet: %v %q", ok, why)
+	}
+	tr.answer(nil)
 	if ok, why := StandbyReady(e, l); !ok || why != "" {
 		t.Fatalf("ready follower: %v %q", ok, why)
 	}
+
 	// A leader whose lease went stale (it resumed after a freeze) steps
 	// down: never ready, although its label is absent and it campaigns.
-	tr := newRenewTracker(&resourcelock.LeaseLock{LockConfig: resourcelock.ResourceLockConfig{Identity: "gw-a"}})
+	tr.base = time.Now().Add(-time.Minute)
+	tr.answer(nil)
 	tr.led.Store(true)
 	tr.observe(time.Since(tr.base)-2*e.renewDeadline, resourcelock.LeaderElectionRecord{HolderIdentity: "gw-a"}, nil)
-	e.renew.Store(tr)
+	if since, ok := tr.sinceRenew(); !ok || since <= e.renewDeadline {
+		t.Fatalf("the tracker has no stale renewal: %s, %v", since, ok)
+	}
 	e.setLeader(true)
-	if ok, why := StandbyReady(e, l); ok || !strings.Contains(why, "stepping down") {
+	if ok, why := StandbyReady(e, l); ok || why != ReasonSteppingDown {
 		t.Fatalf("stale leader: %v %q", ok, why)
+	}
+	// The same once its term has ended.
+	e.setLeader(false)
+	if ok, why := StandbyReady(e, l); ok || why != ReasonSteppingDown {
+		t.Fatalf("former leader: %v %q", ok, why)
+	}
+}
+
+// A follower that campaigns but whose every request for the lease is refused
+// (no Role in the namespace of the lease) could never take over: it is not
+// ready, and it says why. Once a request succeeds it is.
+func TestStandbyReadyNeedsTheLease(t *testing.T) {
+	client := fake.NewSimpleClientset(gatewayPod(testPod, false))
+	var refused atomic.Bool
+	refused.Store(true)
+	var calls atomic.Int32
+	client.PrependReactor("*", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		calls.Add(1)
+		if refused.Load() {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"},
+				testLease, errors.New("RBAC: no access to leases"))
+		}
+		return false, nil, nil
+	})
+	e := newElector(t, client, testPod, shortTimings(), nil)
+	e.campaignDelay = 0
+	var want atomic.Bool
+	l := newLabeler(t, client, &want, nil)
+	if err := l.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c := start(t, e, true)
+	waitFor(t, "requests for the lease", func() bool { return calls.Load() >= 3 })
+	ok, why := StandbyReady(e, l)
+	if ok || !e.Campaigning() || !strings.Contains(why, "has succeeded yet") || !strings.Contains(why, "no access to leases") {
+		t.Fatalf("every request refused: campaigning %v, StandbyReady %v %q", e.Campaigning(), ok, why)
+	}
+	refused.Store(false)
+	c.waitLeading(t) // the lease is free: the follower takes it at once
+	if err := c.stop(t); err != nil {
+		t.Fatal(err)
+	}
+
+	// A follower that read the lease once, but not for longer than the
+	// standby window, is not ready either.
+	f := newElector(t, client, otherPod, shortTimings(), nil)
+	f.campaigning.Store(true)
+	tr := answered(f)
+	if ok, why := StandbyReady(f, l); !ok {
+		t.Fatalf("follower that just read the lease: %q", why)
+	}
+	tr.base = tr.base.Add(-f.standbyWindow - time.Second)
+	msg := "injected: API server unreachable"
+	tr.failure.Store(&msg)
+	if ok, why := StandbyReady(f, l); ok || !strings.Contains(why, "has succeeded for") || !strings.Contains(why, msg) {
+		t.Fatalf("follower without a recent answer: %v %q", ok, why)
+	}
+}
+
+// A leader holds the lease and renews it, so nobody else can take over: while
+// it does not serve (its engine registry has not synced, for instance because
+// it may not watch the engine pods) it is no standby and not ready.
+func TestStandbyReadyLeaderIsNoStandby(t *testing.T) {
+	client := fake.NewSimpleClientset(gatewayPod(testPod, false))
+	e := newElector(t, client, testPod, shortTimings(), nil)
+	e.campaignDelay = 0
+	var serving atomic.Bool // never true: the leader is stuck starting up
+	l := newLabeler(t, client, &serving, nil)
+	if err := l.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c := start(t, e, true)
+	c.waitLeading(t)
+	waitFor(t, "a fresh lease", e.Fresh)
+	if ok, why := StandbyReady(e, l); ok || !strings.Contains(why, "leading") {
+		t.Fatalf("leader that does not serve: StandbyReady %v %q", ok, why)
 	}
 }
 
