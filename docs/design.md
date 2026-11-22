@@ -201,10 +201,13 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 * Persistente Profile (Abschnitt 7): höchstens eine Engine pro Schlüssel, in jedem Zustand. Eine Nachfolgerin
   startet erst, wenn die vorige GONE ist. Fällig gewordene Engines (Spec geändert, `maxLifetime`) nehmen weiter
   Sessions an, auch neue, enden, sobald sie idle sind (wiedergefundene frühestens nach `recoveryGrace`), und
-  werden `drainTimeout` nach der Fälligkeit gedrained. Eine neue Session ohne bedienende Engine wartet im Rahmen
-  von `startupTimeout`, bis die vorige Engine GONE ist, sonst scheitert sie mit „the previous engine of this key
-  still holds its data volume“; FAILED-Engines beendet sie dafür sofort. Starten, dafür beenden und warten darf
-  nur ein Gateway mit frischer Lease (Abschnitt 6).
+  werden `drainTimeout` nach der Fälligkeit gedrained. Den Zeitpunkt der Fälligkeit vermerkt das Gateway an der
+  Engine (Pod-Annotation `quackmux.io/replace-due`), ein Neustart verschiebt die Frist also nicht. Eine neue
+  Session ohne bedienende Engine wartet im Rahmen von `startupTimeout`, bis die vorige Engine GONE ist, sonst
+  scheitert sie mit „the previous engine of this key still holds its data volume“; FAILED-Engines beendet sie
+  dafür sofort. Starten, dafür beenden und warten darf nur ein Gateway mit frischer Lease (Abschnitt 6). All das
+  gilt für Engines, die das Volume nutzen; Engines des Profils ohne Volume (vor dem Einschalten von
+  `persistence` gestartet) nehmen keine Sessions an und werden gedrained wie veraltete Engines anderer Profile.
 * Pod-Ereignisse kommen über einen Informer: Ready, Failed, gelöscht, `ImagePullBackOff` usw. Wird ein Pod extern
   gelöscht oder stürzt er ab, gehen seine Sessions auf CLOSED („engine terminated“). Folge-Requests bekommen
   `must_invalidate`.
@@ -279,11 +282,15 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   gerade gelöscht wird oder `Lost` ist, auch nicht. Der Manager hält höchstens eine Engine pro Schlüssel
   (Abschnitt 5.2); als GONE gilt eine Engine erst, wenn ihr Pod-Objekt gelöscht ist, also nach dem Stopp der
   Container und dem Aushängen der Volumes, und nie, solange ihr Launch noch läuft. Direkt vor dem Pod prüft der
-  Provider in der API, dass kein anderer Pod des Schlüssels existiert (auch keiner, den die Registry nicht kennt),
-  und mit HA ein letztes Mal die Lease. ReadWriteOncePod (Default) lässt den Scheduler zusätzlich keinen zweiten
-  Pod mit dem Claim einplanen; `spec.nodeName`, das den Scheduler umgeht, lehnt die Validierung ab. Erzwungenes
-  Löschen eines Pods und ein Node-Ausfall sind die Grenzen (deploy/kubernetes/README.md, „Persistente Daten“).
-  Andere Provider lehnen `persistence` ab.
+  Provider in der API, dass kein anderer Pod des Schlüssels mit dem Claim existiert (auch keiner, den die Registry
+  nicht kennt). Mit HA prüft er die Lease vor dem Request und noch einmal im Transport, unmittelbar bevor der
+  Request gesendet wird: Das clientseitige Rate-Limit von client-go kann ihn sonst sekundenlang zurückhalten. Die
+  Leader-Election hat einen eigenen Client mit eigenem Rate-Limit. ReadWriteOncePod (Default) lässt den Scheduler
+  zusätzlich keinen zweiten Pod mit dem Claim einplanen; `spec.nodeName`, das den Scheduler umgeht, lehnt die
+  Validierung ab, ebenso Mounts des Templates auf oder unter `mountPath`. Erzwungenes Löschen eines Pods, ein
+  Node-Ausfall, ein eigener Scheduler ohne die ReadWriteOncePod-Prüfung und mit HA die Bearbeitungszeit eines
+  schon gesendeten Requests sind die Grenzen (deploy/kubernetes/README.md, „Persistente Daten“). Andere Provider
+  lehnen `persistence` ab.
 * Grace Period beim Löschen: `provider.kubernetes.deleteGracePeriod` (Default 30 s, mindestens 1 s). Das Gateway
   setzt `QUACKMUX_STOP_TIMEOUT` der Engine auf 5 s weniger (mindestens 1 s), damit der Entrypoint DuckDB samt
   Checkpoint stoppt, bevor das Kubelet den Container tötet.
@@ -351,8 +358,9 @@ Weitere Provider:
   * `GET /api/v1/engines`
   * `POST /api/v1/engines/{id}/drain`
   * `DELETE /api/v1/engines/{id}`
-  * `GET /api/v1/volumes[?owner=]`, `DELETE /api/v1/volumes/{name}` (Daten-Volumes persistenter Profile; Löschen
-    nur ohne Engine des Schlüssels und nur auf dem Leader)
+  * `GET /api/v1/volumes[?owner=]`, `DELETE /api/v1/volumes/{name}` (Daten-Volumes persistenter Profile; beides
+    nur auf dem Leader mit vollständiger Registry; Löschen nur, solange weder eine Engine des Schlüssels noch ein
+    anderer Pod den Claim nutzt, was der Provider in der API prüft)
   * `/healthz`, `/readyz`, `/metrics` (Prometheus)
 * **Metriken:**
   * `quackmux_sessions{share_level,profile}` und `quackmux_sessions_opened_total`,
