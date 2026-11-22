@@ -314,7 +314,10 @@ pf_stop() {
 	fi
 }
 
-# pf_start POD (re)starts the port-forward to the admin port of POD.
+# pf_start POD (re)starts the port-forward to the admin port of POD. It
+# fails if kubectl could not listen on 127.0.0.1:ADMIN_LOCAL_PORT: another
+# process on that port (another cluster's port-forward) would answer in its
+# place.
 pf_start() {
 	pf_stop
 	(
@@ -322,7 +325,9 @@ pf_start() {
 		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" port-forward "pod/$1" "$ADMIN_LOCAL_PORT:9495"
 	) >"$E2E_WORK/port-forward.log" 2>&1 &
 	PF_PID=$!
-	if ! wait_for 30 "the admin API of $1 through kubectl port-forward" curl -fsS "$ADMIN_URL/healthz"; then
+	if ! wait_for 30 "kubectl port-forward to listen on 127.0.0.1:$ADMIN_LOCAL_PORT (set ADMIN_LOCAL_PORT to a free port)" \
+		grep -qF "Forwarding from 127.0.0.1:$ADMIN_LOCAL_PORT " "$E2E_WORK/port-forward.log" ||
+		! wait_for 30 "the admin API of $1 through kubectl port-forward" curl -fsS "$ADMIN_URL/healthz"; then
 		indent "$E2E_WORK/port-forward.log"
 		return 1
 	fi
