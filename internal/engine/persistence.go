@@ -89,8 +89,11 @@ type VolumeProvider interface {
 	// Volumes lists the data volumes of this gateway instance.
 	Volumes(ctx context.Context) ([]Volume, error)
 	// DeleteVolume deletes a data volume of this gateway instance. It returns
-	// ErrVolumeNotFound for names that are not one.
-	DeleteVolume(ctx context.Context, name string) error
+	// ErrVolumeNotFound for names that are not one, and ErrVolumeInUse while
+	// an instance of its key or anything else uses it, also one the registry
+	// does not know. fence, if set, must report true right before the volume
+	// is deleted; otherwise DeleteVolume fails with ErrNotLeader.
+	DeleteVolume(ctx context.Context, name string, fence func() bool) error
 }
 
 // holderRecheck bounds a wait for the previous engine of a persistent key:
@@ -228,11 +231,16 @@ func (m *Manager) replaceLocked(e *engine, why string, now time.Time, idle bool)
 }
 
 // Volumes lists the data volumes of the provider, each with the engine of
-// its key if one exists. Providers without data volumes have none.
+// its key if one exists. Providers without data volumes have none. Like
+// DeleteVolume it needs a fresh leader lease and a synced registry: a
+// follower knows no engines, and its list would show every volume unused.
 func (m *Manager) Volumes(ctx context.Context) ([]Volume, error) {
 	vp, ok := m.prov.(VolumeProvider)
 	if !ok {
 		return nil, nil
+	}
+	if err := m.volumeRegistryReady(); err != nil {
+		return nil, err
 	}
 	vols, err := vp.Volumes(ctx)
 	if err != nil {
@@ -261,21 +269,32 @@ func (m *Manager) engineOfKeyLocked(key Key) string {
 	return found.ID
 }
 
+// volumeRegistryReady reports whether this gateway can tell which engines
+// use which volumes: only the leader runs the registry, and before the
+// initial recovery the registry may not know every engine yet.
+func (m *Manager) volumeRegistryReady() error {
+	if m.fence != nil && !m.fence() {
+		return ErrNotLeader
+	}
+	if !m.Synced() {
+		return ErrNotSynced
+	}
+	return nil
+}
+
 // DeleteVolume deletes the data volume name. It refuses (ErrVolumeInUse)
 // while an engine of the volume's key exists, and no engine is launched for
-// the key while the deletion request runs. It needs a fresh leader lease and
-// a synced registry: only the leader launches engines, and before the
-// initial recovery the registry may not know every engine yet.
+// the key while the deletion request runs. The provider refuses as well
+// while a pod uses the volume, also one the registry does not know, and
+// checks the fence once more right before the delete. It needs a fresh
+// leader lease and a synced registry (volumeRegistryReady).
 func (m *Manager) DeleteVolume(ctx context.Context, name string) (Volume, error) {
 	vp, ok := m.prov.(VolumeProvider)
 	if !ok {
 		return Volume{}, ErrVolumeNotFound
 	}
-	if m.fence != nil && !m.fence() {
-		return Volume{}, ErrNotLeader
-	}
-	if !m.Synced() {
-		return Volume{}, ErrNotSynced
+	if err := m.volumeRegistryReady(); err != nil {
+		return Volume{}, err
 	}
 	vols, err := vp.Volumes(ctx)
 	if err != nil {
@@ -308,7 +327,7 @@ func (m *Manager) DeleteVolume(ctx context.Context, name string) (Volume, error)
 		}
 		m.mu.Unlock()
 	}()
-	if err := vp.DeleteVolume(ctx, name); err != nil {
+	if err := vp.DeleteVolume(ctx, name, m.fence); err != nil {
 		return *v, err
 	}
 	v.Deleting = true

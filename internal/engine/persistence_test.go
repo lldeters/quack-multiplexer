@@ -134,7 +134,7 @@ func (g *guardedProvider) Volumes(context.Context) ([]engine.Volume, error) {
 	return out, nil
 }
 
-func (g *guardedProvider) DeleteVolume(_ context.Context, name string) error {
+func (g *guardedProvider) DeleteVolume(_ context.Context, name string, fence func() bool) error {
 	g.mu.Lock()
 	block, entered := g.block, g.entered
 	g.mu.Unlock()
@@ -143,6 +143,10 @@ func (g *guardedProvider) DeleteVolume(_ context.Context, name string) error {
 	}
 	if block != nil {
 		<-block
+	}
+	// Like the Kubernetes provider: the fence right before the delete.
+	if fence != nil && !fence() {
+		return engine.ErrNotLeader
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -656,6 +660,59 @@ func TestDeleteVolume(t *testing.T) {
 	}
 	l.Commit()
 	g.checkNoOverlap(t)
+}
+
+// The manager hands its fence to the provider, which checks it right before
+// the delete: a lease that goes stale while the deletion is under way
+// deletes nothing.
+func TestDeleteVolumeFencedUntilDelete(t *testing.T) {
+	g := newGuarded()
+	g.vols["vol-alice"] = engine.Volume{Name: "vol-alice", Key: personalKey.String(), EngineKey: personalKey}
+	var fresh atomic.Bool
+	fresh.Store(true)
+	m, _ := startPersistent(t, g, newTestClock(), fresh.Load, "")
+	block, entered := make(chan struct{}), make(chan struct{}, 1)
+	g.mu.Lock()
+	g.block, g.entered = block, entered
+	g.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.DeleteVolume(context.Background(), "vol-alice")
+		done <- err
+	}()
+	<-entered
+	fresh.Store(false) // the process froze, another replica took over
+	close(block)
+	if err := <-done; !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("delete whose lease went stale: %v", err)
+	}
+	if _, ok := g.vols["vol-alice"]; !ok {
+		t.Fatal("the volume was deleted with a stale lease")
+	}
+}
+
+// Like DeleteVolume, the list needs the registry of the leader: a follower
+// knows no engines and would show every volume unused.
+func TestVolumesNeedLeaderRegistry(t *testing.T) {
+	g := newGuarded()
+	g.vols["vol-alice"] = engine.Volume{Name: "vol-alice", Key: personalKey.String(), EngineKey: personalKey}
+	cfg, err := config.Parse([]byte("auth: {mode: none}\n" + persistentConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := engine.NewManager(cfg, g, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New())
+	if _, err := m.Volumes(context.Background()); !errors.Is(err, engine.ErrNotSynced) {
+		t.Fatalf("list before the registry is synced: %v", err)
+	}
+	var fresh atomic.Bool
+	m, _ = startPersistent(t, g, newTestClock(), fresh.Load, "")
+	if _, err := m.Volumes(context.Background()); !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("list without a fresh lease: %v", err)
+	}
+	fresh.Store(true)
+	if vols, err := m.Volumes(context.Background()); err != nil || len(vols) != 1 {
+		t.Fatalf("list with a fresh lease: %v %v", vols, err)
+	}
 }
 
 func waitUntil(t *testing.T, what string, cond func() bool) {

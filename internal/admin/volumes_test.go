@@ -108,4 +108,13 @@ func TestDeleteVolumeUnavailable(t *testing.T) {
 	if r := do(t, fx.srv, http.MethodGet, "/api/v1/volumes", ""); r.status != http.StatusBadGateway {
 		t.Errorf("list with a failing API: %d %s", r.status, r.body)
 	}
+	// A follower (or a gateway still starting) knows no engines: its list
+	// would show every volume unused, so it answers 503 instead.
+	for _, err := range []error{engine.ErrNotLeader, engine.ErrNotSynced} {
+		fv.err = err
+		if r := do(t, fx.srv, http.MethodGet, "/api/v1/volumes", ""); r.status != http.StatusServiceUnavailable ||
+			!strings.Contains(errorMessage(t, r.body), err.Error()) {
+			t.Errorf("list with %v: %d %s, want 503", err, r.status, r.body)
+		}
+	}
 }

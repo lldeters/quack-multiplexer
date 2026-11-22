@@ -3,7 +3,9 @@ package kubernetes
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -428,16 +430,16 @@ func TestVolumesAndDeleteVolume(t *testing.T) {
 		!v.LastLaunch.Equal(launched) || len(v.AccessModes) != 1 || v.AccessModes[0] != "ReadWriteOncePod" {
 		t.Errorf("volume %+v", v)
 	}
-	if err := e.p.DeleteVolume(ctx, other.Name); !errors.Is(err, engine.ErrVolumeNotFound) {
+	if err := e.p.DeleteVolume(ctx, other.Name, nil); !errors.Is(err, engine.ErrVolumeNotFound) {
 		t.Errorf("deleting another instance's claim: %v", err)
 	}
-	if err := e.p.DeleteVolume(ctx, "unrelated"); !errors.Is(err, engine.ErrVolumeNotFound) {
+	if err := e.p.DeleteVolume(ctx, "unrelated", nil); !errors.Is(err, engine.ErrVolumeNotFound) {
 		t.Errorf("deleting an unrelated claim: %v", err)
 	}
-	if err := e.p.DeleteVolume(ctx, "missing"); !errors.Is(err, engine.ErrVolumeNotFound) {
+	if err := e.p.DeleteVolume(ctx, "missing", nil); !errors.Is(err, engine.ErrVolumeNotFound) {
 		t.Errorf("deleting a missing claim: %v", err)
 	}
-	if err := e.p.DeleteVolume(ctx, ours.Name); err != nil {
+	if err := e.p.DeleteVolume(ctx, ours.Name, nil); err != nil {
 		t.Fatal(err)
 	}
 	var del k8stesting.DeleteAction
@@ -449,5 +451,135 @@ func TestVolumesAndDeleteVolume(t *testing.T) {
 	if del == nil || del.GetName() != ours.Name || del.GetDeleteOptions().Preconditions == nil ||
 		*del.GetDeleteOptions().Preconditions.UID != "uid-1" {
 		t.Errorf("delete action %+v", del)
+	}
+}
+
+// DeleteVolume asks the API server whether a pod uses the claim: an engine
+// pod of its key (also one the registry does not know) and any other pod
+// that mounts it and has not terminated keep it.
+func TestDeleteVolumeRefusesWhilePodsUseIt(t *testing.T) {
+	bob := personalKey
+	bob.Owner = "bob"
+	for what, c := range map[string]struct {
+		pod     func(e *testEnv, claim string) *corev1.Pod
+		refused bool
+	}{
+		"engine pod of the key": {func(e *testEnv, _ string) *corev1.Pod {
+			pod, _ := e.enginePod("quack-user-alice-older", personalKey, false, "tok")
+			return pod
+		}, true},
+		"engine pod of the key without the volume": {func(e *testEnv, _ string) *corev1.Pod {
+			pod, _ := e.enginePod("quack-user-alice-memory", personalKey, false, "tok")
+			pod.Spec.Volumes = nil // started before persistence was switched on
+			return pod
+		}, true},
+		"foreign pod that mounts the claim": {func(_ *testEnv, claim string) *corev1.Pod {
+			return podWithClaim("debug", claim, corev1.PodRunning)
+		}, true},
+		"pending foreign pod that mounts the claim": {func(_ *testEnv, claim string) *corev1.Pod {
+			return podWithClaim("debug", claim, corev1.PodPending)
+		}, true},
+		"terminated foreign pod that mounted the claim": {func(_ *testEnv, claim string) *corev1.Pod {
+			return podWithClaim("copy-job", claim, corev1.PodSucceeded)
+		}, false},
+		"engine pod of another key": {func(e *testEnv, _ string) *corev1.Pod {
+			pod, _ := e.enginePod("quack-user-bob-abcde", bob, false, "tok")
+			return pod
+		}, false},
+	} {
+		t.Run(what, func(t *testing.T) {
+			e := newTestEnv(t, testConfig(t, persistentYAML))
+			claim := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice",
+				e.p.cfg.Profiles["personal"].Persistence, time.Now())
+			e.add(t, claim, c.pod(e, claim.Name))
+			ctx := context.Background()
+			err := e.p.DeleteVolume(ctx, claim.Name, nil)
+			_, getErr := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, claim.Name, metav1.GetOptions{})
+			if c.refused {
+				if !errors.Is(err, engine.ErrVolumeInUse) || getErr != nil {
+					t.Fatalf("delete: %v; claim afterwards: %v", err, getErr)
+				}
+				t.Log(err)
+				return
+			}
+			if err != nil || !apierrors.IsNotFound(getErr) {
+				t.Fatalf("delete: %v; claim afterwards: %v", err, getErr)
+			}
+		})
+	}
+}
+
+func podWithClaim(name, claim string, phase corev1.PodPhase) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+		}}}},
+		Status: corev1.PodStatus{Phase: phase},
+	}
+}
+
+// The case the registry misses: an engine pod of the key whose token secret
+// cannot be read when the gateway starts is skipped by the initial List.
+// Launches for the key are refused (TestLaunchRefusesSecondPodOfKey), and so
+// is the deletion of its volume: Kubernetes would delete the claim once the
+// pod ends, with everything the pod wrote meanwhile.
+func TestDeleteVolumeOfKeyWithUnknownPod(t *testing.T) {
+	cfg := testConfig(t, persistentYAML)
+	e := newTestEnv(t, cfg)
+	pod, secret := e.enginePod("quack-user-alice-older", personalKey, false, "tok-old")
+	pod.Status = readyStatus("10.0.0.7")
+	claim := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice",
+		cfg.Profiles["personal"].Persistence, time.Now())
+	e.add(t, pod, secret, claim)
+	unreadable := func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("etcd is unavailable"))
+	}
+	e.client.PrependReactor("get", "secrets", unreadable)
+	e.client.PrependReactor("list", "secrets", unreadable)
+	m := engine.NewManager(cfg, e.p, slog.New(slog.DiscardHandler), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(m.List()); n != 0 {
+		t.Fatalf("the registry knows %d engines, want none (the token is unreadable)", n)
+	}
+	_, err := m.DeleteVolume(ctx, claim.Name)
+	if !errors.Is(err, engine.ErrVolumeInUse) || !strings.Contains(err.Error(), pod.Name) {
+		t.Fatalf("delete while pod %s of the key exists: %v", pod.Name, err)
+	}
+	if _, err := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, claim.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("claim afterwards: %v", err)
+	}
+}
+
+// The fence is checked once more right before the delete: a leader whose
+// lease went stale while it listed the pods deletes nothing.
+func TestDeleteVolumeFence(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	claim := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice",
+		e.p.cfg.Profiles["personal"].Persistence, time.Now())
+	e.add(t, claim)
+	ctx := context.Background()
+	var fresh atomic.Bool
+	fresh.Store(true)
+	e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		fresh.Store(false) // the process froze while it listed the pods
+		return false, nil, nil
+	})
+	if err := e.p.DeleteVolume(ctx, claim.Name, fresh.Load); !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("delete with a stale lease: %v", err)
+	}
+	for _, a := range actionsOf(e) {
+		if a == "delete persistentvolumeclaims" {
+			t.Fatal("the claim was deleted with a stale lease")
+		}
+	}
+	fresh.Store(true)
+	e.client.ReactionChain = e.client.ReactionChain[1:]
+	if err := e.p.DeleteVolume(ctx, claim.Name, fresh.Load); err != nil {
+		t.Fatalf("delete with a fresh lease: %v", err)
 	}
 }

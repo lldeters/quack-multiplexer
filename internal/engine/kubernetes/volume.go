@@ -299,10 +299,13 @@ func (p *Provider) Volumes(ctx context.Context) ([]engine.Volume, error) {
 }
 
 // DeleteVolume implements engine.VolumeProvider. Only claims of this
-// instance are deleted, and only the object that was read (UID
-// precondition). Kubernetes keeps a claim that a pod still uses until that
-// pod is gone (finalizer kubernetes.io/pvc-protection).
-func (p *Provider) DeleteVolume(ctx context.Context, name string) error {
+// instance are deleted, only while no pod uses them (checkClaimUnused), and
+// only the object that was read (UID precondition). The fence is checked
+// right before the delete and when the request is sent (fence.go).
+// Kubernetes would keep a claim that a pod still uses until that pod is
+// gone (finalizer kubernetes.io/pvc-protection), and then delete it with
+// everything the pod wrote meanwhile.
+func (p *Provider) DeleteVolume(ctx context.Context, name string, fence func() bool) error {
 	pvcs := p.client.CoreV1().PersistentVolumeClaims(p.namespace)
 	pvc, err := pvcs.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -314,14 +317,58 @@ func (p *Provider) DeleteVolume(ctx context.Context, name string) error {
 	if !p.ownsClaim(pvc) {
 		return engine.ErrVolumeNotFound
 	}
-	uid := pvc.UID
-	err = pvcs.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
-	if apierrors.IsNotFound(err) {
-		return engine.ErrVolumeNotFound
+	if err := p.checkClaimUnused(ctx, pvc); err != nil {
+		return err
 	}
-	if err != nil {
+	if fence != nil && !fence() {
+		return engine.ErrNotLeader
+	}
+	uid := pvc.UID
+	err = pvcs.Delete(withFence(ctx, fence), name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	switch {
+	case errors.Is(err, engine.ErrNotLeader):
+		return engine.ErrNotLeader
+	case apierrors.IsNotFound(err):
+		return engine.ErrVolumeNotFound
+	case err != nil:
 		return fmt.Errorf("delete data volume claim %s: %w", name, err)
 	}
 	p.log.Info("deleting data volume claim", "claim", name, "key", pvc.Annotations[AnnotationKey])
 	return nil
+}
+
+// checkClaimUnused makes sure, on the API server, that no engine pod of the
+// key of a data volume claim exists and that no other pod of the namespace
+// that has not terminated mounts the claim (as kubernetes.io/pvc-protection
+// counts them). The manager refuses to delete the volume of a key that has
+// an engine in its registry; this covers the pods the registry does not
+// know: one the initial List skipped because its token could not be read,
+// one another gateway process created, and pods that are no engines (a
+// debug pod that mounts the claim).
+func (p *Provider) checkClaimUnused(ctx context.Context, pvc *corev1.PersistentVolumeClaim) error {
+	list, err := p.client.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list the pods that may use data volume claim %s: %w", pvc.Name, err)
+	}
+	hash := pvc.Labels[LabelKeyHash]
+	for i := range list.Items {
+		pod := &list.Items[i]
+		switch {
+		case hash != "" && p.owns(pod) && pod.Labels[LabelKeyHash] == hash:
+			return fmt.Errorf("%w: engine pod %s of its key exists", engine.ErrVolumeInUse, pod.Name)
+		case mountsClaim(pod, pvc.Name) && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed:
+			return fmt.Errorf("%w: pod %s mounts it", engine.ErrVolumeInUse, pod.Name)
+		}
+	}
+	return nil
+}
+
+// mountsClaim reports whether a pod has a volume of the claim.
+func mountsClaim(pod *corev1.Pod, claim string) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
+			return true
+		}
+	}
+	return false
 }

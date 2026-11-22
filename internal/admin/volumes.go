@@ -13,7 +13,9 @@ import (
 // Volumes is the part of the engine manager that manages the data volumes of
 // profiles with persistence (one per engine key).
 type Volumes interface {
-	// Volumes lists the data volumes, each with the engine of its key.
+	// Volumes lists the data volumes, each with the engine of its key. It
+	// fails with engine.ErrNotLeader or engine.ErrNotSynced when this
+	// replica does not know the engines.
 	Volumes(ctx context.Context) ([]engine.Volume, error)
 	// DeleteVolume deletes a data volume whose key has no engine. It fails
 	// with engine.ErrVolumeNotFound, engine.ErrVolumeInUse,
@@ -47,7 +49,12 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), volumeTimeout)
 		defer cancel()
 		vols, err := s.volumes.Volumes(ctx)
-		if err != nil {
+		switch {
+		case errors.Is(err, engine.ErrNotLeader), errors.Is(err, engine.ErrNotSynced):
+			// Without its engines the list would show every volume unused.
+			s.writeError(w, http.StatusServiceUnavailable, "list data volumes: "+err.Error())
+			return
+		case err != nil:
 			s.writeError(w, http.StatusBadGateway, "listing data volumes failed: "+err.Error())
 			return
 		}
