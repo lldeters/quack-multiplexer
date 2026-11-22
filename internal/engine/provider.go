@@ -47,6 +47,9 @@ type Instance struct {
 	CreatedAt time.Time
 	// Message explains the phase (e.g. "ImagePullBackOff: ...").
 	Message string
+	// Volume names the data volume of an engine of a persistent profile
+	// (the PersistentVolumeClaim its pod mounts); empty otherwise.
+	Volume string
 }
 
 // LaunchRequest asks a provider to start an engine.
