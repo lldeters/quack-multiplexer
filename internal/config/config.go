@@ -400,7 +400,9 @@ type HAConfig struct {
 	// Quack listener open after it removed its leader label: until
 	// kube-proxy has caught up, it still sends new connections to the pod,
 	// which then get an answer at once instead of hanging in connect once
-	// the pod is gone (default 3s, 0s turns it off).
+	// the pod is gone. It counts towards server.shutdownTimeout and must be
+	// shorter (default 3s, at most half of server.shutdownTimeout; 0s turns
+	// it off).
 	DeregistrationDelay Duration `json:"deregistrationDelay,omitempty"`
 }
 
@@ -601,7 +603,10 @@ func (c *Config) ApplyDefaults() {
 	setDur(&h.LeaseDuration, 15*time.Second)
 	setDur(&h.RenewDeadline, 10*time.Second)
 	setDur(&h.RetryPeriod, 2*time.Second)
-	setDur(&h.DeregistrationDelay, 3*time.Second)
+	// The delay counts towards server.shutdownTimeout: by default 3s, but
+	// at most half of it, so that a short shutdown timeout stays valid
+	// without the setting and leaves time to drain.
+	setDur(&h.DeregistrationDelay, min(3*time.Second, max(s.ShutdownTimeout.Duration, 0)/2))
 
 	setStr(&c.Log.Level, "info")
 	setStr(&c.Log.Format, "json")

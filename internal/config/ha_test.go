@@ -33,14 +33,35 @@ func TestDeregistrationDelay(t *testing.T) {
 		t.Errorf("unused ha.deregistrationDelay rejected: %v", err)
 	}
 	for name, raw := range map[string][]byte{
-		"negative":                    haConfig("", "enabled: true, deregistrationDelay: -1s"),
-		"negative without HA":         haConfig("", "deregistrationDelay: -1s"),
-		"as long as the shutdown":     haConfig(", shutdownTimeout: 3s", "enabled: true"),
-		"longer than the shutdown":    haConfig(", shutdownTimeout: 10s", "enabled: true, deregistrationDelay: 15s"),
-		"no shutdown time, a default": haConfig(", shutdownTimeout: 0s", "enabled: true"),
+		"negative":                   haConfig("", "enabled: true, deregistrationDelay: -1s"),
+		"negative without HA":        haConfig("", "deregistrationDelay: -1s"),
+		"as long as the shutdown":    haConfig(", shutdownTimeout: 3s", "enabled: true, deregistrationDelay: 3s"),
+		"longer than the shutdown":   haConfig(", shutdownTimeout: 10s", "enabled: true, deregistrationDelay: 15s"),
+		"no shutdown time, explicit": haConfig(", shutdownTimeout: 0s", "enabled: true, deregistrationDelay: 1s"),
 	} {
 		if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "ha.deregistrationDelay") {
 			t.Errorf("%s: want an error about ha.deregistrationDelay, got %v", name, err)
+		}
+	}
+}
+
+// Configurations without ha.deregistrationDelay stay valid with a short
+// server.shutdownTimeout: the default takes at most half of it.
+func TestDeregistrationDelayDefaultFitsTheShutdown(t *testing.T) {
+	for shutdown, want := range map[string]time.Duration{
+		"30s": 3 * time.Second,
+		"6s":  3 * time.Second,
+		"3s":  1500 * time.Millisecond,
+		"1s":  500 * time.Millisecond,
+		"0s":  0,
+	} {
+		c, err := Parse(haConfig(", shutdownTimeout: "+shutdown, "enabled: true"))
+		if err != nil {
+			t.Errorf("server.shutdownTimeout %s without ha.deregistrationDelay: %v", shutdown, err)
+			continue
+		}
+		if got := c.HA.DeregistrationDelay.Duration; got != want {
+			t.Errorf("server.shutdownTimeout %s: default ha.deregistrationDelay = %s, want %s", shutdown, got, want)
 		}
 	}
 }
