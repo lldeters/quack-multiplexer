@@ -99,6 +99,9 @@ func cmdValidate(args []string) error {
 	if err := validateStartup(cfg); err != nil {
 		return err
 	}
+	for _, w := range cfg.Warnings() {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
 	fmt.Println("configuration is valid")
 	return nil
 }
@@ -234,6 +237,9 @@ func cmdServe(args []string) error {
 	}
 	log := newLogger(cfg.Log)
 	log.Info("starting quackmux", "version", version, "provider", cfg.Provider.Type, "auth", cfg.Auth.Mode)
+	for _, w := range cfg.Warnings() {
+		log.Warn(w)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

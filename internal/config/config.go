@@ -707,6 +707,8 @@ func (c *Config) Validate() error {
 	for lvl := range c.Engine.IdleTimeout {
 		checkLevel("engine.idleTimeout", lvl)
 	}
+	defaultsErrs, _ := c.checkDefaults()
+	errs = append(errs, defaultsErrs...)
 
 	ss := c.Session
 	if ss.MinHeartbeatTimeout.Duration < time.Second {
