@@ -20,10 +20,12 @@ const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccou
 // userAgent identifies the gateway at the API server.
 const userAgent = "quackmux"
 
-// NewClient creates a Kubernetes client. Without cfg.Kubeconfig the
-// in-cluster configuration (service account) is used, otherwise the given
-// kubeconfig file. QPS and Burst are taken from the configuration. The
-// returned rest.Config can be used for further clients (leader election).
+// NewClient creates the Kubernetes client of the engine provider. Without
+// cfg.Kubeconfig the in-cluster configuration (service account) is used,
+// otherwise the given kubeconfig file. QPS and Burst are taken from the
+// configuration. The client checks the fence of a request when it is sent
+// (fence.go). The returned rest.Config is for further clients, which get a
+// rate limiter of their own (NewClientForConfig).
 func NewClient(cfg config.KubernetesProviderConfig) (kclient.Interface, *rest.Config, error) {
 	var (
 		rc  *rest.Config
@@ -56,11 +58,23 @@ func NewClient(cfg config.KubernetesProviderConfig) (kclient.Interface, *rest.Co
 	if rc.UserAgent == "" {
 		rc.UserAgent = userAgent
 	}
-	client, err := kclient.NewForConfig(rc)
+	client, err := kclient.NewForConfig(fencedConfig(rc))
 	if err != nil {
 		return nil, nil, fmt.Errorf("kubernetes: create client: %w", err)
 	}
 	return client, rc, nil
+}
+
+// NewClientForConfig creates another client from the rest.Config returned
+// by NewClient. It has a rate limiter of its own (QPS and Burst as
+// configured): leader election uses one, so that a burst of engine launches
+// cannot hold back the renewals of its lease past ha.renewDeadline.
+func NewClientForConfig(rc *rest.Config) (kclient.Interface, error) {
+	client, err := kclient.NewForConfig(rest.CopyConfig(rc))
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes: create client: %w", err)
+	}
+	return client, nil
 }
 
 // expandHome resolves a leading "~/" (kubeconfig paths are often written so).

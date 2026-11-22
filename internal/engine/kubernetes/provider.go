@@ -495,13 +495,20 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 }
 
 // createPod creates the engine pod. The fence of a launch (see
-// engine.LaunchRequest.Fence) is checked right before, as late as possible:
-// the lease may have gone stale during the calls of Launch before.
+// engine.LaunchRequest.Fence) is checked as late as possible: the lease may
+// have gone stale during the calls of Launch before, and while client-go's
+// rate limiter holds the request back. The client of NewClient checks it
+// again when the request is sent (fence.go).
 func (p *Provider) createPod(ctx context.Context, pod *corev1.Pod, fence func() bool) (*corev1.Pod, error) {
 	if fence != nil && !fence() {
 		return nil, engine.ErrNotLeader
 	}
-	return p.client.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{FieldManager: eventComponent})
+	created, err := p.client.CoreV1().Pods(p.namespace).Create(withFence(ctx, fence), pod,
+		metav1.CreateOptions{FieldManager: eventComponent})
+	if errors.Is(err, engine.ErrNotLeader) {
+		return nil, engine.ErrNotLeader // not sent: drop client-go's "Post <url>:" wrapping
+	}
+	return created, err
 }
 
 // attachSecret makes the pod the owner of its token secret, so that

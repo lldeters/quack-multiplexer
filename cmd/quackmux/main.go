@@ -276,11 +276,16 @@ func cmdServe(args []string) error {
 	var namespace string
 	switch cfg.Provider.Type {
 	case "kubernetes":
-		kube, _, err = kubernetes.NewClient(cfg.Provider.Kubernetes)
+		engineClient, rc, err := kubernetes.NewClient(cfg.Provider.Kubernetes)
 		if err != nil {
 			return fmt.Errorf("kubernetes client: %w", err)
 		}
-		kp, err := kubernetes.New(cfg, kube, log)
+		// Leader election gets a client with a rate limiter of its own: a
+		// burst of engine launches must not delay the renewals of its lease.
+		if kube, err = kubernetes.NewClientForConfig(rc); err != nil {
+			return fmt.Errorf("kubernetes client: %w", err)
+		}
+		kp, err := kubernetes.New(cfg, engineClient, log)
 		if err != nil {
 			return err
 		}
