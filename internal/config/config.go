@@ -396,6 +396,12 @@ type HAConfig struct {
 	LeaseDuration Duration `json:"leaseDuration,omitempty"`
 	RenewDeadline Duration `json:"renewDeadline,omitempty"`
 	RetryPeriod   Duration `json:"retryPeriod,omitempty"`
+	// DeregistrationDelay is how long a leader that shuts down keeps its
+	// Quack listener open after it removed its leader label: until
+	// kube-proxy has caught up, it still sends new connections to the pod,
+	// which then get an answer at once instead of hanging in connect once
+	// the pod is gone (default 3s, 0s turns it off).
+	DeregistrationDelay Duration `json:"deregistrationDelay,omitempty"`
 }
 
 // LogConfig controls logging.
@@ -595,6 +601,7 @@ func (c *Config) ApplyDefaults() {
 	setDur(&h.LeaseDuration, 15*time.Second)
 	setDur(&h.RenewDeadline, 10*time.Second)
 	setDur(&h.RetryPeriod, 2*time.Second)
+	setDur(&h.DeregistrationDelay, 3*time.Second)
 
 	setStr(&c.Log.Level, "info")
 	setStr(&c.Log.Format, "json")
@@ -742,6 +749,13 @@ func (c *Config) Validate() error {
 	}
 	if c.HA.Enabled && c.Server.SessionKeyFile == "" && os.Getenv("QUACKMUX_SESSION_KEY") == "" {
 		add("ha.enabled requires a shared session key (server.sessionKeyFile or QUACKMUX_SESSION_KEY)")
+	}
+	if d := c.HA.DeregistrationDelay.Duration; d < 0 {
+		add("ha.deregistrationDelay must not be negative")
+	} else if c.HA.Enabled && d > 0 && d >= c.Server.ShutdownTimeout.Duration {
+		// The delay counts towards the shutdown deadline; the drain of the
+		// in-flight requests follows it.
+		add("ha.deregistrationDelay (%s) must be shorter than server.shutdownTimeout (%s)", d, c.Server.ShutdownTimeout.Duration)
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
