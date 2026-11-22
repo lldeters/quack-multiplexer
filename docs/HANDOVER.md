@@ -30,11 +30,12 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
   * Engine- und Gateway-Image gebaut (`make docker-engine docker-gateway`), der Selbsttest des Engine-Images
     besteht.
   * `test/e2e/compose/run.sh`: alle 8 Szenarien grün.
-  * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle 4 Szenarien grün, auch der
-    Gateway-Neustart mit Session-Adoption.
-  * `test/e2e/kind/ha.sh` (Overlay `ha`, zwei Replikas, echte Secrets): alle 5 Szenarien grün. Geprüft werden
-    Leader-Wahl, geordnete Übergabe, ein eingefrorener und wieder aufgeweckter Leader, Rollout und
-    PodDisruptionBudget, jeweils mit zwei angehängten Clients.
+  * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle Szenarien grün (seit
+    2026-11-22 k1–k8), auch der Gateway-Neustart mit Session-Adoption und die persistenten Profile.
+  * `test/e2e/kind/ha.sh` (Overlay `ha`, zwei Replikas, echte Secrets): alle Szenarien grün (seit 2026-11-22 h1–h6
+    und h4b). Geprüft werden Leader-Wahl, geordnete Übergabe, ein eingefrorener und wieder aufgeweckter Leader,
+    Rollout, ein hängender Rollout, PodDisruptionBudget und ein persistenter Schlüssel beim Failover, jeweils mit
+    zwei angehängten Clients.
   * Wire-Codec: 400 mitgeschnittene Nachrichten (Client ↔ Server, Client ↔ Gateway, Gateway ↔ Engine) dekodieren
     und kodieren byte-genau (`internal/wire/testdata/duckdb-v2.0.0`, `realtraffic_test.go`).
   * Der `process`-Provider läuft mit der echten CLI.
@@ -151,11 +152,12 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    und mit HA ein Restfenster von Sekunden umgehen die Prüfungen des Gateways; dann schützen nur
    `ReadWriteOncePod` und die Dateisperre von DuckDB. `kubectl delete -k` löscht mit dem Namespace alle Claims.
    Alles in `deploy/kubernetes/README.md`, „Persistente Daten“.
-3. **HA: Nur der Leader ist ready.** `kubectl rollout status` meldet nie Erfolg. Ein Rollout braucht einen
-   kontrollierten Failover. Die PDB verhindert den Drain des Leader-Nodes. Fällt der Leader aus, übernimmt der
-   Follower erst nach Ablauf der Lease (gemessen etwa 20 s). Bei jeder Übergabe hat der Service ein bis drei
-   Sekunden keinen bereiten Endpunkt; Requests darin scheitern mit „Could not connect to server“ und laufen
-   nicht. Alles dokumentiert in `deploy/kubernetes/README.md`, „Hochverfügbarkeit“.
+3. **HA:** Alle gesunden Replikas sind ready, nur der Leader bekommt Quack-Traffic (Label `quackmux.io/leader=true`,
+   der Service von `overlays/ha` wählt es aus). Bei einer geordneten Übergabe hat der Service 0,4–3,6 s keinen
+   Endpunkt, nach einem eingefrorenen Leader übernimmt der Follower nach 15–20 s (in kind gemessen); Requests in
+   der Lücke scheitern mit „Could not connect to server“ und laufen nicht. Eigene Services, die Quack-Traffic
+   routen, brauchen denselben Selector. Ein Upgrade von einer Version ohne Label lässt den Service während des
+   Rollouts ohne Endpunkt. Alles in `deploy/kubernetes/README.md`, „Hochverfügbarkeit“.
 4. **Innerhalb einer Engine sieht jede Session das Init-SQL** (`/proc/1/environ`) und das Engine-Token
    (`getenv`). Für Zugangsdaten `PROVIDER credential_chain` mit Workload Identity verwenden. `quack_stop(…)`
    bleibt für jede Session aufrufbar, dagegen hilft nur eine `quack_authorization_function`.
@@ -167,15 +169,14 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
 ## Nächste Schritte (priorisiert)
 
 Erledigt seit dem 2026-11-21: CI und Release mit GitHub Actions (`.github/workflows`, [docs/releasing.md](releasing.md)),
-der HA-Test nächtlich in CI und PVCs pro Engine-Schlüssel (`persistence`, kind-Szenarien k5–k8 und h6).
+der HA-Test nächtlich in CI, PVCs pro Engine-Schlüssel (`persistence`, kind-Szenarien k5–k8 und h6) und HA mit
+allen Replikas ready (Leader-Label, `ha.deregistrationDelay`, kind-Szenarien h1–h5 und h4b).
 
-1. **HA ohne „nur der Leader ist ready“:** Follower werden ready und leiten an den Leader weiter, oder ein
-   Leader-Label steuert den Service. Dann funktionieren `rollout status` und die PDB normal.
-2. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
+1. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
    Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`.
-3. **Engine-Image:** ein Haken für SQL nach dem Serverstart (etwa `SET enable_external_access = false`) und eine
+2. **Engine-Image:** ein Haken für SQL nach dem Serverstart (etwa `SET enable_external_access = false`) und eine
    Vorlage für `quack_authorization_function` gegen `quack_stop` und Co.
-4. Optional:
+3. Optional:
    * Query-/Request-Timeout (CANCEL nach X)
    * Helm-Chart
    * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)
