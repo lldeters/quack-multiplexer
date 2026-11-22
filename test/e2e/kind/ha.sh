@@ -23,12 +23,13 @@
 #       it still knows and comes back as a ready follower
 #   h4  "kubectl rollout restart" completes on its own ("kubectl rollout
 #       status" succeeds) with exactly one handover, to a new pod
-#   h5  the PodDisruptionBudget lets the leader be evicted while the follower
-#       is ready (it hands over), but never the last ready replica
-#   h6  a rollout whose pods could never lead (the gateway may not use the
+#   h4b a rollout whose pods could never lead (the gateway may not use the
 #       lease in their ha.namespace) stalls: the new pod refuses to start,
 #       and the old ones keep serving without a handover
-#   h7  both clients detach cleanly
+#   h5  the PodDisruptionBudget lets the leader be evicted while the follower
+#       is ready (it hands over), but never the last ready replica
+#
+# At the end both clients must detach cleanly ("detach").
 #
 # Two clients of one user stay attached through all scenarios: one with the
 # default heartbeat timeout (60 s) and one with HEARTBEAT_TIMEOUT 5, whose
@@ -542,11 +543,13 @@ expect_adopted() {
 	expect_eq "$(json_count "$list" engineId "\"$ENGINE_POD\"")" 2 "$1: both run on engine pod $ENGINE_POD" || return 1
 }
 
-# close_clients detaches every client and ends its CLI. It fails if a client
-# does not end cleanly, for instance because its DETACH hangs: a heartbeat
-# that hangs in connect to a pod that is gone blocks it.
+# close_clients detaches every client and ends its CLI. A client that does
+# not end cleanly fails the run ("detach"), for instance because its DETACH
+# hangs: a heartbeat that hangs in connect to a pod that is gone blocks it.
 close_clients() {
-	local id rc failed=''
+	local id rc
+	[ -n "$CLIENTS_OPEN" ] || return 0
+	step "detach the clients"
 	for id in $CLIENTS_OPEN; do
 		rc=0
 		session_send "$id" "DETACH remote;
@@ -556,11 +559,10 @@ SELECT '$id-detached' AS result;" && session_wait "$id" "$id-detached" 60 '' || 
 			ok "client $id detached and ended cleanly"
 		else
 			bad "client $id did not end cleanly"
-			failed=1
+			case " $SCENARIOS_FAILED " in *" detach "*) ;; *) SCENARIOS_FAILED="$SCENARIOS_FAILED detach" ;; esac
 		fi
 	done
 	CLIENTS_OPEN=''
-	[ -z "$failed" ]
 }
 
 # expect_follower_refuses POD: a client that connects to POD directly, not
@@ -881,47 +883,6 @@ scenario_rollout() {
 	expect_adopted "the leader $LEADER after the rollout" || return 1
 }
 
-# h5: kubectl drain respects the PodDisruptionBudget (minAvailable 1). Both
-# replicas are ready, so the leader may be evicted: it hands over to the
-# follower like a deleted pod (h2). Right after that the follower is the only
-# ready replica and may not be evicted, until the replacement pod is ready.
-scenario_pdb() {
-	local out=$E2E_WORK/h5-evict.txt rc old_leader old_follower
-	one_leader || {
-		bad "no single leader"
-		return 1
-	}
-	old_leader=$LEADER old_follower=$FOLLOWER
-	gap_watch_start h5
-	rc=0
-	evict "$old_leader" >"$out" 2>&1 || rc=$?
-	expect_status "$rc" 0 "the leader $old_leader may be evicted while the follower is ready" || {
-		indent "$out"
-		return 1
-	}
-	rc=0
-	evict "$old_follower" >"$out" 2>&1 || rc=$?
-	expect_status "$rc" nonzero "the eviction of $old_follower, now the last ready replica, is refused" || return 1
-	expect_output "$out" "disruption budget" "the PodDisruptionBudget refused it" || {
-		indent "$out"
-		return 1
-	}
-	wait_for 60 "$old_follower to take over" leader_is "$old_follower" || return 1
-	expect_gap h5 "evicting the leader" || return 1
-	wait_for 120 "a ready replacement next to the new leader" one_leader || return 1
-	ok "$LEADER leads, the replacement $FOLLOWER is ready"
-	rc=0
-	evict "$FOLLOWER" >"$out" 2>&1 || rc=$?
-	expect_status "$rc" 0 "the follower $FOLLOWER may be evicted" || {
-		indent "$out"
-		return 1
-	}
-	wait_for 120 "a new follower" one_leader || return 1
-	expect_both_attached h5-after || return 1
-	pf_start "$LEADER" || return 1
-	expect_adopted "the leader $LEADER after the evictions" || return 1
-}
-
 # pod_ready POD prints the status of the Ready condition of POD (True or
 # False).
 pod_ready() { kctl -n "$NS" get pod "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'; }
@@ -938,7 +899,7 @@ break_lease_access() {
 	grep -qx "  namespace: $3" "$2"
 }
 
-# h6: a rollout whose pods could never lead stalls. Its configuration moves
+# h4b: a rollout whose pods could never lead stalls. Its configuration moves
 # the lease to a namespace in which the gateway has no Role (ha.namespace;
 # the same happens when provider.kubernetes.namespace moves without its Role,
 # deploy/kubernetes/README.md, "Konfiguration ändern"). The new pod refuses
@@ -946,7 +907,7 @@ break_lease_access() {
 # old leader serves on without a handover. Applying the overlay again rolls
 # back.
 scenario_broken_rollout() {
-	local live conf=$E2E_WORK/h6-config.yaml ns=default old_leader old_follower transitions pod log=$E2E_WORK/h6-new.log
+	local live conf=$E2E_WORK/h4b-config.yaml ns=default old_leader old_follower transitions pod log=$E2E_WORK/h4b-new.log
 	[ "$NS" != default ] || ns=kube-public
 	one_leader || {
 		bad "no single leader"
@@ -990,7 +951,7 @@ scenario_broken_rollout() {
 	fi
 	ok "$old_leader still leads and is the only endpoint of service/$SVC; $old_follower is ready"
 	expect_eq "$(lease_transitions)" "$transitions" "the lease did not change hands" || return 1
-	expect_both_attached h6-stalled || return 1
+	expect_both_attached h4b-stalled || return 1
 	say "  kubectl apply -k (the generated overlay) rolls back"
 	if ! kctl apply -k "$HA_DIR" >"$E2E_WORK/apply.log" 2>&1; then
 		indent "$E2E_WORK/apply.log"
@@ -1001,7 +962,48 @@ scenario_broken_rollout() {
 	expect_eq "$(lease_transitions)" "$transitions" "the lease did not change hands" || return 1
 	kctl -n "$NS" delete configmap "$BROKEN_CONFIG" --ignore-not-found >/dev/null || return 1
 	BROKEN_CONFIG=''
-	expect_both_attached h6-after || return 1
+	expect_both_attached h4b-after || return 1
+}
+
+# h5: kubectl drain respects the PodDisruptionBudget (minAvailable 1). Both
+# replicas are ready, so the leader may be evicted: it hands over to the
+# follower like a deleted pod (h2). Right after that the follower is the only
+# ready replica and may not be evicted, until the replacement pod is ready.
+scenario_pdb() {
+	local out=$E2E_WORK/h5-evict.txt rc old_leader old_follower
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	old_leader=$LEADER old_follower=$FOLLOWER
+	gap_watch_start h5
+	rc=0
+	evict "$old_leader" >"$out" 2>&1 || rc=$?
+	expect_status "$rc" 0 "the leader $old_leader may be evicted while the follower is ready" || {
+		indent "$out"
+		return 1
+	}
+	rc=0
+	evict "$old_follower" >"$out" 2>&1 || rc=$?
+	expect_status "$rc" nonzero "the eviction of $old_follower, now the last ready replica, is refused" || return 1
+	expect_output "$out" "disruption budget" "the PodDisruptionBudget refused it" || {
+		indent "$out"
+		return 1
+	}
+	wait_for 60 "$old_follower to take over" leader_is "$old_follower" || return 1
+	expect_gap h5 "evicting the leader" || return 1
+	wait_for 120 "a ready replacement next to the new leader" one_leader || return 1
+	ok "$LEADER leads, the replacement $FOLLOWER is ready"
+	rc=0
+	evict "$FOLLOWER" >"$out" 2>&1 || rc=$?
+	expect_status "$rc" 0 "the follower $FOLLOWER may be evicted" || {
+		indent "$out"
+		return 1
+	}
+	wait_for 120 "a new follower" one_leader || return 1
+	expect_both_attached h5-after || return 1
+	pf_start "$LEADER" || return 1
+	expect_adopted "the leader $LEADER after the evictions" || return 1
 }
 
 # Main -------------------------------------------------------------------------------
@@ -1041,12 +1043,12 @@ run_scenario h2 "deleting the leader hands over within seconds; attachments surv
 if [ -n "$ENGINE_POD" ]; then
 	run_scenario h3 "a frozen leader loses the lease and steps down when it resumes" scenario_frozen_leader
 	run_scenario h4 "a rollout completes on its own with one handover" scenario_rollout
+	run_scenario h4b "a rollout of pods that could never lead stalls; the old pods keep serving" scenario_broken_rollout
 	run_scenario h5 "the PodDisruptionBudget lets the leader go while the follower is ready" scenario_pdb
-	run_scenario h6 "a rollout of pods that could never lead stalls; the old pods keep serving" scenario_broken_rollout
 else
-	bad "h3-h6 need the attachments of h2"
-	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h5 h6"
+	bad "h3-h5 need the attachments of h2"
+	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h4b h5"
 fi
-run_scenario h7 "both clients detach cleanly" close_clients
+close_clients
 
 summary "kind HA e2e" || exit 1
