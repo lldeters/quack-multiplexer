@@ -90,6 +90,28 @@ profiles:
         cpu: "1"
         memory: 1Gi
 
+  persistent:
+    description: "Development engine with a data volume per user"
+    image: quackmux/duckdb-engine:2.0.0
+    imagePullPolicy: IfNotPresent
+    # A volume per engine key: only keys that are used again, one subdomain.
+    allowedShareLevels: [USER]
+    allowedSubdomains: [default]
+    # kind's default StorageClass "standard" (local-path) supports
+    # ReadWriteOncePod. The database is /data/engine.duckdb.
+    persistence:
+      size: 1Gi
+    settings:
+      memory_limit: 700MB
+      threads: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
 audit:
   enabled: true
   maxQueryBytes: 4096

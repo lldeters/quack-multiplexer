@@ -21,6 +21,12 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list, watch, create, delete, patch]
+  # Data volumes of profiles with persistence: one PersistentVolumeClaim per
+  # engine key, created before the engine pod and kept when it ends; deleted
+  # only through the admin API (DELETE /api/v1/volumes/{name}).
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, create, patch, delete]
   # Kubernetes events about engines (kubectl describe pod / get events).
   - apiGroups: [""]
     resources: [events]

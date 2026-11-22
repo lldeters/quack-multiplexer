@@ -347,7 +347,8 @@ profiles:
     # IfNotPresent)
     imagePullPolicy: IfNotPresent
     # DuckDB database inside the engine. ":memory:" is lost with the pod; a
-    # file needs a volume (see podTemplate).
+    # file needs a volume of its own per engine key (see persistence; with
+    # persistence the default is <mountPath>/engine.duckdb).
     database: ":memory:"
     # SQL that runs before the Quack server starts (after settings), e.g.
     # ATTACH data sources or create views. A failing statement fails the
@@ -386,6 +387,32 @@ profiles:
     # allowedUsers: [alice, "*"]
     allowedGroups: []
     # allowedGroups: [analytics]
+    # Subdomains that USER, GROUP and SERVER sessions of this profile may use
+    # ([] = any). Required with persistence.
+    allowedSubdomains: []
+    # allowedSubdomains: [default]
+    # A PersistentVolumeClaim per engine key (per user, group or SERVER, and
+    # per subdomain), mounted at mountPath; database then defaults to
+    # <mountPath>/engine.duckdb (provider kubernetes only). Needs
+    # allowedShareLevels without CONNECTION, allowedSubdomains, pool.size 1
+    # and warmPool.size 0. The gateway creates the claim before the first
+    # engine of a key and never deletes it on its own (admin API: DELETE
+    # /api/v1/volumes/{name}). There is never more than one engine per key: a
+    # replacement starts once the pod of its predecessor is gone. A volume in
+    # the podTemplate, in contrast, is mounted by every engine of the profile.
+    persistence: null
+    # persistence:
+    #   # Storage request of new claims (required).
+    #   size: 10Gi
+    #   # StorageClass of new claims ("" = the cluster's default).
+    #   storageClassName: ""
+    #   # ReadWriteOncePod (default: the scheduler refuses a second pod of a
+    #   # claim) or ReadWriteOnce (only one node, but several pods on it).
+    #   accessMode: ReadWriteOncePod
+    #   mountPath: /data
+    #   # Added to new claims, e.g. for backup tools.
+    #   labels: {}
+    #   annotations: {}
     # Lifecycle overrides (null = the engine.* value).
     startupTimeout: null
     # startupTimeout: 10m
