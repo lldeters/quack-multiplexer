@@ -320,6 +320,12 @@ func cmdServe(args []string) error {
 		if err != nil {
 			return err
 		}
+		// A replica that may not use the lease or watch the engine pods
+		// could never serve as the leader: refuse to start, so that a
+		// rollout of it stalls while the old replicas keep serving.
+		if err := elector.CheckAccess(ctx, namespace); err != nil {
+			return err
+		}
 		// Background work that acts on engines runs only while this process
 		// holds a fresh lease: a leader that resumes after a freeze must not
 		// close sessions or stop engines that the new leader serves by now.
@@ -330,21 +336,13 @@ func cmdServe(args []string) error {
 	var leading atomic.Bool
 	var started atomic.Bool
 	var stopping atomic.Bool
-	// serving reports whether this process serves Quack requests. With HA
-	// only the leader with a fresh lease does; its pod carries the label that
-	// the Service selects.
-	serving := func() (bool, string) {
-		if stopping.Load() {
-			return false, "shutting down"
-		}
-		if elector != nil && (!leading.Load() || !elector.Fresh()) {
-			return false, proxy.ReasonNotLeader
-		}
-		if !started.Load() || !engines.Synced() {
-			return false, "starting up"
-		}
-		return true, ""
+	// serving reports whether this process serves Quack requests, ready
+	// whether its pod is ready (see readiness).
+	rd := &readiness{stopping: &stopping, leading: &leading, started: &started, synced: engines.Synced}
+	if elector != nil {
+		rd.elector = elector
 	}
+	serving, ready := rd.serving, rd.ready
 	var labeler *ha.Labeler
 	if elector != nil {
 		labeler, err = ha.NewLabeler(ha.LabelerOptions{
@@ -359,20 +357,7 @@ func cmdServe(args []string) error {
 		if err := labeler.Init(ctx); err != nil {
 			return err
 		}
-	}
-	// ready is the readiness of the pod (/readyz). Without HA it is serving.
-	// With HA every healthy replica is ready, so that rollouts, the
-	// PodDisruptionBudget and health checks work as usual; the Service
-	// routes Quack traffic by the leader label. A replica that does not
-	// serve is ready only once the label is confirmed absent from its pod
-	// (else the Service could route to it) and it campaigns for the lease
-	// (so that it can take over at once).
-	ready := func() (bool, string) {
-		ok, why := serving()
-		if ok || labeler == nil || stopping.Load() {
-			return ok, why
-		}
-		return ha.StandbyReady(elector, labeler)
+		rd.standby = func() (bool, string) { return ha.StandbyReady(elector, labeler) }
 	}
 	gw := proxy.New(proxy.Options{Config: cfg, Auth: authn, Engines: engines, Sessions: sessions, Upstream: up, Log: log, Metrics: met, Ready: serving})
 
