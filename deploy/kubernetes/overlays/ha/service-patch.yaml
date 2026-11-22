@@ -1,0 +1,17 @@
+# Quack traffic goes to the leader alone. Every healthy replica is ready
+# (followers stand by), so the Service also selects the label the leader
+# puts on its own pod: quackmux.io/leader=true. The admin port follows (the
+# admin API of a follower knows no sessions or engines; to scrape every
+# replica, use a PodMonitor, see README.md, "Metriken").
+#
+# Every other Service that routes Quack traffic to the gateway (e.g. the
+# LoadBalancer variant in ../../base/service.yaml) needs this selector too;
+# otherwise followers receive requests and answer them with the error
+# "quackmux: gateway is not ready: not the leader".
+apiVersion: v1
+kind: Service
+metadata:
+  name: quackmux
+spec:
+  selector:
+    quackmux.io/leader: "true"

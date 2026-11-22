@@ -40,9 +40,12 @@ spec:
       # The Service "quackmux" would otherwise inject QUACKMUX_SERVICE_* and
       # QUACKMUX_PORT* variables into the container.
       enableServiceLinks: false
-      # server.shutdownTimeout (30s) drains in-flight requests, plus margin; with
-      # leader election (overlays/ha) the lease is released first (at most
-      # ha.renewDeadline + 1s, normally milliseconds).
+      # server.shutdownTimeout (30s) bounds the shutdown, plus margin. With
+      # leader election (overlays/ha) the leader first removes its label (at
+      # most 2s) and releases the lease (at most ha.renewDeadline + 1s, both
+      # normally milliseconds), then keeps answering for
+      # ha.deregistrationDelay (3s) until kube-proxy has caught up; in-flight
+      # requests drain meanwhile and afterwards.
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
@@ -59,7 +62,8 @@ spec:
           # The image's entrypoint is the quackmux binary.
           args: ["serve", "-config", "/etc/quackmux/config.yaml"]
           env:
-            # Leader election identity (ha.enabled).
+            # Leader election identity (ha.enabled); the leader labels the pod
+            # of this name in POD_NAMESPACE.
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -81,9 +85,10 @@ spec:
             - name: admin
               containerPort: 9495
               protocol: TCP
-          # Ready once the engine registry is synced and, with ha.enabled,
-          # only while this replica is the leader: the Service routes to the
-          # leader alone.
+          # Ready once the engine registry is synced. With ha.enabled
+          # (overlays/ha) every healthy replica is ready: the leader, and a
+          # follower once it campaigns and its pod is known to carry no
+          # leader label; the Service selects the label of the leader.
           readinessProbe:
             httpGet:
               path: /readyz
