@@ -1,0 +1,693 @@
+package kubernetes
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
+	k8stesting "k8s.io/client-go/testing"
+
+	"quackmux/internal/engine"
+)
+
+const persistentYAML = `
+profiles:
+  default: {}
+  personal:
+    allowedShareLevels: [USER, SERVER]
+    allowedSubdomains: [default, etl]
+    persistence:
+      size: 5Gi
+      storageClassName: fast
+      labels: {team: data}
+      annotations: {backup.example.com/enabled: "true"}
+`
+
+var personalKey = engine.Key{ShareLevel: engine.ShareUser, Owner: "alice", Subdomain: "default", Profile: "personal"}
+
+func TestDataClaimName(t *testing.T) {
+	long := personalKey
+	long.Owner = strings.Repeat("Very.Long-User@Example.COM", 5)
+	// The name must never change for a key: a new name is a new, empty
+	// volume, and the data of every key would be orphaned. These values are
+	// frozen (sha256 of "quackmux/data-claim\x00<instance>\x00<Key.String()>").
+	for _, c := range []struct {
+		instance string
+		key      engine.Key
+		want     string
+	}{
+		{"default", personalKey, "quackmux-data-user-alice-default-personal-3800bb77b5cb0374"},
+		{"staging", personalKey, "quackmux-data-user-alice-default-personal-5a6ba2570d07b4af"},
+		{"default", engine.Key{ShareLevel: engine.ShareServer, Subdomain: "default", Profile: "personal"},
+			"quackmux-data-server-default-personal-b9740ee93a5c893e"},
+		{"default", engine.Key{ShareLevel: engine.ShareGroup, Owner: "Data Science", Subdomain: "etl", Profile: "personal"},
+			"quackmux-data-group-data-science-etl-personal-467a889d0ee0cb59"},
+		{"default", long, "quackmux-data-user-very-long-user-example-comv-d46c5fa5f077a7f2"},
+	} {
+		if got := dataClaimName(c.instance, c.key); got != c.want {
+			t.Errorf("dataClaimName(%q, %s) = %q, want %q", c.instance, c.key, got, c.want)
+		}
+	}
+	server := engine.Key{ShareLevel: engine.ShareServer, Subdomain: "default", Profile: "personal"}
+	keys := map[string]engine.Key{
+		"alice": personalKey, "Alice": {ShareLevel: engine.ShareUser, Owner: "Alice", Subdomain: "default", Profile: "personal"},
+		"subdomain": {ShareLevel: engine.ShareUser, Owner: "alice", Subdomain: "etl", Profile: "personal"},
+		"profile":   {ShareLevel: engine.ShareUser, Owner: "alice", Subdomain: "default", Profile: "Personal"},
+		"group":     {ShareLevel: engine.ShareGroup, Owner: "alice", Subdomain: "default", Profile: "personal"},
+		"long":      long, "long2": {ShareLevel: engine.ShareUser, Owner: long.Owner + "x", Subdomain: "default", Profile: "personal"},
+		"server": server, "unicode": {ShareLevel: engine.ShareUser, Owner: "jürgen/ü", Subdomain: "default", Profile: "personal"},
+	}
+	seen := map[string]string{}
+	for what, k := range keys {
+		for _, instance := range []string{"default", "staging"} {
+			n := dataClaimName(instance, k)
+			if errs := validation.IsDNS1123Label(n); len(errs) > 0 {
+				t.Errorf("%s/%s: %q is not a DNS-1123 label: %v", what, instance, n, errs)
+			}
+			if n != dataClaimName(instance, k) {
+				t.Errorf("%s: name is not deterministic", what)
+			}
+			if other, dup := seen[n]; dup {
+				t.Errorf("%s/%s and %s share the claim name %q", what, instance, other, n)
+			}
+			seen[n] = what + "/" + instance
+		}
+	}
+}
+
+func TestPersistentPodRender(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	prof := e.p.cfg.Profiles["personal"]
+	pod := e.p.pod(podInput{Name: "quack-user-alice-abcde", Key: personalKey, User: "alice", ProfileName: "personal", Profile: prof})
+	claim := dataClaimName("default", personalKey)
+	var vol *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == dataVolumeName {
+			vol = &pod.Spec.Volumes[i]
+		}
+	}
+	if vol == nil || vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != claim || vol.PersistentVolumeClaim.ReadOnly {
+		t.Fatalf("data volume %+v, want claim %s", vol, claim)
+	}
+	c := container(pod, ContainerName)
+	mounted := false
+	for _, m := range c.VolumeMounts {
+		if m.Name == dataVolumeName && m.MountPath == "/data" && !m.ReadOnly {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatalf("engine container does not mount the data volume at /data: %+v", c.VolumeMounts)
+	}
+	if db, _ := envVar(c, engine.EnvDatabase); db.Value != "/data/engine.duckdb" {
+		t.Errorf("%s = %q", engine.EnvDatabase, db.Value)
+	}
+	if p := pod.Spec.SecurityContext.FSGroupChangePolicy; p == nil || *p != corev1.FSGroupChangeOnRootMismatch {
+		t.Errorf("fsGroupChangePolicy %v", p)
+	}
+	inst, err := instanceFromPod(pod)
+	if err != nil || inst.Volume != claim {
+		t.Errorf("instanceFromPod volume %q, %v", inst.Volume, err)
+	}
+	// Profiles without persistence are unchanged.
+	plain := e.p.pod(podInput{Name: "quack-user-alice-fghij", Key: userKey, User: "alice", ProfileName: "default", Profile: e.p.cfg.Profiles["default"]})
+	for _, v := range plain.Spec.Volumes {
+		if v.Name == dataVolumeName {
+			t.Error("a profile without persistence got a data volume")
+		}
+	}
+	if plain.Spec.SecurityContext.FSGroupChangePolicy != nil {
+		t.Error("a profile without persistence got an fsGroupChangePolicy")
+	}
+}
+
+func TestPersistentSpecHash(t *testing.T) {
+	base := testConfig(t, persistentYAML)
+	e := newTestEnv(t, base)
+	h := e.p.SpecHash("personal", base.Profiles["personal"])
+	for what, change := range map[string]func(*testing.T) string{
+		"size": func(t *testing.T) string {
+			c := testConfig(t, strings.Replace(persistentYAML, "size: 5Gi", "size: 50Gi", 1))
+			return newTestEnv(t, c).p.SpecHash("personal", c.Profiles["personal"])
+		},
+		"storageClassName": func(t *testing.T) string {
+			c := testConfig(t, strings.Replace(persistentYAML, "storageClassName: fast", "storageClassName: slow", 1))
+			return newTestEnv(t, c).p.SpecHash("personal", c.Profiles["personal"])
+		},
+	} {
+		// Claim settings apply to new claims only; they never replace engines.
+		if got := change(t); got != h {
+			t.Errorf("changing %s changed the spec hash", what)
+		}
+	}
+	c := testConfig(t, strings.Replace(persistentYAML, "size: 5Gi", "size: 5Gi\n      mountPath: /var/lib/duckdb", 1))
+	if newTestEnv(t, c).p.SpecHash("personal", c.Profiles["personal"]) == h {
+		t.Error("changing the mount path kept the spec hash")
+	}
+}
+
+func TestValidatePersistentProfile(t *testing.T) {
+	const head = `
+profiles:
+  default: {}
+  p:
+    allowedShareLevels: [USER]
+    allowedSubdomains: [default]
+`
+	for what, tail := range map[string]string{
+		"volume name": `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        volumes: [{name: quackmux-data, emptyDir: {}}]
+`,
+		"mount path": `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers: [{name: engine, volumeMounts: [{name: other, mountPath: /data}]}]
+        volumes: [{name: other, emptyDir: {}}]
+`,
+		"mount below the mount path": `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers: [{name: engine, volumeMounts: [{name: other, mountPath: /data/sub/}]}]
+        volumes: [{name: other, emptyDir: {}}]
+`,
+		"data volume mounted by the template": `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers: [{name: engine, volumeMounts: [{name: quackmux-data, mountPath: /data}]}]
+`,
+		"node name": `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        nodeName: node-1
+`,
+		"storage class": `    persistence: {size: 1Gi, storageClassName: Not_Valid}
+`,
+		"claim label": `    persistence: {size: 1Gi, labels: {"bad label!": x}}
+`,
+	} {
+		if err := Validate(testConfig(t, head+tail)); err == nil {
+			t.Errorf("%s: accepted", what)
+		} else {
+			t.Logf("%s: %v", what, err)
+		}
+	}
+	if err := Validate(testConfig(t, persistentYAML)); err != nil {
+		t.Fatalf("valid profile rejected: %v", err)
+	}
+	// Sidecars may mount the data volume by name, e.g. for backups.
+	sidecar := `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers:
+          - name: backup
+            image: backup:1
+            volumeMounts: [{name: quackmux-data, mountPath: /data, readOnly: true}]
+`
+	if err := Validate(testConfig(t, head+sidecar)); err != nil {
+		t.Fatalf("sidecar with the data volume rejected: %v", err)
+	}
+	// A mount next to the data volume, or one above it, hides nothing.
+	beside := `    persistence: {size: 1Gi}
+    podTemplate:
+      spec:
+        containers: [{name: engine, volumeMounts: [{name: a, mountPath: /data2}, {name: b, mountPath: /var/lib}]}]
+        volumes: [{name: a, emptyDir: {}}, {name: b, emptyDir: {}}]
+`
+	if err := Validate(testConfig(t, head+beside)); err != nil {
+		t.Fatalf("mounts beside the data volume rejected: %v", err)
+	}
+}
+
+// actionsOf lists "verb resource" of the recorded client actions.
+func actionsOf(e *testEnv) []string {
+	var out []string
+	for _, a := range e.client.Actions() {
+		out = append(out, a.GetVerb()+" "+a.GetResource().Resource)
+	}
+	return out
+}
+
+func TestLaunchCreatesClaimBeforePod(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	ctx := context.Background()
+	req := launchRequest(e.p, personalKey, false, "alice", "tok-123")
+	if _, err := e.p.Launch(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(actionsOf(e), ", ")
+	if !strings.HasPrefix(got, "get persistentvolumeclaims, create persistentvolumeclaims, list pods, create secrets, create pods") {
+		t.Fatalf("actions: %s", got)
+	}
+	pvc, err := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, dataClaimName("default", personalKey), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pvc.Labels[LabelComponent] != dataComponentValue || pvc.Labels[LabelInstance] != "default" ||
+		pvc.Labels[LabelKeyHash] != personalKey.Hash() || pvc.Labels[LabelShareLevel] != "user" || pvc.Labels["team"] != "data" ||
+		pvc.Annotations[AnnotationKey] != personalKey.String() || pvc.Annotations[AnnotationUser] != "alice" ||
+		pvc.Annotations["backup.example.com/enabled"] != "true" || pvc.Annotations[AnnotationLastLaunch] == "" {
+		t.Errorf("claim metadata %v %v", pvc.Labels, pvc.Annotations)
+	}
+	if len(pvc.OwnerReferences) != 0 {
+		t.Error("the claim must outlive its engine (no owner reference)")
+	}
+	if m := pvc.Spec.AccessModes; len(m) != 1 || m[0] != corev1.ReadWriteOncePod || *pvc.Spec.StorageClassName != "fast" ||
+		*pvc.Spec.VolumeMode != corev1.PersistentVolumeFilesystem {
+		t.Errorf("claim spec %+v", pvc.Spec)
+	}
+	if q := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; q.Cmp(resource.MustParse("5Gi")) != 0 {
+		t.Errorf("storage request %s", q.String())
+	}
+	// Terminate deletes pod and secret, never the claim.
+	if err := e.p.Terminate(ctx, req.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, pvc.Name, metav1.GetOptions{}); err != nil {
+		t.Errorf("claim gone after Terminate: %v", err)
+	}
+}
+
+func TestLaunchReusesClaimOfTheKey(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	ps := e.p.cfg.Profiles["personal"].Persistence
+	old := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	existing := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "bob", ps, old)
+	existing.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce} // created under an older config
+	e.add(t, existing)
+	ctx := context.Background()
+	if _, err := e.p.Launch(ctx, launchRequest(e.p, personalKey, false, "alice", "tok-123")); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range actionsOf(e) {
+		if a == "create persistentvolumeclaims" {
+			t.Fatal("an existing claim was created again")
+		}
+	}
+	pvc, _ := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, existing.Name, metav1.GetOptions{})
+	if pvc.Annotations[AnnotationUser] != "bob" || pvc.Annotations[AnnotationLastLaunch] == old.Format(time.RFC3339) {
+		t.Errorf("annotations after reuse: %v", pvc.Annotations)
+	}
+	if !strings.Contains(e.logs.String(), "keeps the access mode and storage class") {
+		t.Error("no warning about the access mode of the existing claim")
+	}
+}
+
+// The settings of a profile apply to new claims only. A launch that reuses a
+// claim with another storage class warns, and for a claim that never bound
+// (no data) it says how to create the claim anew: that is what unblocks a
+// claim that stays Pending with the class it was created with.
+func TestLaunchWarnsAboutClaimWithOtherClass(t *testing.T) {
+	for what, c := range map[string]struct {
+		class, volume string
+		profile       string // replaces "storageClassName: fast"
+		want          string // "" for no warning
+	}{
+		"pending, other class":  {class: "does-not-exist", want: "holds no data"},
+		"bound, other class":    {class: "slow", volume: "pv-1", want: "apply to new claims only"},
+		"same class":            {class: "fast"},
+		"profile without class": {class: "whatever", profile: "storageClassName: \"\"", want: ""},
+	} {
+		t.Run(what, func(t *testing.T) {
+			yaml := persistentYAML
+			if c.profile != "" {
+				yaml = strings.Replace(yaml, "storageClassName: fast", c.profile, 1)
+			}
+			e := newTestEnv(t, testConfig(t, yaml))
+			ps := e.p.cfg.Profiles["personal"].Persistence
+			existing := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice", ps, time.Now())
+			existing.Spec.StorageClassName = &c.class
+			existing.Spec.VolumeName = c.volume
+			e.add(t, existing)
+			if _, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123")); err != nil {
+				t.Fatal(err)
+			}
+			logs := e.logs.String()
+			if c.want == "" {
+				if strings.Contains(logs, "keeps the access mode and storage class") {
+					t.Fatalf("unexpected warning: %s", logs)
+				}
+				return
+			}
+			if !strings.Contains(logs, "keeps the access mode and storage class") || !strings.Contains(logs, c.want) {
+				t.Fatalf("want a warning with %q, got: %s", c.want, logs)
+			}
+		})
+	}
+}
+
+func TestLaunchRefusesUnusableClaims(t *testing.T) {
+	for what, mutate := range map[string]func(*corev1.PersistentVolumeClaim){
+		"other key": func(c *corev1.PersistentVolumeClaim) {
+			c.Annotations[AnnotationKey] = "USER/mallory/default/personal#0"
+		},
+		"other instance": func(c *corev1.PersistentVolumeClaim) { c.Labels[LabelInstance] = "staging" },
+		"not ours":       func(c *corev1.PersistentVolumeClaim) { delete(c.Labels, LabelManagedBy) },
+		"deleting": func(c *corev1.PersistentVolumeClaim) {
+			c.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+			c.Finalizers = []string{"kubernetes.io/pvc-protection"}
+		},
+		"lost": func(c *corev1.PersistentVolumeClaim) { c.Status.Phase = corev1.ClaimLost },
+	} {
+		t.Run(what, func(t *testing.T) {
+			e := newTestEnv(t, testConfig(t, persistentYAML))
+			c := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice", e.p.cfg.Profiles["personal"].Persistence, time.Now())
+			mutate(c)
+			e.add(t, c)
+			if _, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123")); err == nil {
+				t.Fatal("launch with an unusable claim succeeded")
+			}
+			for _, a := range actionsOf(e) {
+				if a == "create pods" || a == "create secrets" {
+					t.Fatalf("%s after a refused claim", a)
+				}
+			}
+		})
+	}
+}
+
+// A pod of the key that the registry does not know (one the initial List
+// skipped because its token could not be read, or one another gateway
+// process created) keeps a second pod of the key from being created, and it
+// is replayed to the manager.
+func TestLaunchRefusesSecondPodOfKey(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	other, _ := e.enginePod("quack-user-alice-older", personalKey, false, "tok-old")
+	e.add(t, other)
+	ctx := context.Background()
+	_, err := e.p.Launch(ctx, launchRequest(e.p, personalKey, false, "alice", "tok-123"))
+	if !errors.Is(err, engine.ErrHandover) || !strings.Contains(err.Error(), other.Name) {
+		t.Fatalf("launch next to another pod of the key: %v", err)
+	}
+	for _, a := range actionsOf(e) {
+		if a == "create pods" || a == "create secrets" {
+			t.Fatalf("%s next to another pod of the key", a)
+		}
+	}
+	if len(e.p.replayCh) != 1 {
+		t.Error("the pod of the key was not replayed to the manager")
+	}
+	// Pods of other keys do not matter.
+	bob := personalKey
+	bob.Owner = "bob"
+	if _, err := e.p.Launch(ctx, launchRequest(e.p, bob, false, "bob", "tok-456")); err != nil {
+		t.Fatalf("launch for another key: %v", err)
+	}
+}
+
+// A launch whose fence fails right before the pod would be created (a leader
+// whose lease went stale meanwhile) creates no pod and leaves no token
+// secret behind.
+func TestLaunchFence(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	ctx := context.Background()
+	req := launchRequest(e.p, personalKey, false, "alice", "tok-123")
+	req.Fence = func() bool { return false }
+	if _, err := e.p.Launch(ctx, req); !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("launch with a stale lease: %v", err)
+	}
+	pods, _ := e.client.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
+	secrets, _ := e.client.CoreV1().Secrets(testNamespace).List(ctx, metav1.ListOptions{})
+	if len(pods.Items) != 0 || len(secrets.Items) != 0 {
+		t.Fatalf("left behind: %d pods, %d secrets", len(pods.Items), len(secrets.Items))
+	}
+	if _, ok := e.p.cachedToken(req.ID); ok {
+		t.Error("the token of the fenced launch is still cached")
+	}
+	req = launchRequest(e.p, personalKey, false, "alice", "tok-456")
+	req.Fence = func() bool { return true }
+	if _, err := e.p.Launch(ctx, req); err != nil {
+		t.Fatalf("launch with a fresh lease: %v", err)
+	}
+}
+
+func TestLaunchClaimErrors(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	e.client.PrependReactor("create", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "persistentvolumeclaims"}, "x",
+			errors.New("exceeded quota: storage, requested: requests.storage=5Gi"))
+	})
+	_, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123"))
+	if err == nil || !strings.Contains(err.Error(), "exceeded quota") {
+		t.Fatalf("launch error %v", err)
+	}
+	for _, a := range actionsOf(e) {
+		if a == "create pods" || a == "create secrets" {
+			t.Fatalf("%s after a failed claim", a)
+		}
+	}
+
+	// A concurrent create (another gateway process) is fine if the claim is ours.
+	e = newTestEnv(t, testConfig(t, persistentYAML))
+	theirs := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice", e.p.cfg.Profiles["personal"].Persistence, time.Now())
+	e.client.PrependReactor("create", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if err := e.client.Tracker().Add(theirs); err != nil {
+			t.Error(err)
+		}
+		return true, nil, apierrors.NewAlreadyExists(schema.GroupResource{Resource: "persistentvolumeclaims"}, theirs.Name)
+	})
+	if _, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123")); err != nil {
+		t.Fatalf("launch after a concurrent create: %v", err)
+	}
+}
+
+func TestVolumesAndDeleteVolume(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	ps := e.p.cfg.Profiles["personal"].Persistence
+	launched := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	ours := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice", ps, launched)
+	ours.UID = "uid-1"
+	ours.Status.Phase = corev1.ClaimBound
+	ours.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("8Gi")}
+	other := e.p.dataClaim("quackmux-data-other", personalKey, "personal", "alice", ps, launched)
+	other.Labels[LabelInstance] = "staging"
+	plain := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: testNamespace}}
+	e.add(t, ours, other, plain)
+	ctx := context.Background()
+	vols, err := e.p.Volumes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vols) != 1 {
+		t.Fatalf("volumes %+v", vols)
+	}
+	v := vols[0]
+	if v.Name != ours.Name || v.EngineKey != personalKey || v.Owner != "alice" || v.ShareLevel != "USER" || v.Subdomain != "default" ||
+		v.Profile != "personal" || v.User != "alice" || v.Size != "8Gi" || v.StorageClass != "fast" || v.Phase != "Bound" ||
+		!v.LastLaunch.Equal(launched) || len(v.AccessModes) != 1 || v.AccessModes[0] != "ReadWriteOncePod" {
+		t.Errorf("volume %+v", v)
+	}
+	if err := e.p.DeleteVolume(ctx, other.Name, nil); !errors.Is(err, engine.ErrVolumeNotFound) {
+		t.Errorf("deleting another instance's claim: %v", err)
+	}
+	if err := e.p.DeleteVolume(ctx, "unrelated", nil); !errors.Is(err, engine.ErrVolumeNotFound) {
+		t.Errorf("deleting an unrelated claim: %v", err)
+	}
+	if err := e.p.DeleteVolume(ctx, "missing", nil); !errors.Is(err, engine.ErrVolumeNotFound) {
+		t.Errorf("deleting a missing claim: %v", err)
+	}
+	if err := e.p.DeleteVolume(ctx, ours.Name, nil); err != nil {
+		t.Fatal(err)
+	}
+	var del k8stesting.DeleteAction
+	for _, a := range e.client.Actions() {
+		if d, ok := a.(k8stesting.DeleteAction); ok && a.GetResource().Resource == "persistentvolumeclaims" {
+			del = d
+		}
+	}
+	if del == nil || del.GetName() != ours.Name || del.GetDeleteOptions().Preconditions == nil ||
+		*del.GetDeleteOptions().Preconditions.UID != "uid-1" {
+		t.Errorf("delete action %+v", del)
+	}
+}
+
+// DeleteVolume asks the API server whether a pod uses the claim: an engine
+// pod of its key (also one the registry does not know) and any other pod
+// that mounts it and has not terminated keep it.
+func TestDeleteVolumeRefusesWhilePodsUseIt(t *testing.T) {
+	bob := personalKey
+	bob.Owner = "bob"
+	for what, c := range map[string]struct {
+		pod     func(e *testEnv, claim string) *corev1.Pod
+		refused bool
+	}{
+		"engine pod of the key": {func(e *testEnv, _ string) *corev1.Pod {
+			pod, _ := e.enginePod("quack-user-alice-older", personalKey, false, "tok")
+			return pod
+		}, true},
+		"engine pod of the key without the volume": {func(e *testEnv, _ string) *corev1.Pod {
+			pod, _ := e.enginePod("quack-user-alice-memory", personalKey, false, "tok")
+			pod.Spec.Volumes = nil // started before persistence was switched on
+			return pod
+		}, true},
+		"foreign pod that mounts the claim": {func(_ *testEnv, claim string) *corev1.Pod {
+			return podWithClaim("debug", claim, corev1.PodRunning)
+		}, true},
+		"pending foreign pod that mounts the claim": {func(_ *testEnv, claim string) *corev1.Pod {
+			return podWithClaim("debug", claim, corev1.PodPending)
+		}, true},
+		"terminated foreign pod that mounted the claim": {func(_ *testEnv, claim string) *corev1.Pod {
+			return podWithClaim("copy-job", claim, corev1.PodSucceeded)
+		}, false},
+		"engine pod of another key": {func(e *testEnv, _ string) *corev1.Pod {
+			pod, _ := e.enginePod("quack-user-bob-abcde", bob, false, "tok")
+			return pod
+		}, false},
+	} {
+		t.Run(what, func(t *testing.T) {
+			e := newTestEnv(t, testConfig(t, persistentYAML))
+			claim := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice",
+				e.p.cfg.Profiles["personal"].Persistence, time.Now())
+			e.add(t, claim, c.pod(e, claim.Name))
+			ctx := context.Background()
+			err := e.p.DeleteVolume(ctx, claim.Name, nil)
+			_, getErr := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, claim.Name, metav1.GetOptions{})
+			if c.refused {
+				if !errors.Is(err, engine.ErrVolumeInUse) || getErr != nil {
+					t.Fatalf("delete: %v; claim afterwards: %v", err, getErr)
+				}
+				t.Log(err)
+				return
+			}
+			if err != nil || !apierrors.IsNotFound(getErr) {
+				t.Fatalf("delete: %v; claim afterwards: %v", err, getErr)
+			}
+		})
+	}
+}
+
+func podWithClaim(name, claim string, phase corev1.PodPhase) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+		Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+		}}}},
+		Status: corev1.PodStatus{Phase: phase},
+	}
+}
+
+// The case the registry misses: an engine pod of the key whose token secret
+// cannot be read when the gateway starts is skipped by the initial List.
+// Launches for the key are refused (TestLaunchRefusesSecondPodOfKey), and so
+// is the deletion of its volume: Kubernetes would delete the claim once the
+// pod ends, with everything the pod wrote meanwhile.
+func TestDeleteVolumeOfKeyWithUnknownPod(t *testing.T) {
+	cfg := testConfig(t, persistentYAML)
+	e := newTestEnv(t, cfg)
+	pod, secret := e.enginePod("quack-user-alice-older", personalKey, false, "tok-old")
+	pod.Status = readyStatus("10.0.0.7")
+	claim := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice",
+		cfg.Profiles["personal"].Persistence, time.Now())
+	e.add(t, pod, secret, claim)
+	unreadable := func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("etcd is unavailable"))
+	}
+	e.client.PrependReactor("get", "secrets", unreadable)
+	e.client.PrependReactor("list", "secrets", unreadable)
+	m := engine.NewManager(cfg, e.p, slog.New(slog.DiscardHandler), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(m.List()); n != 0 {
+		t.Fatalf("the registry knows %d engines, want none (the token is unreadable)", n)
+	}
+	_, err := m.DeleteVolume(ctx, claim.Name)
+	if !errors.Is(err, engine.ErrVolumeInUse) || !strings.Contains(err.Error(), pod.Name) {
+		t.Fatalf("delete while pod %s of the key exists: %v", pod.Name, err)
+	}
+	if _, err := e.client.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, claim.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("claim afterwards: %v", err)
+	}
+}
+
+// The fence is checked once more right before the delete: a leader whose
+// lease went stale while it listed the pods deletes nothing.
+func TestDeleteVolumeFence(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	claim := e.p.dataClaim(dataClaimName("default", personalKey), personalKey, "personal", "alice",
+		e.p.cfg.Profiles["personal"].Persistence, time.Now())
+	e.add(t, claim)
+	ctx := context.Background()
+	var fresh atomic.Bool
+	fresh.Store(true)
+	e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		fresh.Store(false) // the process froze while it listed the pods
+		return false, nil, nil
+	})
+	if err := e.p.DeleteVolume(ctx, claim.Name, fresh.Load); !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("delete with a stale lease: %v", err)
+	}
+	for _, a := range actionsOf(e) {
+		if a == "delete persistentvolumeclaims" {
+			t.Fatal("the claim was deleted with a stale lease")
+		}
+	}
+	fresh.Store(true)
+	e.client.ReactionChain = e.client.ReactionChain[1:]
+	if err := e.p.DeleteVolume(ctx, claim.Name, fresh.Load); err != nil {
+		t.Fatalf("delete with a fresh lease: %v", err)
+	}
+}
+
+// A pod of the key that does not mount its data volume (an engine started
+// before persistence was switched on for the profile) does not keep the
+// first engine with the volume from starting: the manager drains it.
+func TestLaunchIgnoresPodOfKeyWithoutVolume(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	memory, _ := e.enginePod("quack-user-alice-memory", personalKey, false, "tok-old")
+	memory.Spec.Volumes = nil
+	e.add(t, memory)
+	if _, err := e.p.Launch(context.Background(), launchRequest(e.p, personalKey, false, "alice", "tok-123")); err != nil {
+		t.Fatalf("launch next to a pod of the key without the volume: %v", err)
+	}
+}
+
+// The replacement deadline is an annotation of the engine pod; instances
+// read it back after a restart.
+func TestRecordReplacementDue(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	pod, _ := e.enginePod("quack-user-alice-abcde", personalKey, false, "tok")
+	e.add(t, pod)
+	ctx := context.Background()
+	due := time.Date(2026, 11, 22, 10, 30, 0, 0, time.UTC)
+	if err := e.p.RecordReplacementDue(ctx, pod.Name, due.In(time.FixedZone("CET", 3600))); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := e.client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if v := got.Annotations[AnnotationReplaceDue]; v != "2026-11-22T10:30:00Z" {
+		t.Fatalf("annotation %q", v)
+	}
+	if inst, err := instanceFromPod(got); err != nil || !inst.ReplaceDue.Equal(due) {
+		t.Fatalf("instance: %v %v", inst.ReplaceDue, err)
+	}
+	if err := e.p.RecordReplacementDue(ctx, pod.Name, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = e.client.CoreV1().Pods(testNamespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if v, ok := got.Annotations[AnnotationReplaceDue]; ok {
+		t.Fatalf("annotation %q left after clearing", v)
+	}
+	if got.Annotations[AnnotationKey] != personalKey.String() {
+		t.Error("clearing the deadline touched other annotations")
+	}
+	if inst, _ := instanceFromPod(got); !inst.ReplaceDue.IsZero() {
+		t.Errorf("instance deadline %v after clearing", inst.ReplaceDue)
+	}
+	if err := e.p.RecordReplacementDue(ctx, "quack-user-nobody-x", due); err == nil {
+		t.Error("recording on a missing pod succeeded")
+	}
+}

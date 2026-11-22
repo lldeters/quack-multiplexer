@@ -11,8 +11,12 @@
 // needed to rebuild the registry after a gateway restart: key, user,
 // profile, spec hash and the name of the token secret.
 //
+// Profiles with persistence get a PersistentVolumeClaim per engine key,
+// created before the pod and kept when the engine ends (volume.go).
+//
 // Required RBAC in the engine namespace: pods get/list/watch/create/delete/
-// patch, secrets get/list/create/delete/patch, events create.
+// patch, secrets get/list/create/delete/patch, events create,
+// persistentvolumeclaims get/list/create/patch/delete.
 package kubernetes
 
 import (
@@ -422,7 +426,9 @@ func (p *Provider) List(ctx context.Context) ([]engine.Instance, error) {
 }
 
 // Launch implements engine.Provider: it creates the token secret and the
-// pod and returns the instance in PhaseStarting.
+// pod and returns the instance in PhaseStarting. For a profile with
+// persistence it first makes sure that the data volume claim of the key
+// exists and that no other pod of the key does (volume.go).
 func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine.Instance, error) {
 	if errs := validation.IsDNS1123Label(req.ID); len(errs) > 0 {
 		return engine.Instance{}, fmt.Errorf("kubernetes provider: invalid engine id %q: %s", req.ID, strings.Join(errs, "; "))
@@ -440,6 +446,15 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 	})
 	secret := p.secret(req.ID, req.Token, engine.RenderInitSQL(req.Profile))
 	secrets := p.client.CoreV1().Secrets(p.namespace)
+	if req.Profile.Persistence != nil {
+		// The claim before the pod, which would otherwise wait for it.
+		if _, err := p.ensureDataClaim(ctx, req); err != nil {
+			return engine.Instance{}, err
+		}
+		if err := p.checkSoleEngine(ctx, req); err != nil {
+			return engine.Instance{}, err
+		}
+	}
 
 	// Known before the pod exists, so that its first events carry the token.
 	p.storeToken(req.ID, req.Token)
@@ -447,7 +462,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		p.forgetToken(req.ID)
 		return engine.Instance{}, fmt.Errorf("create token secret %s: %w", secret.Name, err)
 	}
-	created, err := p.client.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{FieldManager: eventComponent})
+	created, err := p.createPod(ctx, pod, req.Fence)
 	if err != nil {
 		p.forgetToken(req.ID)
 		// The caller's context may be what failed; clean up regardless.
@@ -477,6 +492,23 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		inst.CreatedAt = p.now()
 	}
 	return inst, nil
+}
+
+// createPod creates the engine pod. The fence of a launch (see
+// engine.LaunchRequest.Fence) is checked as late as possible: the lease may
+// have gone stale during the calls of Launch before, and while client-go's
+// rate limiter holds the request back. The client of NewClient checks it
+// again when the request is sent (fence.go).
+func (p *Provider) createPod(ctx context.Context, pod *corev1.Pod, fence func() bool) (*corev1.Pod, error) {
+	if fence != nil && !fence() {
+		return nil, engine.ErrNotLeader
+	}
+	created, err := p.client.CoreV1().Pods(p.namespace).Create(withFence(ctx, fence), pod,
+		metav1.CreateOptions{FieldManager: eventComponent})
+	if errors.Is(err, engine.ErrNotLeader) {
+		return nil, engine.ErrNotLeader // not sent: drop client-go's "Post <url>:" wrapping
+	}
+	return created, err
 }
 
 // attachSecret makes the pod the owner of its token secret, so that

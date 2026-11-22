@@ -136,5 +136,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
       - name: Create the cluster, build and load the images, deploy the dev overlay
         run: bash test/e2e/kind/setup.sh
-      - name: Scenarios k1-k4
+      # k5-k8 (persistent profile) use kind's default StorageClass, which
+      # supports ReadWriteOncePod.
+      - name: Scenarios k1-k8
         run: bash test/e2e/kind/test.sh

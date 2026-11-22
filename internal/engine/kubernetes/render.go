@@ -119,7 +119,15 @@ func (r *renderer) pod(in podInput) *corev1.Pod {
 	c := &spec.Containers[engineContainer(spec)]
 	r.shapeContainer(c, in)
 	ensureTmpVolume(spec, c)
+	if ps := prof.Persistence; ps != nil {
+		addDataVolume(spec, c, dataClaimName(r.instance, in.Key), ps)
+	}
 	applyPodSecurityDefaults(spec)
+	if prof.Persistence != nil && spec.SecurityContext.FSGroupChangePolicy == nil {
+		// Adjust the ownership of the data volume only while its root does
+		// not match fsGroup yet, not on every mount.
+		spec.SecurityContext.FSGroupChangePolicy = ptrTo(corev1.FSGroupChangeOnRootMismatch)
+	}
 	applyContainerSecurityDefaults(c)
 	return pod
 }
@@ -691,6 +699,11 @@ func (r *renderer) validateProfiles() error {
 		case corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:
 		default:
 			errs = append(errs, fmt.Errorf("profiles.%s.imagePullPolicy: %q is not Always, IfNotPresent or Never", name, policy))
+		}
+		if prof.Persistence != nil {
+			if err := r.validatePersistence(name, prof, pod); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if err := errors.Join(errs...); err != nil {

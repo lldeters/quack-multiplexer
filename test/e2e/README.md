@@ -5,7 +5,7 @@ Diese Tests prüfen quackmux mit **echten DuckDB-2.0-Clients und -Engines**. Es 
 | Umgebung | Verzeichnis | Was läuft | Dauer |
 |---|---|---|---|
 | Docker Compose | [compose](compose) | Gateway mit Provider `static` vor zwei Engine-Containern, Auth `static` | ca. 1 min (plus Build) |
-| kind | [kind](kind) | Overlay `deploy/kubernetes/overlays/dev`: Das Gateway startet Engine-Pods selbst | einige Minuten |
+| kind | [kind](kind) | Overlay `deploy/kubernetes/overlays/dev`: Das Gateway startet Engine-Pods selbst, auch mit Volume pro Benutzer | einige Minuten |
 
 Die Unit- und Integrationstests (`go test ./...`) brauchen weder Docker noch DuckDB. Das gilt auch für die
 Go-Tests in diesem Verzeichnis: Sie prüfen nur die Fixtures des Compose-Tests (siehe
@@ -113,7 +113,7 @@ HTTP).
 
 ```bash
 bash test/e2e/kind/setup.sh      # Cluster "quackmux", Images bauen und laden, Overlay dev ausrollen
-bash test/e2e/kind/test.sh       # Szenarien k1–k4 (beliebig oft wiederholbar)
+bash test/e2e/kind/test.sh       # Szenarien k1–k8 (beliebig oft wiederholbar, etwa 6 min)
 bash test/e2e/kind/ha.sh         # Hochverfügbarkeit: Szenarien h1–h5 mit overlays/ha
 bash test/e2e/kind/teardown.sh   # Cluster löschen
 ```
@@ -132,7 +132,7 @@ per `kubectl exec` und sprechen das Gateway über seinen Service an (`quack:quac
 das Skript per `kubectl port-forward` auf `127.0.0.1:19695`. Das Dev-Overlay nutzt `auth.mode: none`, der Benutzer
 kommt also aus der Token-Option (`TOKEN 'e2e?user=e2e-alice-<run-id>&share_level=connection'`). Jeder Lauf verwendet
 neue Benutzernamen mit der Run-ID und beendet die Engines, die er gestartet hat, über
-`DELETE /api/v1/engines/{id}`.
+`DELETE /api/v1/engines/{id}`. Die Volumes seiner Benutzer löscht er am Ende über `DELETE /api/v1/volumes/{name}`.
 
 | | Ablauf | Was es beweist |
 |---|---|---|
@@ -140,11 +140,19 @@ neue Benutzernamen mit der Run-ID und beendet die Engines, die er gestartet hat,
 | k2 | Zwei Sessions desselben Benutzers mit `share_level=user`; die erste legt eine Tabelle an, die zweite liest sie | Beide Sessions teilen sich genau einen Engine-Pod und dessen Datenbank. |
 | k3 | Der Engine-Pod einer `USER`-Session wird gelöscht. Danach eine Query auf demselben Attachment, dann `DETACH` und erneutes `ATTACH` | Das Gateway erkennt den Verlust über den Informer und schließt die Session. Die nächste Query scheitert mit „session closed“ statt zu hängen. Ein neues `ATTACH` startet einen neuen Pod und funktioniert. |
 | k4 | Eine offene Session, dann `kubectl rollout restart` des Gateways, danach eine Query auf demselben Attachment | Das neue Gateway findet die Engine-Pods wieder (Discovery) und übernimmt die Session aus der versiegelten Connection-ID (Adoption): Die Query klappt, die Admin-API zeigt die Session mit `"adopted": true` auf derselben Engine. Das Dev-Overlay nutzt die Strategie `Recreate`; dass Heartbeats in der kurzen Pause scheitern, toleriert der Client. Scheitert die erste Query nach dem Neustart mit einem Transportfehler, wiederholt das Skript sie bis zu zweimal und meldet das als Warnung. |
+| k5 | Eine Session mit `profile=persistent` legt eine Tabelle an. Die Admin-API draint ihre Engine, während die Session angehängt bleibt, und eine zweite Session desselben Benutzers attacht; dann detacht die erste. Danach wird der Engine-Pod gelöscht, und die zweite Session attacht neu. | Die Engine mountet einen eigenen Claim (`ReadWriteOncePod`, `Bound`, Annotation `quackmux.io/key` mit dem Schlüssel des Benutzers). Die zweite Session wartet, solange die gedrainte Engine eine Session hat: Ihr `ATTACH` bleibt offen, das Gateway-Log meldet `a new session waits for the previous engine of its key`. Die nächste Engine startet erst, wenn der alte Pod aus der API verschwunden ist, mit demselben Claim und der Tabelle. Auch nach dem Löschen des Pods ist die Tabelle da. Ein Watch auf `quackmux.io/key-hash` sieht nie zwei Pods. |
+| k6 | Zwei Benutzer mit `profile=persistent`; der zweite fragt die Tabelle des ersten ab. Ein dritter Client wählt `subdomain=other`. | Jeder Benutzer hat seinen eigenen Claim und sieht nur seine Daten („does not exist“). Eine Subdomain außerhalb von `allowedSubdomains` lehnt das Gateway ab („does not allow subdomain“). |
+| k7 | Das Profil `persistent` wird geändert (eine neue ConfigMap mit zusätzlichem Label, Rollout des Gateways). Eine zweite Session kommt hinzu, danach enden beide; dann attacht eine dritte. | Die veraltete Engine nimmt weiter Sessions an (`replacement pending`, zwei Sessions), statt neben einer Nachfolgerin zu laufen. Sie endet, sobald sie idle ist (nach `engine.recoveryGrace` des neu gestarteten Gateways, daher dauert k7 etwa fünf Minuten); erst dann startet die Nachfolgerin, mit demselben Claim und denselben Daten. Der Watch sieht nie zwei Pods des Schlüssels. Danach stellt das Skript die Konfiguration wieder her. |
+| k8 | `GET /api/v1/volumes?owner=…`, `DELETE /api/v1/volumes/{name}` mit laufender Engine, mit einem Debug-Pod, der den Claim mountet, und ohne beides | Die Admin-API listet den Claim mit seiner Engine. Sie lehnt das Löschen ab (409), solange die Engine existiert und solange ein anderer Pod den Claim mountet (das Gateway fragt dafür die Kubernetes-API, nicht seine Registry), und löscht ihn danach (202). |
 
 Anforderungen an das Overlay (das Dev-Overlay erfüllt sie): `auth.mode: none`, ein gemeinsamer Session-Key
 (`server.sessionKeyFile` oder `QUACKMUX_SESSION_KEY`, sonst scheitert k4 mit „Invalid connection id“), ein Service mit
 Port 9494, Platz für mindestens zwei gleichzeitige Engines (`limits.maxEngines`), auch für denselben Benutzer
-(`limits.maxEnginesPerUser`), Pool-Größe 1 und ein kurzes `engine.checkInterval` (Default 5 s).
+(`limits.maxEnginesPerUser`), Pool-Größe 1 und ein kurzes `engine.checkInterval` (Default 5 s). Für k5–k8 ein Profil
+`persistent` mit `allowedShareLevels: [USER]`, `allowedSubdomains: [default]` und `persistence`, die ConfigMap der
+Gateway-Konfiguration im Volume `config` des Deployments (k7 tauscht sie aus) und eine Default-StorageClass, die
+`ReadWriteOncePod` kann (in kind: `standard`, local-path). Ohne Default-StorageClass bricht `test.sh` gleich zu Beginn
+ab.
 
 | Variable | Default | Bedeutung |
 |---|---|---|
@@ -193,6 +201,21 @@ unterwegs ist, darf scheitern (nie doppelt laufen); das Skript wiederholt sie bi
 h3 braucht `docker exec` auf dem kind-Node (`crictl inspect` liefert die PID des Gateway-Containers). Wer
 Fehler untersuchen will, lässt das HA-Deployment mit `KEEP_HA=1` stehen; das erzeugte Overlay mit seinen Secrets
 bleibt dann ebenfalls liegen.
+
+**h6, persistente Schlüssel mit HA:** ha.sh fügt der Konfiguration des erzeugten Overlays das Profil `persistent`
+hinzu (ein Volume pro Benutzer, Subdomains `default` und `late`); hat das Overlay keine `config.yaml` mit
+`profiles:`, entfällt h6 mit einer Warnung. Eine Session des Profils legt eine Tabelle an, dann friert das Skript
+den Leader ein wie in h3. Währenddessen verbindet sich ein zweiter Client direkt mit dem eingefrorenen Pod, für die
+Subdomain `late` (ein Schlüssel ohne Engine), und nach der Übernahme attacht ein dritter über den Service. Geprüft
+wird:
+
+* Der neue Leader übernimmt die Engine und gibt der neuen Session des Schlüssels dieselbe; sie sieht die Tabelle.
+  Ein Watch auf `quackmux.io/key-hash` sieht nie zwei Pods des Schlüssels.
+* Der aufgeweckte Leader beantwortet das wartende `ATTACH` mit einem Fehler und startet keine Engine für `late`:
+  Ohne frische Lease startet er keine Engine eines persistenten Schlüssels.
+* Auf dem Follower antworten `GET` und `DELETE /api/v1/volumes` mit 503.
+* Die Session von vor dem Einfrieren arbeitet weiter. Am Ende löscht das Skript Engine und Claim über die
+  Admin-API des Leaders.
 
 | Variable | Default | Bedeutung |
 |---|---|---|
