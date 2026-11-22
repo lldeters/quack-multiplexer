@@ -47,6 +47,13 @@ type Instance struct {
 	CreatedAt time.Time
 	// Message explains the phase (e.g. "ImagePullBackOff: ...").
 	Message string
+	// Volume names the data volume of an engine of a persistent profile
+	// (the PersistentVolumeClaim its pod mounts); empty otherwise.
+	Volume string
+	// ReplaceDue is when the replacement of an engine of a persistent
+	// profile fell due, as recorded on the instance (see
+	// ReplacementRecorder); zero if it did not.
+	ReplaceDue time.Time
 }
 
 // LaunchRequest asks a provider to start an engine.
@@ -62,6 +69,12 @@ type LaunchRequest struct {
 	// engine (QUACK_TOKEN) and store it so that List can return it later.
 	Token    string
 	SpecHash string
+	// Fence, if set, must report true right before the provider creates the
+	// instance; otherwise Launch fails with ErrNotLeader. The manager sets
+	// it for persistent keys with leader election: a leader that resumes
+	// after a freeze must not start a second engine on a data volume next
+	// to the one the new leader started meanwhile (see persistence.go).
+	Fence func() bool
 }
 
 // ErrNotSupported is returned by providers that cannot perform an operation

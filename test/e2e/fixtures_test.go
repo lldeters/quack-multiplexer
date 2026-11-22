@@ -387,8 +387,12 @@ func TestComposeFile(t *testing.T) {
 	if err := yaml.Unmarshal(readFile(t, composeFile), &cf); err != nil {
 		t.Fatalf("%s: %v", composeFile, err)
 	}
-	if ref := "-p " + cf.Name + " "; cf.Name == "" || !bytes.Contains(readFile(t, runScript), []byte(ref)) {
-		t.Errorf("%s: project name %q does not match the one run.sh uses", composeFile, cf.Name)
+	// run.sh passes -p "$E2E_PROJECT", whose default must be the file's name.
+	if ref := "E2E_PROJECT=${E2E_PROJECT:-" + cf.Name + "}"; cf.Name == "" || !bytes.Contains(readFile(t, runScript), []byte(ref)) {
+		t.Errorf("%s: project name %q does not match the default run.sh uses", composeFile, cf.Name)
+	}
+	if !bytes.Contains(readFile(t, runScript), []byte(`docker compose -p "$E2E_PROJECT" `)) {
+		t.Errorf("%s: docker compose does not get the project name E2E_PROJECT", runScript)
 	}
 	gw := loadConfig(t, gatewayConfig)
 

@@ -17,6 +17,8 @@
 //	GET    /api/v1/engines/{id}              {"engine": {...}, "sessions": [...]}
 //	POST   /api/v1/engines/{id}/drain        take an engine out of rotation (202)
 //	DELETE /api/v1/engines/{id}              terminate an engine and close its sessions (202)
+//	GET    /api/v1/volumes[?owner=]          {"volumes": [...], "count": n} (persistent profiles)
+//	DELETE /api/v1/volumes/{name}            delete a data volume whose key has no engine (202)
 //
 // API errors are JSON objects of the form {"error": "..."} with a matching
 // HTTP status code. GET requests never change any state.
@@ -94,6 +96,9 @@ type Options struct {
 	// A nil manager is treated as one without any sessions or engines.
 	Sessions Sessions
 	Engines  Engines
+	// Volumes manages the data volumes of persistent profiles; nil means
+	// there are none.
+	Volumes Volumes
 	// Metrics is exposed on /metrics; nil disables the endpoint.
 	Metrics *metrics.Metrics
 	// Token is the bearer token required for /api. Empty disables
@@ -115,6 +120,7 @@ type Options struct {
 type Server struct {
 	sessions  Sessions
 	engines   Engines
+	volumes   Volumes
 	tokenHash *[sha256.Size]byte // nil: no authentication
 	ready     func() (bool, string)
 	live      func() bool
@@ -134,6 +140,7 @@ func New(o Options) *Server {
 	s := &Server{
 		sessions:  o.Sessions,
 		engines:   o.Engines,
+		volumes:   o.Volumes,
 		ready:     o.Ready,
 		live:      o.Live,
 		log:       log.With("component", "admin"),
@@ -173,6 +180,8 @@ func New(o Options) *Server {
 		http.MethodDelete: s.handleTerminateEngine,
 	})
 	s.route(api, "/api/v1/engines/{id}/drain", methods{http.MethodPost: s.handleDrainEngine})
+	s.route(api, "/api/v1/volumes", methods{http.MethodGet: s.handleListVolumes})
+	s.route(api, "/api/v1/volumes/{name}", methods{http.MethodDelete: s.handleDeleteVolume})
 	api.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "no such endpoint: "+r.URL.Path)
 	})

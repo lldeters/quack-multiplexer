@@ -108,7 +108,6 @@ profiles:
     description: "Standard engine: 1-2 CPUs, 4 GiB memory"
     image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
     imagePullPolicy: IfNotPresent
-    database: ":memory:"
     # Applied with SET before the Quack server starts. memory_limit stays
     # below limits.memory to leave room for allocations outside DuckDB's
     # buffer manager.

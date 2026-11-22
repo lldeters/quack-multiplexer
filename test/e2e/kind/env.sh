@@ -125,6 +125,8 @@ pod_gone() {
 diagnostics() {
 	step "diagnostics (namespace $NS)"
 	kctl -n "$NS" get pods -o wide >&2 || true
+	say "data volume claims:"
+	kctl -n "$NS" get pvc -l app.kubernetes.io/component=engine-data >&2 || true
 	say "recent events:"
 	kctl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 25 >&2 || true
 	say "gateway log (last 150 lines):"
@@ -146,6 +148,58 @@ engine_pods() {
 
 # new_pods BEFORE_FILE prints the engine pods that are not in BEFORE_FILE.
 new_pods() { engine_pods | LC_ALL=C comm -13 "$1" -; }
+
+# Engines of persistent profiles ------------------------------------------------
+
+# DATA_VOLUME is the pod volume of the data volume claim of an engine.
+DATA_VOLUME=quackmux-data
+
+# claim_of POD prints the claim that engine pod POD mounts as its data volume.
+claim_of() {
+	kctl -n "$NS" get pod "$1" -o jsonpath="{.spec.volumes[?(@.name==\"$DATA_VOLUME\")].persistentVolumeClaim.claimName}" 2>/dev/null
+}
+
+# key_hash_of POD prints the key hash label of engine pod POD; all pods (and
+# the claim) of one engine key carry the same one.
+key_hash_of() {
+	kctl -n "$NS" get pod "$1" -o jsonpath='{.metadata.labels.quackmux\.io/key-hash}' 2>/dev/null
+}
+
+# key_watch_start HASH FILE records every pod of the key HASH, as the API
+# server reports it, in FILE (until key_watch_stop).
+KEY_WATCH_PID=''
+key_watch_start() {
+	key_watch_stop
+	(
+		close_session_fds
+		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" get pods -l "quackmux.io/key-hash=$1" --watch \
+			--output-watch-events -o jsonpath='{.type} {.object.metadata.name}{"\n"}'
+	) >"$2" 2>&1 &
+	KEY_WATCH_PID=$!
+	# The watch starts with an ADDED event per existing pod.
+	wait_for 30 "the watch of the pods of key $1" grep -q ADDED "$2"
+}
+
+key_watch_stop() {
+	if [ -n "$KEY_WATCH_PID" ]; then
+		kill "$KEY_WATCH_PID" 2>/dev/null || true
+		wait "$KEY_WATCH_PID" 2>/dev/null || true
+		KEY_WATCH_PID=''
+	fi
+}
+
+# expect_one_pod_at_a_time FILE HASH stops the watch and checks that at no
+# time more than one pod object of the key existed.
+expect_one_pod_at_a_time() {
+	local max
+	key_watch_stop
+	max=$(awk '$1 == "ADDED" { live[$2] = 1 } $1 == "DELETED" { delete live[$2] }
+		{ n = 0; for (p in live) n++; if (n > max) max = n } END { print max + 0 }' "$1")
+	if ! expect_eq "$max" 1 "never more than one engine pod of the key existed (watch of key-hash $2)"; then
+		indent "$1"
+		return 1
+	fi
+}
 
 # Client pod -----------------------------------------------------------------
 

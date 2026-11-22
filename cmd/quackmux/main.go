@@ -99,6 +99,9 @@ func cmdValidate(args []string) error {
 	if err := validateStartup(cfg); err != nil {
 		return err
 	}
+	for _, w := range cfg.Warnings() {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
 	fmt.Println("configuration is valid")
 	return nil
 }
@@ -234,6 +237,9 @@ func cmdServe(args []string) error {
 	}
 	log := newLogger(cfg.Log)
 	log.Info("starting quackmux", "version", version, "provider", cfg.Provider.Type, "auth", cfg.Auth.Mode)
+	for _, w := range cfg.Warnings() {
+		log.Warn(w)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -276,11 +282,16 @@ func cmdServe(args []string) error {
 	var namespace string
 	switch cfg.Provider.Type {
 	case "kubernetes":
-		kube, _, err = kubernetes.NewClient(cfg.Provider.Kubernetes)
+		engineClient, rc, err := kubernetes.NewClient(cfg.Provider.Kubernetes)
 		if err != nil {
 			return fmt.Errorf("kubernetes client: %w", err)
 		}
-		kp, err := kubernetes.New(cfg, kube, log)
+		// Leader election gets a client with a rate limiter of its own: a
+		// burst of engine launches must not delay the renewals of its lease.
+		if kube, err = kubernetes.NewClientForConfig(rc); err != nil {
+			return fmt.Errorf("kubernetes client: %w", err)
+		}
+		kp, err := kubernetes.New(cfg, engineClient, log)
 		if err != nil {
 			return err
 		}
@@ -353,7 +364,7 @@ func cmdServe(args []string) error {
 		log.Warn("admin API has no token (admin.tokenFile): anyone who can reach it can manage sessions and engines")
 	}
 	adm := admin.New(admin.Options{
-		Sessions: sessions, Engines: engines, Metrics: met, Token: adminToken, Ready: ready,
+		Sessions: sessions, Engines: engines, Volumes: engines, Metrics: met, Token: adminToken, Ready: ready,
 		Live: func() bool { return true }, Log: log, Version: version,
 	})
 

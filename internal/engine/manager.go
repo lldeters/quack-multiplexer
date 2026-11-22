@@ -67,12 +67,21 @@ type engine struct {
 	Recovered   bool
 	Sessions    int
 	Reserved    int
+	// Volume is the data volume claim of an engine of a persistent profile.
+	Volume      string
 	terminateAt time.Time // last Terminate call, for retries
+	// replaceSince is when a persistent engine became due for replacement
+	// (see replaceLocked); zero while it is not.
+	replaceSince time.Time
 
 	inFlight atomic.Int64
 	lastUsed atomic.Int64 // unix nanos
 
 	ready chan struct{} // closed exactly once, when the engine leaves STARTING
+	gone  chan struct{} // closed exactly once, when the engine leaves the registry
+	// launched is closed when the provider's Launch call returned; nil for
+	// engines this process did not launch (see terminateLocked).
+	launched chan struct{}
 }
 
 func (e *engine) touch(now time.Time) { e.lastUsed.Store(now.UnixNano()) }
@@ -117,6 +126,7 @@ type View struct {
 	InFlight    int64     `json:"inFlight"`
 	SpecHash    string    `json:"specHash"`
 	SpecCurrent bool      `json:"specCurrent"`
+	Volume      string    `json:"volume,omitempty"`
 }
 
 // Target is what the proxy needs to forward a request.
@@ -179,6 +189,9 @@ type Manager struct {
 	// refills back off while warmRetryAt lies ahead.
 	warmFailures map[string]int
 	warmRetryAt  map[string]time.Time
+	// volumeOps counts data volume deletions in progress per key; no engine
+	// is launched for such a key (see DeleteVolume).
+	volumeOps map[Key]int
 
 	synced   chan struct{}
 	syncOnce sync.Once
@@ -198,6 +211,7 @@ func NewManager(cfg *config.Config, prov Provider, log *slog.Logger, met *metric
 		specHashes:   map[string]string{},
 		warmFailures: map[string]int{},
 		warmRetryAt:  map[string]time.Time{},
+		volumeOps:    map[Key]int{},
 		synced:       make(chan struct{}),
 	}
 }
@@ -281,7 +295,11 @@ func (m *Manager) registerLocked(inst Instance, now time.Time, recovered bool) *
 		StateSince:  now,
 		Message:     inst.Message,
 		Recovered:   recovered,
-		ready:       make(chan struct{}),
+		Volume:      inst.Volume,
+		// Recorded by an earlier gateway process (see replaceLocked).
+		replaceSince: inst.ReplaceDue,
+		ready:        make(chan struct{}),
+		gone:         make(chan struct{}),
 	}
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = now
@@ -361,6 +379,9 @@ func (m *Manager) applyEvent(inst Instance, only *engine) {
 	}
 	if inst.Endpoint != "" {
 		e.Endpoint = inst.Endpoint
+	}
+	if inst.Volume != "" {
+		e.Volume = inst.Volume
 	}
 	switch inst.Phase {
 	case PhaseReady:
@@ -447,6 +468,7 @@ func (m *Manager) setFailedLocked(e *engine, now time.Time, msg string) {
 
 func (m *Manager) removeLocked(e *engine) {
 	leaveStartingLocked(e)
+	close(e.gone)
 	delete(m.engines, e.ID)
 	delete(m.byUID, UIDOf(e.ID))
 	m.log.Info("engine removed", "engine", e.ID, "key", e.Key.String(), "state", e.State)
@@ -466,13 +488,20 @@ func (m *Manager) Acquire(ctx context.Context, key Key, user string) (*Lease, er
 	if key.ShareLevel != ShareConnection && prof.Pool.Size > 1 {
 		key.PoolIndex = m.selectPoolIndex(key.Base(), prof.Pool)
 	}
+	// A persistent key has one startup budget for the whole call, including
+	// the wait for its previous engine (see reserve). Other keys keep a
+	// budget per engine.
+	var deadline time.Time
+	if prof.Persistence != nil {
+		deadline = time.Now().Add(m.cfg.EngineStartupTimeout(key.Profile))
+	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		e, err := m.reserve(ctx, key, user, prof)
+		e, err := m.reserve(ctx, key, user, prof, deadline)
 		if err != nil {
 			return nil, err
 		}
-		lease, err := m.wait(ctx, e)
+		lease, err := m.wait(ctx, e, deadline)
 		if err == nil {
 			return lease, nil
 		}
@@ -487,14 +516,26 @@ func (m *Manager) Acquire(ctx context.Context, key Key, user string) (*Lease, er
 var errRetry = errors.New("engine left service while waiting")
 
 // reserve finds, claims or launches the engine for key and reserves it.
-func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config.Profile) (*engine, error) {
-	claimFailed := false
+func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config.Profile, deadline time.Time) (*engine, error) {
+	claimFailed, waitLogged := false, false
 	for {
 		m.mu.Lock()
 		if e := m.findLocked(key); e != nil {
 			e.Reserved++
 			m.mu.Unlock()
 			return e, nil
+		}
+		if prof.Persistence != nil {
+			// Only one engine may use the data volume of the key (see
+			// persistence.go). awaitPredecessorLocked keeps m.mu only when
+			// the key may get a new engine now.
+			waited, err := m.awaitPredecessorLocked(ctx, key, deadline, &waitLogged)
+			if err != nil {
+				return nil, err
+			}
+			if waited {
+				continue
+			}
 		}
 		if key.ShareLevel == ShareConnection && !claimFailed {
 			if err := m.checkUserLimitLocked(user); err != nil {
@@ -566,8 +607,16 @@ func (m *Manager) findLocked(key Key) *engine {
 
 // servesNewLocked reports whether e may take new sessions of key.
 func (m *Manager) servesNewLocked(e *engine, key Key) bool {
-	return !e.Warm && e.Key == key && (e.State == StateReady || e.State == StateStarting) &&
-		(m.specCurrentLocked(e) || !m.replaceOnSpecChange())
+	if e.Warm || e.Key != key || (e.State != StateReady && e.State != StateStarting) {
+		return false
+	}
+	if m.persistent(e.ProfileName) {
+		// The engine of a persistent key is the only one that may open its
+		// data volume, so it keeps taking sessions until it is replaced
+		// (Reconcile, replaceLocked). One without the volume takes none.
+		return m.mountsVolumeLocked(e)
+	}
+	return m.specCurrentLocked(e) || !m.replaceOnSpecChange()
 }
 
 // olderEngine orders engines by creation, then by id.
@@ -717,6 +766,8 @@ func (m *Manager) newEngineLocked(key Key, user string, warm bool) *engine {
 		CreatedAt:   now,
 		StateSince:  now,
 		ready:       make(chan struct{}),
+		gone:        make(chan struct{}),
+		launched:    make(chan struct{}),
 	}
 	e.touch(now)
 	m.addLocked(e)
@@ -737,11 +788,17 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 		Token:       e.Token,
 		SpecHash:    e.SpecHash,
 	}
+	if prof.Persistence != nil {
+		// Checked once more right before the instance is created: the lease
+		// may have gone stale since reserve checked it (persistence.go).
+		req.Fence = m.fence
+	}
 	m.log.Info("launching engine", "engine", e.ID, "key", e.Key.String(), "warm", e.Warm, "user", e.User)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), m.cfg.EngineStartupTimeout(e.ProfileName))
 		defer cancel()
 		inst, err := m.prov.Launch(ctx, req)
+		close(e.launched)
 		if err != nil {
 			m.mu.Lock()
 			if m.engines[e.ID] == e && e.State == StateStarting {
@@ -757,11 +814,15 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 	}()
 }
 
-// wait blocks until a reserved engine is ready. On failure the reservation is
-// dropped. errRetry asks Acquire to pick another engine.
-func (m *Manager) wait(ctx context.Context, e *engine) (*Lease, error) {
+// wait blocks until a reserved engine is ready, at most until deadline if
+// that is set. On failure the reservation is dropped. errRetry asks Acquire
+// to pick another engine.
+func (m *Manager) wait(ctx context.Context, e *engine, deadline time.Time) (*Lease, error) {
 	timeout := m.cfg.EngineStartupTimeout(e.ProfileName)
 	remaining := timeout - m.now().Sub(e.startedAt())
+	if !deadline.IsZero() {
+		remaining = min(remaining, time.Until(deadline))
+	}
 	if remaining < time.Second {
 		remaining = time.Second
 	}
@@ -961,8 +1022,23 @@ func (m *Manager) terminateLocked(e *engine, reason string) {
 		m.log.Info("terminating engine", "engine", e.ID, "key", e.Key.String(), "reason", reason)
 	}
 	e.terminateAt = now
-	id := e.ID
+	id, launched := e.ID, e.launched
+	launchTimeout := m.cfg.EngineStartupTimeout(e.ProfileName)
 	go func() {
+		if launched != nil {
+			// While the launch is under way, the instance may not exist yet:
+			// the provider would find nothing to stop and report the engine
+			// gone, and the instance could appear afterwards, next to a
+			// successor (for a persistent key: on the same data volume).
+			t := time.NewTimer(launchTimeout + time.Minute)
+			defer t.Stop()
+			select {
+			case <-launched:
+			case <-t.C:
+				m.log.Warn("terminate engine postponed: its launch has not returned (will retry)", "engine", id)
+				return
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		if err := m.prov.Terminate(ctx, id, reason); err != nil {
@@ -973,7 +1049,7 @@ func (m *Manager) terminateLocked(e *engine, reason string) {
 
 // terminationLabel keeps metric label cardinality bounded.
 func terminationLabel(reason string) string {
-	for _, p := range []string{"idle", "drained", "failed", "launch failed", "warm", "admin", "startup timeout"} {
+	for _, p := range []string{"idle", "drained", "failed", "launch failed", "warm", "admin", "startup timeout", "replaced"} {
 		if len(reason) >= len(p) && reason[:len(p)] == p {
 			return p
 		}
@@ -1011,7 +1087,7 @@ func (m *Manager) viewLocked(e *engine) View {
 		User: e.User, State: e.State, Endpoint: e.Endpoint, CreatedAt: e.CreatedAt, ReadyAt: e.ReadyAt,
 		StateSince: e.StateSince, LastUsed: e.idleSince(), Message: e.Message, Recovered: e.Recovered,
 		Sessions: e.Sessions, Reserved: e.Reserved, InFlight: e.inFlight.Load(), SpecHash: e.SpecHash,
-		SpecCurrent: m.specCurrentLocked(e),
+		SpecCurrent: m.specCurrentLocked(e), Volume: e.Volume,
 	}
 }
 
@@ -1075,13 +1151,16 @@ func (m *Manager) Reconcile() {
 			if e.Warm {
 				continue // see maintainWarmPoolsLocked
 			}
-			if max := m.cfg.EngineMaxLifetime(e.ProfileName); max > 0 && now.Sub(e.CreatedAt) > max {
-				m.drainLocked(e, fmt.Sprintf("max lifetime %s reached", max))
+			if why := m.replacementDueLocked(e, now); why != "" {
+				if !m.mountsVolumeLocked(e) {
+					m.drainLocked(e, why)
+				} else if m.replaceLocked(e, why, now, idle, protected) {
+					drainClose = append(drainClose, e.ID)
+				}
 				continue
 			}
-			if !m.specCurrentLocked(e) && m.replaceOnSpecChange() {
-				m.drainLocked(e, "profile changed")
-				continue
+			if !e.replaceSince.IsZero() {
+				m.replacementCancelledLocked(e)
 			}
 			if s := serving[e.Key]; s != nil && s != e {
 				m.drainLocked(e, "duplicate engine: "+s.ID+" serves "+e.Key.String())

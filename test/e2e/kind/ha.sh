@@ -134,9 +134,46 @@ secretGenerator:
     behavior: replace
     files: [users.yaml=secrets/users.yaml]
 EOF
+		add_persistent_profile
 	)
+	if [ -f "$HA_DIR/config.yaml" ]; then HA_PERSISTENT=1; fi
 	ADMIN_HEADER_FILE=$E2E_WORK/admin.header
 	(umask 077 && printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" >"$ADMIN_HEADER_FILE")
+}
+
+# add_persistent_profile adds the profile "persistent" of h6 (a data volume
+# per user, subdomains default and late) to the configuration of HA_OVERLAY,
+# in HA_DIR/config.yaml, if that overlay has a config.yaml with profiles.
+HA_PERSISTENT=''
+add_persistent_profile() {
+	local src=$HA_DIR/$HA_OVERLAY/config.yaml
+	[ -f "$src" ] && grep -q '^profiles:$' "$src" || return 0
+	cat >"$HA_DIR/persistent-profile.yaml" <<'EOF'
+  # Added by test/e2e/kind/ha.sh for h6: a data volume per user.
+  persistent:
+    description: "test/e2e/kind/ha.sh: a data volume per user"
+    allowedShareLevels: [USER]
+    allowedSubdomains: [default, late]
+    persistence:
+      size: 1Gi
+    settings:
+      memory_limit: 700MB
+      threads: "1"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+EOF
+	sed "/^profiles:\$/r $HA_DIR/persistent-profile.yaml" "$src" >"$HA_DIR/config.yaml"
+	cat >>"$HA_DIR/kustomization.yaml" <<'EOF'
+configMapGenerator:
+  - name: quackmux-config
+    behavior: replace
+    files: [config.yaml=config.yaml]
+EOF
 }
 
 # Gateway pods and the lease -------------------------------------------------------
@@ -393,6 +430,7 @@ cleanup() {
 	if [ -n "$ENGINE_POD" ]; then
 		kctl -n "$NS" delete pod "$ENGINE_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	fi
+	if [ -n "$HA_PERSISTENT" ]; then cleanup_persistent; fi
 	pf_stop
 	kctl -n "$NS" delete pod "$CLIENT_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	if [ -n "$SWITCHED" ] && [ -z "${KEEP_HA:-}" ]; then
@@ -599,6 +637,164 @@ scenario_pdb() {
 	expect_both_attached h5-after || return 1
 }
 
+# Persistence ------------------------------------------------------------------------
+
+# start_persistent ID SUBDOMAIN [HOST:PORT] starts a client that attaches the
+# profile "persistent" with SUBDOMAIN, through the Service or straight to
+# HOST:PORT; session_wait ID ID-attached=ok waits for the attachment.
+start_persistent() {
+	local uri=quack:${3:-$SVC:$SVC_PORT}
+	session_start "$1" "${CLIENT_CMD[@]}" || return 1
+	session_send "$1" "$(client_preamble)
+CREATE SECRET (TYPE quack, TOKEN '$CLIENT_TOKEN?share_level=user&profile=persistent&subdomain=$2', SCOPE '$uri');
+ATTACH '$uri' AS remote (DISABLE_SSL true);
+SELECT '$1-attached=' || x AS result FROM remote.query('SELECT ''ok'' AS x');"
+}
+
+# persistent_engine SUBDOMAIN prints the engine pod of the key
+# USER/HA_USER/SUBDOMAIN/persistent that is not being deleted.
+persistent_engine() {
+	kctl -n "$NS" get pods -l app.kubernetes.io/component=engine,quackmux.io/profile=persistent \
+		-o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.annotations.quackmux\.io/key}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' |
+		awk -v k="USER/$HA_USER/$1/persistent#0" '$2 == k && NF == 2 { print $1 }'
+}
+
+# routes_only_to POD succeeds when the Service has exactly one ready
+# endpoint, POD.
+routes_only_to() {
+	[ "$(kctl -n "$NS" get endpointslices -l "kubernetes.io/service-name=$SVC" \
+		-o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.targetRef.name}{"\n"}{end}' | sort -u)" = "$1" ]
+}
+
+# cleanup_persistent deletes the persistent engine pods and the claims of
+# this run (their keys contain the run id).
+cleanup_persistent() {
+	local p c
+	for p in $(kctl -n "$NS" get pods -l app.kubernetes.io/component=engine,quackmux.io/profile=persistent \
+		-o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.annotations.quackmux\.io/key}{"\n"}{end}' 2>/dev/null |
+		awk -v id="$RUN_ID" 'index($2, id) { print $1 }' || true); do
+		kctl -n "$NS" delete pod "$p" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	done
+	for c in $(kctl -n "$NS" get pvc -l app.kubernetes.io/component=engine-data \
+		-o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.annotations.quackmux\.io/key}{"\n"}{end}' 2>/dev/null |
+		awk -v id="$RUN_ID" 'index($2, id) { print $1 }' || true); do
+		kctl -n "$NS" delete pvc "$c" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	done
+}
+
+# h6: a key of the persistent profile through a frozen leader (see h3 and
+# deploy/kubernetes/README.md, "Persistente Daten"). Its engine keeps
+# running; the new leader adopts it and gives a new session of the key the
+# same engine, and a watch on the key-hash label never sees a second pod of
+# the key. A connect that reaches the frozen leader directly, for a key
+# without an engine (subdomain late), does not attach when the leader
+# resumes, and no pod of that key appears: without a fresh lease the leader
+# starts no engine of a persistent key. The volume API of a follower answers
+# 503 (it knows no engines).
+scenario_persistent_failover() {
+	local frozen takeover node pid ip start restarts e claim hash attempt id
+	local out=$E2E_WORK/h6.json events=$E2E_WORK/h6.events log=$E2E_WORK/h6-resumed.log
+	one_leader || {
+		bad "no single leader"
+		return 1
+	}
+	frozen=$LEADER takeover=$FOLLOWER
+	pf_start "$frozen" || return 1
+	start_persistent p1 default || return 1
+	session_wait p1 p1-attached=ok "$ATTACH_TIMEOUT" || return 1
+	e=$(persistent_engine default)
+	claim=$(claim_of "$e")
+	if [ -z "$e" ] || [ -z "$claim" ]; then
+		bad "the persistent session has no engine with a data volume (engine '$e', claim '$claim')"
+		return 1
+	fi
+	session_send p1 "CREATE TABLE remote.h6_t AS SELECT 7 AS x;
+SELECT 'p1-created' AS result;" || return 1
+	session_wait p1 p1-created 60 || return 1
+	ok "engine $e of the persistent key mounts claim $claim"
+	hash=$(key_hash_of "$e")
+	key_watch_start "$hash" "$events" || return 1
+
+	node=$(kctl -n "$NS" get pod "$frozen" -o jsonpath='{.spec.nodeName}') || return 1
+	ip=$(kctl -n "$NS" get pod "$frozen" -o jsonpath='{.status.podIP}') || return 1
+	if ! pid=$(node_pid "$frozen" "$node"); then
+		bad "cannot find the gateway process of $frozen on the kind node $node"
+		return 1
+	fi
+	restarts=$(restart_count "$frozen")
+	say "  kill -STOP $pid on node $node (gateway $frozen) for ${HA_FREEZE_SECONDS}s"
+	start=$(now)
+	docker exec "$node" kill -STOP "$pid" || return 1
+	FROZEN_NODE=$node FROZEN_PID=$pid
+	# Waits in the frozen process until it resumes.
+	start_persistent q1 late "$ip:9494" || return 1
+	wait_for 90 "$takeover to take over the lease" leader_is "$takeover" || return 1
+	wait_for 60 "service/$SVC to route to $takeover only" routes_only_to "$takeover" || return 1
+	ok "$takeover leads $(($(now) - start))s after the freeze, and the Service routes to it"
+	start_persistent p2 default || return 1
+	session_wait p2 p2-attached=ok "$ATTACH_TIMEOUT" || return 1
+	session_send p2 "SELECT 'p2-sees=' || CAST(x AS VARCHAR) AS result FROM remote.h6_t;" || return 1
+	session_wait p2 p2-sees=7 60 || return 1
+	expect_eq "$(persistent_engine default)" "$e" "the new leader gives a new session of the key the adopted engine $e" || return 1
+	pf_start "$takeover" || return 1
+	api GET "$ADMIN_URL" "/api/v1/volumes?owner=$HA_USER" "$out"
+	expect_eq "$HTTP_STATUS $(json_value "$out" engine)" "200 $e" "the new leader lists claim $claim with engine $e" || return 1
+
+	sleep_until $((start + HA_FREEZE_SECONDS))
+	say "  kill -CONT $pid: $frozen resumes after $(($(now) - start))s"
+	docker exec "$node" kill -CONT "$pid" || return 1
+	FROZEN_NODE='' FROZEN_PID=''
+	wait_for 60 "$frozen to step down and restart as a follower" restarted_follower "$frozen" "$restarts" || return 1
+	kctl -n "$NS" logs "$frozen" --previous >"$log" 2>&1 || true
+	expect_output "$log" "lost leadership" "the resumed gateway noticed that it lost the lease" || return 1
+	wait_for 60 "the connect that waited in the frozen gateway to fail" grep -q Error "$E2E_WORK/q1.log" || return 1
+	case $(session_output q1) in
+	*q1-attached=ok*)
+		bad "the connect to the frozen gateway attached"
+		return 1
+		;;
+	esac
+	say "  the connect to the frozen gateway: $(grep -m1 Error "$E2E_WORK/q1.log")"
+	if grep -F '"msg":"launching engine"' "$log" | grep -qF "/late/persistent"; then
+		bad "the resumed gateway launched an engine of the key it had no lease for:"
+		grep -F '"msg":"launching engine"' "$log" | indent
+		return 1
+	fi
+	expect_eq "$(persistent_engine late)" "" "no engine pod of the late key exists" || return 1
+	ok "the resumed gateway started no engine"
+
+	wait_for 60 "two replicas with one leader" one_leader || return 1
+	expect_eq "$LEADER" "$takeover" "$takeover still leads" || return 1
+	pf_start "$FOLLOWER" || return 1
+	api GET "$ADMIN_URL" /api/v1/volumes "$out"
+	expect_eq "$HTTP_STATUS" 503 "GET /api/v1/volumes on the follower $FOLLOWER answers 503" || return 1
+	api DELETE "$ADMIN_URL" "/api/v1/volumes/$claim" "$out"
+	expect_eq "$HTTP_STATUS" 503 "DELETE /api/v1/volumes/$claim on the follower answers 503" || return 1
+	pf_start "$LEADER" || return 1
+	attempt=1
+	while :; do
+		session_send p1 "SELECT 'p1-after-$attempt=' || x AS result FROM remote.query('SELECT x FROM h6_t');" || return 1
+		session_wait p1 "p1-after-$attempt=7" 60 '' && break
+		[ "$attempt" -lt 3 ] || return 1
+		warn "query $attempt of p1 after the failover failed, retrying"
+		attempt=$((attempt + 1))
+		sleep 3
+	done
+	ok "the session attached before the freeze still uses engine $e"
+	if [ -n "$ENGINE_POD" ]; then
+		# The clients of h2 stay attached through this failover as well.
+		expect_both_attached h6-after || return 1
+	fi
+	expect_one_pod_at_a_time "$events" "$hash" || return 1
+
+	for id in p1 p2 q1; do session_end "$id" 30 || true; done
+	api DELETE "$ADMIN_URL" "/api/v1/engines/$e" "$out"
+	expect_eq "$HTTP_STATUS" 202 "DELETE /api/v1/engines/$e" || return 1
+	wait_for 90 "engine pod $e to be deleted" pod_gone "$e" || return 1
+	api DELETE "$ADMIN_URL" "/api/v1/volumes/$claim" "$out"
+	expect_eq "$HTTP_STATUS" 202 "DELETE /api/v1/volumes/$claim on the leader" || return 1
+}
+
 # Main -------------------------------------------------------------------------------
 
 step "prerequisites"
@@ -639,6 +835,11 @@ if [ -n "$ENGINE_POD" ]; then
 else
 	bad "h3-h5 need the attachments of h2"
 	SCENARIOS_FAILED="$SCENARIOS_FAILED h3 h4 h5"
+fi
+if [ -n "$HA_PERSISTENT" ]; then
+	run_scenario h6 "persistence: a frozen leader starts no second engine of a key" scenario_persistent_failover
+else
+	warn "h6 skipped: $HA_OVERLAY has no config.yaml with profiles that the persistent profile could be added to"
 fi
 close_clients
 

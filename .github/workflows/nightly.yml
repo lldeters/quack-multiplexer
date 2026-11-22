@@ -37,9 +37,9 @@ jobs:
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
       - name: Create the cluster, build and load the images, deploy the dev overlay
         run: bash test/e2e/kind/setup.sh
-      - name: Scenarios k1-k4 (dev overlay)
+      - name: Scenarios k1-k8 (dev overlay)
         run: bash test/e2e/kind/test.sh
-      - name: Scenarios h1-h5 (HA overlay)
+      - name: Scenarios h1-h6 (HA overlay)
         run: bash test/e2e/kind/ha.sh
 
   race-repeated:

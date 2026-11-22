@@ -27,6 +27,13 @@ const (
 	// AnnotationInitSQLHash is the SHA-256 of the init SQL, which lives in
 	// the engine's secret: a changed init SQL changes the spec hash.
 	AnnotationInitSQLHash = "quackmux.io/init-sql-sha256"
+	// AnnotationLastLaunch on a data volume claim records the last launch
+	// of an engine with that volume (RFC 3339).
+	AnnotationLastLaunch = "quackmux.io/last-launch"
+	// AnnotationReplaceDue on the pod of a persistent engine records when
+	// its replacement fell due (RFC 3339), so that the deadline survives a
+	// gateway restart (engine.ReplacementRecorder).
+	AnnotationReplaceDue = "quackmux.io/replace-due"
 
 	// annotationDefaultContainer makes kubectl logs/exec pick the engine
 	// container when a pod template adds sidecars.
@@ -36,6 +43,8 @@ const (
 	nameValue           = "quack-engine"
 	componentValue      = "engine"
 	tokenComponentValue = "engine-token"
+	// dataComponentValue marks the data volume claims of persistent profiles.
+	dataComponentValue = "engine-data"
 )
 
 // Fixed names inside engine pods.
@@ -48,6 +57,10 @@ const (
 	tmpVolumeName    = "tmp"
 	tmpVolumeAltName = "quackmux-tmp"
 	tmpMountPath     = "/tmp"
+
+	// dataVolumeName is the pod volume of the data volume claim (profiles
+	// with persistence). Containers of a podTemplate may mount it by name.
+	dataVolumeName = "quackmux-data"
 
 	// tokenSecretSuffix is appended to the pod name for its token secret.
 	tokenSecretSuffix = "-token"

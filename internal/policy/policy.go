@@ -105,6 +105,11 @@ func Resolve(cfg *config.Config, id auth.Identity, opts map[string]string, sessi
 	if !allowedPrincipal(profile.AllowedUsers, profile.AllowedGroups, id) {
 		return Decision{}, fmt.Errorf("%w: user %q may not use profile %q", ErrDenied, id.User, profileName)
 	}
+	// CONNECTION engines have no use for a subdomain (it is dropped below).
+	if level != engine.ShareConnection && len(profile.AllowedSubdomains) > 0 && !contains(profile.AllowedSubdomains, subdomain) {
+		return Decision{}, fmt.Errorf("%w: profile %q does not allow subdomain %q (allowed: %s)", ErrDenied, profileName,
+			subdomain, strings.Join(profile.AllowedSubdomains, ", "))
+	}
 	if ov != nil {
 		if !allowedLevel(ov.AllowedShareLevels, level) {
 			return Decision{}, fmt.Errorf("%w: share level %s is not allowed for user %q", ErrDenied, level, id.User)
