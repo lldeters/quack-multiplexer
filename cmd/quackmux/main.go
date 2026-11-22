@@ -353,7 +353,7 @@ func cmdServe(args []string) error {
 		log.Warn("admin API has no token (admin.tokenFile): anyone who can reach it can manage sessions and engines")
 	}
 	adm := admin.New(admin.Options{
-		Sessions: sessions, Engines: engines, Metrics: met, Token: adminToken, Ready: ready,
+		Sessions: sessions, Engines: engines, Volumes: engines, Metrics: met, Token: adminToken, Ready: ready,
 		Live: func() bool { return true }, Log: log, Version: version,
 	})
 
