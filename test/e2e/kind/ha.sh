@@ -781,6 +781,10 @@ SELECT 'p1-created' AS result;" || return 1
 		sleep 3
 	done
 	ok "the session attached before the freeze still uses engine $e"
+	if [ -n "$ENGINE_POD" ]; then
+		# The clients of h2 stay attached through this failover as well.
+		expect_both_attached h6-after || return 1
+	fi
 	expect_one_pod_at_a_time "$events" "$hash" || return 1
 
 	for id in p1 p2 q1; do session_end "$id" 30 || true; done
