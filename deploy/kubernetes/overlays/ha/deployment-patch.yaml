@@ -1,13 +1,16 @@
-# Two replicas, replaced one at a time and never more than two pods.
+# Two replicas; a rollout starts a new pod before it removes an old one.
 #
-# Only the leader passes the readiness probe, so the Deployment counts one of
-# the two pods as available. A rollout therefore replaces the (unready)
-# follower first and then waits: the new pod cannot become ready while the
-# old leader holds the lease. Delete the old leader pod to hand over (it
-# releases the lease on SIGTERM, the new pod takes over within seconds), and
-# the rollout completes. For the same reason "kubectl rollout status" never
-# reports success here (it waits for both pods to be available); the
-# Deployment is done at UP-TO-DATE 2, AVAILABLE 1. See README.md,
+# Every healthy replica is ready: the leader, and a follower once it
+# campaigns for the lease (3 x ha.retryPeriod after its start) and has made
+# sure that its pod does not carry the leader label. A rollout therefore
+# proceeds on its own: new pod ready (a follower), old follower removed,
+# second new pod ready, old leader removed. The leader gives its pod a
+# deletion cost (controller.kubernetes.io/pod-deletion-cost, overwriting a
+# value from the template), so the old ReplicaSet removes the follower
+# first, and a rollout hands over exactly once, to a new pod. Never fewer
+# than two ready replicas, at most three pods. Without room for a third
+# gateway pod, use maxSurge 0 and maxUnavailable 1: the follower goes first,
+# and there is no standby until its replacement is ready. See README.md,
 # "Hochverfügbarkeit".
 apiVersion: apps/v1
 kind: Deployment
@@ -18,8 +21,8 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 0
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     spec:
       # Prefer different nodes, so that a node failure leaves a follower.

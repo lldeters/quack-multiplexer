@@ -528,12 +528,19 @@ audit:
   maxQueryBytes: 4096
 
 # -----------------------------------------------------------------------------
-# High availability: leader election on a Kubernetes Lease. Only the leader
-# is ready and serves; requires provider.type kubernetes and a shared
-# session key.
+# High availability: leader election on a Kubernetes Lease. Every healthy
+# replica is ready; the leader alone serves and labels its pod
+# quackmux.io/leader=true, which the Service selects (overlays/ha). Requires
+# provider.type kubernetes, a shared session key, the gateway running as a
+# pod (POD_NAME and POD_NAMESPACE from the downward API), "patch" on pods in
+# its namespace, get, create and update on the lease, and list and watch on
+# the engine pods; without them the gateway does not start.
 ha:
   enabled: false
-  # Name of the Lease ("" = quackmux-<provider.kubernetes.instance>).
+  # Name of the Lease ("" = quackmux-<provider.kubernetes.instance>). Do not
+  # change the lease (its name or namespace) in a rolling update: the new
+  # pods would elect a second leader next to the old one
+  # (deploy/kubernetes/README.md, "Lease nicht per Rollout ändern").
   leaseName: ""
   # Namespace of the Lease ("" = the engine namespace).
   namespace: ""
@@ -544,9 +551,16 @@ ha:
   # the lease for this long; must be shorter than leaseDuration.
   renewDeadline: 10s
   # Interval of renewal and acquisition attempts. A process that just started
-  # waits 3 x retryPeriod before it campaigns, so that the replicas that run
-  # already take over first (deploy/kubernetes/README.md, "Rollout").
+  # waits 3 x retryPeriod before it campaigns (and only then reports ready),
+  # so that the replicas that run already take over first
+  # (deploy/kubernetes/README.md, "Rollout").
   retryPeriod: 2s
+  # A leader that shuts down keeps answering new connections this long after
+  # it removed its label: until kube-proxy has caught up, it still sends them
+  # to the old pod, where they would hang in connect once the pod is gone.
+  # Counts towards server.shutdownTimeout and must be shorter (default 3s,
+  # at most half of server.shutdownTimeout; 0s = off).
+  deregistrationDelay: 3s
 
 # -----------------------------------------------------------------------------
 # Logging (to stderr).

@@ -182,7 +182,11 @@ wie ein Betreiber nach [deploy/kubernetes/README.md](../../deploy/kubernetes/REA
    Token für den Testbenutzer) und dem lokal gebauten Gateway-Image. Das Overlay liegt in
    `test/e2e/kind/.work/ha-overlay` (von Git ignoriert) und wird danach gelöscht.
 2. Es skaliert das laufende Gateway auf 0 und rollt das Overlay aus.
-3. Am Ende stellt es das Dev-Overlay wieder her, damit test.sh wie gewohnt läuft.
+3. Am Ende stellt es das Dev-Overlay wieder her, damit test.sh wie gewohnt läuft (auch der Selektor des Service
+   verliert dabei `quackmux.io/leader`, das prüft es), und löscht die ConfigMaps und Secrets, die nur das erzeugte
+   Overlay verwendet hat: die mit Hash-Suffix aus dessen Render (HA-Konfiguration, frische Secrets), die das
+   Dev-Overlay nicht enthält und die kein Deployment und kein Pod im Namespace nennt. Objekte ohne Suffix wie
+   `quackmux-users` (beide Overlays schreiben sie) und alles, was das Dev-Overlay rendert oder nutzt, bleiben.
 
 Zwei Clients desselben Benutzers bleiben über alle Szenarien angehängt (`share_level=user`, eine gemeinsame
 Engine). Der erste nutzt den Default-Heartbeat-Timeout (60 s). Der zweite nutzt `HEARTBEAT_TIMEOUT 5`; seine
@@ -192,11 +196,13 @@ unterwegs ist, darf scheitern (nie doppelt laufen); das Skript wiederholt sie bi
 
 | | Ablauf | Was es beweist |
 |---|---|---|
-| h1 | Overlay ausrollen | Zwei Replikas, genau eine ist ready und hält die Lease `quackmux-default`. Der Follower meldet `not the leader` und `quackmux_is_leader 0`. Das Deployment ist `Available` bei `UP-TO-DATE 2, AVAILABLE 1`. |
-| h2 | `kubectl delete pod` des Leaders | Der alte Leader gibt die Lease beim Herunterfahren frei, und der wartende Follower führt nach höchstens `HA_HANDOVER_SECONDS` (gemessen 1–4 s). Der Ersatz-Pod bewirbt sich erst nach `3 × ha.retryPeriod`. Der neue Leader adoptiert beide Sessions auf derselben Engine. |
-| h3 | Den Gateway-Prozess des Leaders auf dem kind-Node mit `SIGSTOP` einfrieren, nach `HA_FREEZE_SECONDS` mit `SIGCONT` wecken | Der Follower übernimmt nach Ablauf der Lease (`ha.leaseDuration`, gemessen etwa 20 s). Der aufgeweckte Prozess merkt, dass er die Lease verloren hat, beendet sich und startet als Follower neu. Dabei schließt er keine Session und gibt die Lease des neuen Leaders nicht frei. Danach arbeiten beide Clients weiter. |
-| h4 | `kubectl rollout restart`, dann den alten Leader löschen | Der Rollout ersetzt zuerst den Follower und wartet (`kubectl rollout status` meldet keinen Erfolg). Das Löschen des alten Leaders schließt ihn ab: Der neue Follower übernimmt, nicht der Pod mit altem Template, den die alte ReplicaSet als Ersatz startet. Danach `UP-TO-DATE 2, AVAILABLE 1`, und die Clients arbeiten weiter. |
-| h5 | Eviction-API wie `kubectl drain` | Die PodDisruptionBudget lehnt die Räumung des Leaders ab, der Follower darf gehen und wird ersetzt. |
+| h1 | Overlay ausrollen | `kubectl rollout status` meldet Erfolg, das Deployment zeigt `UP-TO-DATE 2, AVAILABLE 2`. Beide Replikas sind ready; genau eine trägt `quackmux.io/leader=true` und die Löschkosten 100, hält die Lease `quackmux-default` und ist der einzige Endpunkt des Service. Der Follower besteht `/readyz` und meldet `quackmux_is_leader 0` und `quackmux_leader_label 0`. Ein Client, der sich direkt mit dem Follower verbindet, bekommt `not the leader` (gezählt als `outcome="not_leader"`). |
+| h2 | `kubectl delete pod` des Leaders | Der alte Leader entfernt sein Label (laut seinem Log vor der Freigabe der Lease) und gibt die Lease frei; der wartende Follower führt nach höchstens `HA_HANDOVER_SECONDS` (gemessen 2–3 s), der Service ist höchstens `HA_GAP_SECONDS` ohne bereiten Endpunkt (gemessen 0,6–2 s), die Lease wechselt einmal. Laut seinem Log schließt der alte Leader seinen Quack-Listener frühestens `HA_DEREGISTRATION_SECONDS` nach dem Entfernen des Labels. Der Ersatz-Pod bewirbt sich erst nach `3 × ha.retryPeriod`. Der neue Leader adoptiert beide Sessions auf derselben Engine. |
+| h3 | Den Gateway-Prozess des Leaders auf dem kind-Node mit `SIGSTOP` einfrieren, nach `HA_FREEZE_SECONDS` mit `SIGCONT` wecken | Der Follower übernimmt nach Ablauf der Lease (`ha.leaseDuration`, gemessen 18–19 s nach dem Einfrieren), ist danach der einzige Endpunkt und entfernt das Label vom eingefrorenen Pod. Der aufgeweckte Prozess merkt, dass er die Lease verloren hat, beendet sich und startet als bereiter Follower ohne Label neu. Dabei schließt er keine Session und gibt die Lease des neuen Leaders nicht frei. Danach arbeiten beide Clients weiter. |
+| h4 | `kubectl rollout restart` | `kubectl rollout status` meldet ohne Eingriff Erfolg (gemessen nach 14–17 s). Die Lease wechselt genau einmal, zu einem Pod mit neuem Template: Wegen der Löschkosten des Leaders entfernt Kubernetes den alten Follower zuerst. Der Service ist höchstens `HA_GAP_SECONDS` ohne bereiten Endpunkt (gemessen 0,5–3,1 s), und der alte Leader hält seinen Quack-Listener wie in h2 offen. Danach `UP-TO-DATE 2, AVAILABLE 2`, und die Clients arbeiten weiter. |
+| h4b | Eine Konfiguration ausrollen, die die Lease in einen Namespace ohne Role des Gateways verlegt (`ha.namespace: default`), danach das Overlay wieder anwenden | Der neue Pod startet nicht (`ha: this replica could never lead: …`), `kubectl rollout status` meldet keinen Erfolg, und wegen `maxUnavailable: 0` bleiben beide alten Pods bereit (`3 1 2`). Der alte Leader bedient ohne Übergabe weiter, die Clients merken nichts. Das erneute `kubectl apply -k` rollt zurück, die Lease wechselt nicht. |
+| h5 | Eviction-API wie `kubectl drain` | Der Leader darf gehen, solange der Follower ready ist, und übergibt wie beim Löschen (höchstens `HA_GAP_SECONDS` ohne Endpunkt, gemessen 0,6–3,3 s). Direkt danach lehnt das PodDisruptionBudget die Räumung des neuen Leaders ab, der jetzt die letzte bereite Replika ist. Ist der Ersatz-Pod ready, darf der Follower gehen. |
+| Ende | `DETACH` beider Clients | Beide Clients lösen sich sauber, kein `DETACH` hängt (etwa an einem Heartbeat, der im Verbindungsaufbau zu einem beendeten Pod hängt). |
 
 h3 braucht `docker exec` auf dem kind-Node (`crictl inspect` liefert die PID des Gateway-Containers). Wer
 Fehler untersuchen will, lässt das HA-Deployment mit `KEEP_HA=1` stehen; das erzeugte Overlay mit seinen Secrets
@@ -222,6 +228,8 @@ wird:
 | `HA_OVERLAY` | `../../../../../deploy/kubernetes/overlays/ha` | das geprüfte Overlay, relativ zum erzeugten |
 | `HA_LEASE` | `quackmux-default` | Name der Lease |
 | `HA_HANDOVER_SECONDS` | 12 | Höchstdauer der Übergabe in h2 (eine ablaufende statt freigegebene Lease bräuchte mindestens 15 s) |
+| `HA_GAP_SECONDS` | 8 | Höchstdauer ohne bereiten Endpunkt des Service bei einer geordneten Übergabe (h2, h4, h5); der Follower fragt alle `ha.retryPeriod` plus Jitter, also bis zu 4,4 s |
+| `HA_DEREGISTRATION_SECONDS` | 3 | `ha.deregistrationDelay` des geprüften Overlays: so lange muss ein Leader, der herunterfährt, seinen Quack-Listener nach dem Entfernen des Labels offen halten (h2, h4) |
 | `HA_FREEZE_SECONDS` | 45 | Dauer des Einfrierens in h3: länger als die Session-Lease des zweiten Clients, kürzer als die Liveness-Probe des Gateways toleriert (etwa 60 s) |
 | `ADMIN_LOCAL_PORT` | 19696 | lokaler Port des Port-Forwards auf die Admin-API eines bestimmten Pods |
 | `KEEP_HA` | – | `1`: HA-Deployment und erzeugtes Overlay nach dem Lauf behalten |

@@ -441,6 +441,14 @@ type HAConfig struct {
 	LeaseDuration Duration `json:"leaseDuration,omitempty"`
 	RenewDeadline Duration `json:"renewDeadline,omitempty"`
 	RetryPeriod   Duration `json:"retryPeriod,omitempty"`
+	// DeregistrationDelay is how long a leader that shuts down keeps its
+	// Quack listener open after it removed its leader label: until
+	// kube-proxy has caught up, it still sends new connections to the pod,
+	// which then get an answer at once instead of hanging in connect once
+	// the pod is gone. It counts towards server.shutdownTimeout and must be
+	// shorter (default 3s, at most half of server.shutdownTimeout; 0s turns
+	// it off).
+	DeregistrationDelay Duration `json:"deregistrationDelay,omitempty"`
 }
 
 // LogConfig controls logging.
@@ -647,6 +655,10 @@ func (c *Config) ApplyDefaults() {
 	setDur(&h.LeaseDuration, 15*time.Second)
 	setDur(&h.RenewDeadline, 10*time.Second)
 	setDur(&h.RetryPeriod, 2*time.Second)
+	// The delay counts towards server.shutdownTimeout: by default 3s, but
+	// at most half of it, so that a short shutdown timeout stays valid
+	// without the setting and leaves time to drain.
+	setDur(&h.DeregistrationDelay, min(3*time.Second, max(s.ShutdownTimeout.Duration, 0)/2))
 
 	setStr(&c.Log.Level, "info")
 	setStr(&c.Log.Format, "json")
@@ -804,6 +816,13 @@ func (c *Config) Validate() error {
 	}
 	if c.HA.Enabled && c.Server.SessionKeyFile == "" && os.Getenv("QUACKMUX_SESSION_KEY") == "" {
 		add("ha.enabled requires a shared session key (server.sessionKeyFile or QUACKMUX_SESSION_KEY)")
+	}
+	if d := c.HA.DeregistrationDelay.Duration; d < 0 {
+		add("ha.deregistrationDelay must not be negative")
+	} else if c.HA.Enabled && d > 0 && d >= c.Server.ShutdownTimeout.Duration {
+		// The delay counts towards the shutdown deadline; the drain of the
+		// in-flight requests follows it.
+		add("ha.deregistrationDelay (%s) must be shorter than server.shutdownTimeout (%s)", d, c.Server.ShutdownTimeout.Duration)
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":

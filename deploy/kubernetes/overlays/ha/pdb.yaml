@@ -1,7 +1,8 @@
-# Keeps the serving gateway (the leader, the only ready pod) from being
-# evicted voluntarily, e.g. by "kubectl drain". Drain the leader's node after
-# a controlled failover (delete the leader pod; README.md, "Hochverfügbarkeit").
-# The unready follower may always be evicted.
+# Keeps one ready gateway through voluntary evictions such as "kubectl
+# drain". Followers are ready too, so the leader may be evicted while a
+# follower is ready: it removes its label, releases the lease, and the
+# follower takes over within seconds. The last ready replica is never
+# evicted; an unready one always may be.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

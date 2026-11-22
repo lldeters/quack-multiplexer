@@ -2,7 +2,9 @@
 #   Quack:  quack:quackmux.quackmux.svc.cluster.local:9494
 #   Admin:  http://quackmux.quackmux.svc.cluster.local:9495 (API, /metrics)
 #
-# Only ready gateway pods receive traffic; with ha.enabled that is the leader.
+# Only ready gateway pods receive traffic. With ha.enabled every healthy
+# replica is ready, and overlays/ha adds quackmux.io/leader: "true" to the
+# selector, so that the leader alone receives traffic.
 apiVersion: v1
 kind: Service
 metadata:
@@ -30,7 +32,8 @@ spec:
 # Copy this Service into your own overlay, or uncomment it here including the
 # "---" line (service.yaml is already listed in kustomization.yaml). It
 # publishes the Quack port only; keep the admin port internal. Do not put an
-# L7 ingress in front of the gateway (see README.md, "Verbinden").
+# L7 ingress in front of the gateway (see README.md, "Verbinden"). With
+# overlays/ha add quackmux.io/leader: "true" to its selector.
 #
 # ---
 # apiVersion: v1
@@ -48,7 +51,7 @@ spec:
 # spec:
 #   type: LoadBalancer
 #   # Keeps the client address (logs, audit) and sends traffic only to the
-#   # node of the ready gateway pod.
+#   # node of the ready gateway pod (with overlays/ha: of the leader).
 #   externalTrafficPolicy: Local
 #   # Restrict the clients that may connect:
 #   # loadBalancerSourceRanges: [203.0.113.0/24]
