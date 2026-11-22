@@ -386,8 +386,8 @@ kubectl -n quackmux logs deployment/quackmux | grep '"component":"audit"'
 ```
 
 Mit `overlays/ha` schreibt jeder Pod, solange er Leader ist, seine eigenen Audit-Zeilen, und
-`logs deployment/quackmux` liest nur einen Pod, oft den Follower. Lesen Sie alle Gateway-Pods; die Zeilen
-früherer Leader gehen mit deren Pods verloren, dauerhaft hält sie nur eine Log-Sammlung:
+`logs deployment/quackmux` liest nur einen Pod, nicht unbedingt den Leader. Lesen Sie alle Gateway-Pods; die
+Zeilen früherer Leader gehen mit deren Pods verloren, dauerhaft hält sie nur eine Log-Sammlung:
 
 ```sh
 kubectl -n quackmux logs -l app.kubernetes.io/component=gateway --prefix --tail=-1 | grep '"component":"audit"'
@@ -422,8 +422,8 @@ kubectl -n quackmux rollout status deployment/quackmux
 * Leader anzeigen: `kubectl -n quackmux get pods -L quackmux.io/leader` oder
   `kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}'` (Metriken
   `quackmux_is_leader`, `quackmux_leader_label`).
-* **Logs:** `kubectl -n quackmux logs deployment/quackmux` liest einen beliebigen bereiten Pod, oft den Follower.
-  Den Leader zeigt `kubectl -n quackmux logs -l app.kubernetes.io/component=gateway,quackmux.io/leader=true --tail=-1`,
+* **Logs:** `kubectl -n quackmux logs deployment/quackmux` liest einen beliebigen bereiten Pod, nicht unbedingt den
+  Leader. Den zeigt `kubectl -n quackmux logs -l app.kubernetes.io/component=gateway,quackmux.io/leader=true --tail=-1`,
   alle Replikas `kubectl -n quackmux logs -l app.kubernetes.io/component=gateway --prefix --tail=-1`.
 * **Eigene Services:** Jeder Service, der Quack-Traffic zum Gateway leitet (etwa die LoadBalancer-Variante aus
   `base/service.yaml`), braucht im HA-Betrieb ebenfalls `quackmux.io/leader: "true"` im Selektor. Sonst landen
@@ -477,7 +477,8 @@ zuerst auf einen bereiten Endpunkt:
 
 ```sh
 until kubectl -n quackmux get endpointslices -l kubernetes.io/service-name=quackmux \
-    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].addresses[0]}' | grep -q .; do sleep 1; done
+    -o go-template='{{range .items}}{{range .endpoints}}{{if .conditions.ready}}{{index .addresses 0}}{{"\n"}}{{end}}{{end}}{{end}}' |
+    grep -q .; do sleep 1; done
 ```
 
 **Lease nicht per Rollout ändern:** Die Lease ergibt sich aus `ha.namespace` (sonst dem Engine-Namespace, also
@@ -647,7 +648,7 @@ kubectl -n quackmux logs quack-user-alice-x7k2p
 kubectl -n quackmux get events --sort-by=.lastTimestamp
 ```
 
-Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, oft den Follower; den Leader zeigt
+Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nicht unbedingt den Leader; den zeigt
 `kubectl -n quackmux logs -l app.kubernetes.io/component=gateway,quackmux.io/leader=true -f`.
 
 | Symptom | Ursache und Abhilfe |
