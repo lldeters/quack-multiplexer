@@ -11,8 +11,12 @@
 // needed to rebuild the registry after a gateway restart: key, user,
 // profile, spec hash and the name of the token secret.
 //
+// Profiles with persistence get a PersistentVolumeClaim per engine key,
+// created before the pod and kept when the engine ends (volume.go).
+//
 // Required RBAC in the engine namespace: pods get/list/watch/create/delete/
-// patch, secrets get/list/create/delete/patch, events create.
+// patch, secrets get/list/create/delete/patch, events create,
+// persistentvolumeclaims get/list/create/patch/delete.
 package kubernetes
 
 import (
@@ -440,6 +444,12 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 	})
 	secret := p.secret(req.ID, req.Token, engine.RenderInitSQL(req.Profile))
 	secrets := p.client.CoreV1().Secrets(p.namespace)
+	if req.Profile.Persistence != nil {
+		// The claim before the pod, which would otherwise wait for it.
+		if _, err := p.ensureDataClaim(ctx, req); err != nil {
+			return engine.Instance{}, err
+		}
+	}
 
 	// Known before the pod exists, so that its first events carry the token.
 	p.storeToken(req.ID, req.Token)

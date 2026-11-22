@@ -40,6 +40,12 @@ func instanceFromPod(pod *corev1.Pod) (engine.Instance, error) {
 		profile = key.Profile
 	}
 	phase, endpoint, msg := podStatus(pod)
+	var volume string
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == dataVolumeName && v.PersistentVolumeClaim != nil {
+			volume = v.PersistentVolumeClaim.ClaimName
+		}
+	}
 	return engine.Instance{
 		ID:          pod.Name,
 		Key:         key,
@@ -51,6 +57,7 @@ func instanceFromPod(pod *corev1.Pod) (engine.Instance, error) {
 		User:        pod.Annotations[AnnotationUser],
 		CreatedAt:   pod.CreationTimestamp.Time,
 		Message:     msg,
+		Volume:      volume,
 	}, nil
 }
 
