@@ -55,12 +55,13 @@ Sessions beendet das Gateway sie nach `engine.idleTimeout` (USER/GROUP/SERVER 30
 | Objekt | Zweck |
 |---|---|
 | Namespace `quackmux` | Gateway und Engines. Pod Security `restricted` wird durchgesetzt. |
-| ServiceAccount, Role, RoleBinding `quackmux-gateway` | Engine-Pods und ihre Token-Secrets verwalten, Events schreiben, Lease (HA) |
+| ServiceAccount, Role, RoleBinding `quackmux-gateway` | Engine-Pods, ihre Token-Secrets und die Daten-Volumes persistenter Profile verwalten, Events schreiben, Lease (HA) |
 | ConfigMap `quackmux-config-<hash>` | `config.yaml`, gemountet als `/etc/quackmux/config.yaml` |
 | Secrets `quackmux-session-key-<hash>`, `quackmux-admin-token-<hash>`, `quackmux-users` | `/etc/quackmux/session/key`, `/etc/quackmux/admin/token`, `/etc/quackmux/users/users.yaml` |
 | Deployment `quackmux` | Gateway, 1 Replika, Strategie `Recreate` |
 | Service `quackmux` | ClusterIP: 9494 (Quack), 9495 (Admin-API, Probes, Metriken) |
 | NetworkPolicies | Engines nur vom Gateway auf 9494; Gateway: 9494 von überall, 9495 nur aus dem Namespace |
+| PersistentVolumeClaims `quackmux-data-…` | nur mit persistenten Profilen: Daten eines Engine-Schlüssels, angelegt vom Gateway; sie bleiben beim Deinstallieren ([Persistente Daten](#persistente-daten)) |
 
 Warum `Recreate` und nur eine Replika? Ohne Leader-Election darf genau ein Gateway die Engines verwalten. Ein
 Update unterbricht den Betrieb daher kurz. Die Sessions überleben das (versiegelte Connection-IDs, gemeinsamer
@@ -273,9 +274,9 @@ CREATE SECRET (TYPE quack, TOKEN 'mein-token', SCOPE 'quack:quackmux.example.com
 | `group` | `X-Quackmux-Group` | eine Gruppe des Benutzers |
 
 Priorität: Token-Optionen vor Headern, Header vor `overrides[].defaults`, diese vor `defaults`. Was ein
-Benutzer wählen darf, regeln `profiles.<name>.allowedShareLevels`, `allowedUsers`, `allowedGroups` und
-`overrides` (in der Base: `large` nur mit `user` oder `connection`). Verstöße meldet der Client als
-`quackmux: not permitted: …`.
+Benutzer wählen darf, regeln `profiles.<name>.allowedShareLevels`, `allowedUsers`, `allowedGroups`,
+`allowedSubdomains` und `overrides` (in der Base: `large` nur mit `user` oder `connection`). Verstöße meldet der
+Client als `quackmux: not permitted: …`.
 
 ## Admin-API
 
@@ -296,6 +297,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9495/api/v1/engines
 curl -s -X POST   -H "Authorization: Bearer $TOKEN" http://localhost:9495/api/v1/sessions/<session-id>/cancel
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" "http://localhost:9495/api/v1/sessions/<session-id>?force=true"
 curl -s -X POST   -H "Authorization: Bearer $TOKEN" http://localhost:9495/api/v1/engines/quack-user-alice-x7k2p/drain
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:9495/api/v1/volumes?owner=alice"
 ```
 
 PowerShell:
@@ -316,6 +318,8 @@ curl.exe -s -H "Authorization: Bearer $token" http://localhost:9495/api/v1/engin
 | `GET /api/v1/engines/{id}` | eine Engine samt Sessions |
 | `POST /api/v1/engines/{id}/drain` | keine neuen Sessions; die Engine endet mit ihrer letzten Session (spätestens nach `engine.drainTimeout` werden die Sessions geschlossen) |
 | `DELETE /api/v1/engines/{id}` | Engine sofort beenden und ihre Sessions schließen |
+| `GET /api/v1/volumes[?owner=…]` | Daten-Volumes persistenter Profile mit Größe, Zustand, letztem Start und der Engine, die sie nutzt |
+| `DELETE /api/v1/volumes/{name}` | Volume löschen (409, solange eine Engine des Schlüssels existiert; 503, wenn diese Replika nicht Leader ist oder noch nicht alle Engines kennt) |
 
 ## Metriken
 
@@ -434,8 +438,10 @@ kubectl apply -k deploy/kubernetes/overlays/ha
 ## Entwicklung mit kind (`overlays/dev`)
 
 `auth.mode: none`, Admin-API ohne Token, kleine Ressourcen (Gateway bis 512 MiB, Engines 100m/256 MiB
-angefordert, bis 1 CPU/1 GiB), höchstens 8 Engines, Debug-Logs im Textformat. **Nur auf dem eigenen Rechner
-verwenden:** Jeder Client darf sich jeden Benutzernamen aussuchen.
+angefordert, bis 1 CPU/1 GiB), höchstens 8 Engines, Debug-Logs im Textformat. Das Profil `persistent`
+(`TOKEN 'dev?user=alice&profile=persistent'`) gibt jedem Benutzer ein Volume von 1 GiB aus der
+Default-StorageClass von kind. **Nur auf dem eigenen Rechner verwenden:** Jeder Client darf sich jeden
+Benutzernamen aussuchen.
 
 ```sh
 kind create cluster --name quackmux
@@ -476,29 +482,147 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
   liegen; `kubectl rollout undo` braucht sie. Löschen Sie sie erst, wenn Sie nicht mehr zurückrollen wollen.
 * Geänderte Profile: Engines mit der alten Spec gehen auf DRAINING (`engine.replaceOnSpecChange`). Neue
   Sessions bekommen neue Engines, bestehende laufen auf der alten weiter, höchstens `engine.drainTimeout`.
+  Persistente Profile: Die alte Engine nimmt weiter Sessions an, bis sie keine mehr hat (spätestens
+  `engine.drainTimeout`); erst dann startet die neue ([Persistente Daten](#persistente-daten)).
 * Anderer Namespace: `namespace` im eigenen Overlay setzen (Kustomize benennt den Namespace um und passt die
   RoleBinding an) und `provider.kubernetes.namespace` in der Konfiguration ändern oder weglassen; ohne Angabe
   starten die Engines im Namespace des Gateways.
 
 ## Persistente Daten
 
-Engines halten ihren Zustand im Speicher (`database: ":memory:"`) und verlieren ihn mit dem Pod. Ein PVC im
-`podTemplate` ist **kein** Speicher pro Benutzer: Das Gateway rendert das Template für jede Engine des Profils
-gleich. Alle Engines des Profils mounten also dasselbe Volume: jeder Benutzer, jede Gruppe und Subdomain, jede
-Pool-Engine und die Ersatz-Engine, die neben einer DRAINING-Engine anläuft. Mit `database: /data/engine.duckdb`
-öffnen sie dieselbe Datei. Eine DuckDB-Datei kann nur ein Prozess schreibend öffnen; jede weitere Engine scheitert
-beim Start (`Could not set lock on file`). Auf Netzwerk-Dateisystemen ohne verlässliche Locks droht Datenverlust.
+Engines halten ihren Zustand standardmäßig im Speicher (`database: ":memory:"`) und verlieren ihn mit dem Pod.
+Für Daten, die bleiben sollen, gibt es drei Wege.
 
-* **Gemeinsame Daten read-only anhängen:** PVC (`ReadOnlyMany`) im Template und im `initSQL`
-  `ATTACH '/data/lake.duckdb' AS lake (READ_ONLY)`. Das verträgt beliebig viele Engines.
-* **Schreibbare Daten in einen externen Katalog:** etwa DuckLake mit Postgres-Katalog und Objektspeicher (Beispiel
-  in [images/engine/README.md](../../images/engine/README.md)).
-* **Eine schreibbare Datei auf einem PVC** trägt nur ein Profil, das nie mehr als eine Engine hat:
-  `allowedShareLevels: [SERVER]`, `pool.size: 1`, Benutzer, die nur eine Subdomain nutzen (`allowedUsers`),
-  `maxLifetime` 0 und `engine.replaceOnSpecChange: false`, sonst läuft eine Ersatz-Engine neben der alten an. Das
-  Gateway erzwingt das nicht.
+### Ein Volume pro Engine-Schlüssel (`persistence`)
 
-PVCs pro Engine-Schlüssel (etwa pro Benutzer) legt das Gateway noch nicht an.
+Mit `profiles.<name>.persistence` bekommt jeder Engine-Schlüssel des Profils ein eigenes PersistentVolumeClaim:
+bei `USER` jeder Benutzer, bei `GROUP` jede Gruppe, bei `SERVER` das ganze Profil, jeweils pro Subdomain. Das
+Gateway legt den Claim beim ersten `ATTACH` an, bevor es den Pod startet, und mountet ihn unter `/data`. Die
+Datenbank ist dann `/data/engine.duckdb`.
+
+```yaml
+profiles:
+  personal:
+    description: "Eigene Datenbank pro Benutzer"
+    allowedShareLevels: [USER]
+    allowedSubdomains: [default]
+    persistence:
+      size: 10Gi
+      # storageClassName: fast-ssd      # ohne Angabe: die Default-StorageClass des Clusters
+      # accessMode: ReadWriteOncePod    # Default; ReadWriteOnce, wenn die StorageClass kein RWOP kann
+      # mountPath: /data
+      # labels: {}                      # zusätzlich am Claim, etwa für Backup-Werkzeuge
+      # annotations: {}
+```
+
+```sql
+CREATE SECRET (TYPE quack, TOKEN 'mein-token?profile=personal', SCOPE 'quack:quackmux.example.com:9494');
+ATTACH 'quack:quackmux.example.com:9494' AS meine (DISABLE_SSL true);
+CREATE TABLE meine.notizen AS SELECT 'bleibt erhalten' AS text;
+```
+
+Regeln, die `quackmux validate` und der Start des Gateways prüfen:
+
+* nur mit `provider.type: kubernetes`;
+* `allowedShareLevels` muss gesetzt sein und darf `CONNECTION` nicht enthalten: Jede Session bekäme ein eigenes
+  Volume, das nie wieder benutzt würde;
+* `allowedSubdomains` muss gesetzt sein. Jede Subdomain bekommt eigene Volumes; ohne Liste könnte ein Benutzer
+  beliebig viele anlegen. Mehrere Datenbanken pro Benutzer gehören als Dateien auf sein eines Volume. Die Liste
+  wirkt auch ohne `persistence`: Andere Subdomains lehnt das Gateway mit `quackmux: not permitted: …` ab;
+* `pool.size: 1` und `warmPool.size: 0`;
+* `size` ist Pflicht; `accessMode` ist `ReadWriteOncePod` (Default) oder `ReadWriteOnce`; `mountPath` ist ein
+  absoluter Pfad außer `/` und `/tmp`;
+* das `podTemplate` darf kein Volume `quackmux-data` definieren, im Engine-Container nichts unter `mountPath`
+  mounten und kein `spec.nodeName` setzen (das umgeht den Scheduler und damit die ReadWriteOncePod-Prüfung).
+  Init-Container und Sidecars des Templates dürfen das Volume `quackmux-data` über seinen Namen einbinden.
+
+Ein explizites `database` gilt weiter, auch `":memory:"` (etwa mit `ATTACH '/data/…'` im `initSQL`).
+
+**Nie zwei Engines auf denselben Daten.** Eine DuckDB-Datei kann nur ein Prozess schreibend öffnen. Das Gateway
+startet für einen Schlüssel deshalb erst dann eine neue Engine, wenn der Pod der vorigen aus der Kubernetes-API
+verschwunden ist; dann sind seine Container beendet und seine Volumes ausgehängt (wie bei einem StatefulSet).
+
+* Ändert sich das Profil (`engine.replaceOnSpecChange`) oder erreicht die Engine `engine.maxLifetime`, nimmt sie
+  weiter Sessions an, auch neue: Keine andere Engine darf die Daten öffnen. Die Admin-API zeigt dann
+  `replacement pending: …`. Sobald sie keine Session mehr hat, beendet das Gateway sie, und die nächste Session
+  startet die neue Engine. Nach einem Neustart des Gateways, also auch nach jeder Profiländerung, geschieht das
+  frühestens nach `engine.recoveryGrace`. Spätestens `engine.drainTimeout` nach der Änderung schließt das Gateway
+  die verbliebenen Sessions; deren Clients müssen neu attachen.
+* Ein `ATTACH`, das in diese Lücke fällt, wartet, bis die alte Engine weg ist (Checkpoint und Stopp, höchstens
+  die Grace Period), und dann auf den Start der neuen. Beides zusammen zählt gegen `engine.startupTimeout`. Endet
+  die alte Engine in dieser Zeit nicht, meldet der Client
+  `quackmux: could not provide an engine: the previous engine of this key still holds its data volume (engine …)`.
+  Das gilt auch nach `POST /api/v1/engines/{id}/drain`, bis die gedrainte Engine endet.
+* Eine ausgefallene Engine (`FAILED`) beendet das Gateway sofort, wenn eine neue Session den Schlüssel braucht.
+  Sonst bleibt ihr Pod wie bisher `engine.failedRetention` lang zur Analyse stehen.
+* Mit Leader-Election startet nur ein Gateway mit frischer Lease eine Engine für einen solchen Schlüssel, und nur
+  dieses beendet dafür eine alte. Es prüft die Lease beim `ATTACH` und noch einmal direkt vor dem Anlegen des Pods.
+  Ein Leader, der nach einem Einfrieren aufwacht, lässt die Engines in Ruhe; ein `ATTACH`, das ihn bis zu seinem
+  Neustart noch erreicht, scheitert mit `… this gateway does not hold a fresh leader lease` und kann wiederholt
+  werden.
+* Direkt vor dem Anlegen des Pods fragt das Gateway außerdem die Kubernetes-API, ob es schon einen Pod des
+  Schlüssels gibt, auch einen, den es nicht kennt: etwa einen, dessen Token-Secret beim Start des Gateways nicht
+  lesbar war (das Gateway übernimmt ihn, sobald es das Token lesen kann), oder einen eines anderen
+  Gateway-Prozesses. Dann startet es keine Engine, und der Client bekommt
+  `… the previous engine of this key still holds its data volume (engine pod … exists …)`.
+* `ReadWriteOncePod` sichert zusätzlich ab: Der Scheduler plant keinen zweiten Pod mit demselben Claim ein,
+  solange der erste läuft oder herunterfährt (in kind geprüft). `ReadWriteOnce` erlaubt dagegen mehrere Pods auf
+  demselben Node; dann schützen nur das Gateway und die Dateisperre von DuckDB („Could not set lock on file“).
+* Grenzen: Ein erzwungenes Löschen (`kubectl delete pod --force --grace-period=0`) entfernt den Pod aus der API,
+  bevor sein Container beendet ist; weder das Gateway noch der Scheduler sehen ihn danach. Fällt ein Node aus,
+  bleibt der Pod `Terminating`, bis der Node zurückkommt, der Pod erzwungen gelöscht oder der Node mit dem Taint
+  `node.kubernetes.io/out-of-service` markiert wird; so lange bekommt der Schlüssel keine Engine. Mit lokalem
+  Storage (etwa local-path) liegen die Daten ohnehin auf diesem Node.
+* Wer `persistence` für ein bestehendes Profil einschaltet, beendet dessen laufende Engines am besten gleich
+  (`DELETE /api/v1/engines/{id}`): Bis sie enden, nehmen sie wie jede veraltete Engine eines persistenten Profils
+  weiter Sessions an, deren Daten dann nur im Speicher liegen.
+
+**Lebenszyklus der Volumes.** Die Claims haben keine Owner-Reference. Sie bleiben, wenn die Engine endet, das
+Profil entfernt oder das Gateway deinstalliert wird. Das Gateway löscht sie nie von sich aus.
+
+* Name: `quackmux-data-<level>-<owner>-<subdomain>-<profil>-<hash>`, gekürzt auf ein DNS-Label (63 Zeichen); der
+  Hash über `provider.kubernetes.instance` und den vollständigen Schlüssel macht ihn eindeutig. Er hängt von nichts
+  anderem ab. Ein umbenanntes Profil, eine andere Subdomain oder Instanz ergibt ein neues, leeres Volume.
+* Labels: `app.kubernetes.io/managed-by=quackmux`, `app.kubernetes.io/component=engine-data`,
+  `quackmux.io/instance`, `quackmux.io/key-hash` (wie am Pod), `quackmux.io/share-level`, `quackmux.io/profile`.
+  Annotationen: `quackmux.io/key` (der Schlüssel), `quackmux.io/user` (wessen Session ihn angelegt hat),
+  `quackmux.io/last-launch` (letzter Start einer Engine damit).
+* Einen Claim mit dem richtigen Namen, aber fremden Labels oder anderem `quackmux.io/key` mountet das Gateway nie;
+  der Start scheitert mit `refusing to mount a claim that does not belong to the engine key`.
+* `GET /api/v1/volumes[?owner=…]` listet die Volumes mit Größe, Zustand, letztem Start und der Engine, die sie
+  gerade nutzt. `DELETE /api/v1/volumes/{name}` löscht eines, solange keine Engine des Schlüssels existiert (sonst
+  409; vorher `DELETE /api/v1/engines/{id}`). Nur der Leader löscht, und erst wenn er alle Engines kennt (sonst
+  503). Mit `reclaimPolicy: Delete` der StorageClass sind die Daten danach weg. `kubectl delete pvc` geht auch;
+  Kubernetes hält einen Claim, den ein Pod nutzt, bis der Pod weg ist (Finalizer `kubernetes.io/pvc-protection`).
+* `size`, `storageClassName`, `accessMode`, `labels` und `annotations` gelten nur für neue Claims; bestehende
+  behalten ihre Werte. Vergrößern: `kubectl patch pvc …` mit einer StorageClass, die `allowVolumeExpansion` erlaubt.
+* Plattenplatz begrenzen: Eine ResourceQuota im Namespace (`count/persistentvolumeclaims`, `requests.storage`)
+  deckelt alle Volumes. Scheitert das Anlegen an ihr, meldet der Client `… exceeded quota …`.
+* Bei einer Datei-Datenbank lagert DuckDB Zwischenergebnisse neben der Datei aus (`engine.duckdb.tmp`, also auf dem
+  Volume). Mit `settings.temp_directory: /tmp/duckdb-spill` landen sie im `emptyDir` des Pods.
+* Beim Beenden macht der Entrypoint einen `FORCE CHECKPOINT`, höchstens `QUACKMUX_STOP_TIMEOUT` lang (Grace Period
+  minus 5 s). Große Datenbanken brauchen eine längere `provider.kubernetes.deleteGracePeriod`; sonst spielt die
+  nächste Engine das WAL beim Start ein, was gegen `startupTimeout` zählt. Das Bereitstellen eines neuen Volumes
+  (Cloud-Disks: oft 10–60 s) zählt ebenfalls dagegen.
+* Backups: Volume-Snapshots der StorageClass oder Werkzeuge wie Velero über die Labels; deren Annotationen setzt
+  `persistence.annotations`.
+
+### Gemeinsame Daten read-only anhängen
+
+Ein PVC im `podTemplate` ist **kein** Speicher pro Benutzer: Das Gateway rendert das Template für jede Engine des
+Profils gleich, alle Engines des Profils mounten also dasselbe Volume (jeder Benutzer, jede Subdomain, Pool- und
+Ersatz-Engines). Eine DuckDB-Datei darauf kann nur eine davon schreibend öffnen; jede weitere scheitert beim Start
+(`Could not set lock on file`), auf Netzwerk-Dateisystemen ohne verlässliche Locks droht Datenverlust. Das taugt
+also nur für Daten, die gelesen werden: PVC (`ReadOnlyMany`) im Template und im `initSQL`
+`ATTACH '/data/lake.duckdb' AS lake (READ_ONLY)`. Das verträgt beliebig viele Engines.
+
+### Schreibbare Daten in einem externen Katalog
+
+Etwa DuckLake mit Postgres-Katalog und Objektspeicher (Beispiel in
+[images/engine/README.md](../../images/engine/README.md)). Mehrere Engines können so dieselben Tabellen schreiben.
+
+Eine einzige schreibbare Datei für alle: ein Profil mit `allowedShareLevels: [SERVER]`,
+`allowedSubdomains: [default]` und `persistence`.
 
 ## Härtung geteilter Engines
 
@@ -562,6 +686,7 @@ kubectl -n quackmux get pods -l app.kubernetes.io/component=engine -L quackmux.i
 kubectl -n quackmux describe pod quack-user-alice-x7k2p
 kubectl -n quackmux logs quack-user-alice-x7k2p
 kubectl -n quackmux get events --sort-by=.lastTimestamp
+kubectl -n quackmux get pvc -l app.kubernetes.io/component=engine-data -L quackmux.io/share-level,quackmux.io/profile
 ```
 
 | Symptom | Ursache und Abhilfe |
@@ -575,4 +700,12 @@ kubectl -n quackmux get events --sort-by=.lastTimestamp
 | `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
 | `quackmux: gateway is not ready: not the leader` | Die Verbindung landet direkt beim Follower, etwa durch einen Port-Forward auf einen bestimmten Pod. `svc/quackmux` verwenden. |
 | `quackmux: could not provide an engine: engine limit reached …` | `limits.maxEngines`, `maxEnginesPerUser` oder `maxStartingEngines` erreicht; `GET /api/v1/engines` zeigt, wer sie belegt. |
-| `quackmux: not permitted: …` | Share-Level, Profil oder Gruppe sind für den Benutzer nicht erlaubt (`allowedShareLevels`, `allowedUsers`, `allowedGroups`, `overrides`). |
+| `quackmux: not permitted: …` | Share-Level, Profil, Subdomain oder Gruppe sind für den Benutzer nicht erlaubt (`allowedShareLevels`, `allowedUsers`, `allowedGroups`, `allowedSubdomains`, `overrides`). |
+| `quackmux: could not provide an engine: … the previous engine of this key still holds its data volume …` | Persistentes Profil: Die vorige Engine des Schlüssels läuft noch aus (Drain) oder ihr Pod hängt in `Terminating` (Node ausgefallen, siehe [Persistente Daten](#persistente-daten)); `GET /api/v1/engines` zeigt sie. Mit `(engine pod … exists …)` gibt es einen Pod des Schlüssels, den das Gateway nicht kennt: `kubectl get pods -l quackmux.io/key-hash=<hash>`. Ist sein Token-Secret lesbar, übernimmt das Gateway ihn nach wenigen Sekunden. |
+| `quackmux: could not provide an engine: … this gateway does not hold a fresh leader lease` | Persistentes Profil mit HA: Das `ATTACH` erreichte einen Leader, der gerade seine Lease verliert. Wiederholen. |
+| `launch failed: … refusing to mount a claim that does not belong to the engine key` | Unter dem Namen liegt ein fremder Claim (andere Labels oder anderes `quackmux.io/key`). Das Gateway überschreibt ihn nie; prüfen und gegebenenfalls löschen. |
+| `launch failed: data volume claim … is being deleted` | Der Claim wird gerade gelöscht; ist er weg, legt das nächste `ATTACH` ein neues, leeres Volume an. |
+| `launch failed: create data volume claim …: … exceeded quota` | ResourceQuota des Namespace erschöpft (`count/persistentvolumeclaims`, `requests.storage`). |
+| Engine-Pod bleibt `Pending`, sein Claim ebenfalls | Provisioner oder StorageClass (`kubectl describe pvc <name>`); ohne Default-StorageClass `persistence.storageClassName` setzen. Die Zeit zählt gegen `startupTimeout`. |
+| Engine-Pod bleibt `Pending`: `… PersistentVolumeClaim with ReadWriteOncePod access mode already in-use by another pod` | Ein anderer Pod nutzt den Claim, etwa ein Debug-Pod: `kubectl get pods -l quackmux.io/key-hash=<hash>` und `kubectl describe pvc <name>`. |
+| Engine scheitert mit `Could not set lock on file "/data/engine.duckdb"` | Ein zweiter Prozess hält die Datei (nur mit `ReadWriteOnce`, einem fremden Pod oder einem PVC im `podTemplate` möglich). |

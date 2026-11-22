@@ -10,7 +10,7 @@ Sessions und Engines nach Timeouts wieder ab.
  DuckDB-Client ──HTTP(S) POST /quack──▶ quackmux ──HTTP POST /quack──▶ Engine-Pod (DuckDB + quack_serve)
  (ATTACH)                                 │  ▲                          Engine-Pod …
                                           ▼  │ Watch/Create/Delete
-                                    Kubernetes-API (Pods, Secrets, Lease)
+                                    Kubernetes-API (Pods, Secrets, PVCs, Lease)
 ```
 
 ## 1. Protokoll-Grundlagen (Quack v3, DuckDB 2.0)
@@ -198,6 +198,13 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   Engine, bestehende laufen aus. Nach `drainTimeout` werden sie geschlossen.
 * `engine.replaceOnSpecChange` (Default an): Jede Engine trägt den Hash ihrer gerenderten Spec. Ändert sich ein
   Profil, gehen alte Engines auf DRAINING. Das ergibt ein „Rolling Update“ ohne Abbruch laufender Sessions.
+* Persistente Profile (Abschnitt 7): höchstens eine Engine pro Schlüssel, in jedem Zustand. Eine Nachfolgerin
+  startet erst, wenn die vorige GONE ist. Fällig gewordene Engines (Spec geändert, `maxLifetime`) nehmen weiter
+  Sessions an, auch neue, enden, sobald sie idle sind (wiedergefundene frühestens nach `recoveryGrace`), und
+  werden `drainTimeout` nach der Fälligkeit gedrained. Eine neue Session ohne bedienende Engine wartet im Rahmen
+  von `startupTimeout`, bis die vorige Engine GONE ist, sonst scheitert sie mit „the previous engine of this key
+  still holds its data volume“; FAILED-Engines beendet sie dafür sofort. Starten, dafür beenden und warten darf
+  nur ein Gateway mit frischer Lease (Abschnitt 6).
 * Pod-Ereignisse kommen über einen Informer: Ready, Failed, gelöscht, `ImagePullBackOff` usw. Wird ein Pod extern
   gelöscht oder stürzt er ab, gehen seine Sessions auf CLOSED („engine terminated“). Folge-Requests bekommen
   `must_invalidate`.
@@ -263,14 +270,27 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   Labels und Annotationen. Optional dient ein komplettes `podTemplate` als Basis, das Gateway ergänzt seine
   Pflichtfelder. Ein PVC im Template mounten **alle** Engines des Profils (jeder Benutzer, jede Subdomain, Pool-
   und Ersatz-Engines); eine DuckDB-Datei darauf kann nur eine davon schreibend öffnen. Das taugt für read-only
-  angehängte Daten oder ein Profil mit genau einer Engine. PVCs pro Engine-Schlüssel sind offen
-  (deploy/kubernetes/README.md, „Persistente Daten“).
+  angehängte Daten.
+* Persistente Profile (`persistence`) bekommen ein PersistentVolumeClaim pro Engine-Schlüssel, gemountet unter
+  `/data` (Datenbank `/data/engine.duckdb`). Der Name `quackmux-data-<level>-<owner>-<subdomain>-<profil>-<hash>`
+  hängt nur von Instanz und Schlüssel ab, ein Neustart findet die Claims also ohne Zustand wieder. Das Gateway
+  legt den Claim vor dem Pod an (wie ein StatefulSet), ohne Owner-Reference, und löscht ihn nie von sich aus
+  (Admin-API, Abschnitt 9). Einen Claim mit fremden Labels oder anderem Schlüssel mountet es nie, einen, der
+  gerade gelöscht wird oder `Lost` ist, auch nicht. Der Manager hält höchstens eine Engine pro Schlüssel
+  (Abschnitt 5.2); als GONE gilt eine Engine erst, wenn ihr Pod-Objekt gelöscht ist, also nach dem Stopp der
+  Container und dem Aushängen der Volumes, und nie, solange ihr Launch noch läuft. Direkt vor dem Pod prüft der
+  Provider in der API, dass kein anderer Pod des Schlüssels existiert (auch keiner, den die Registry nicht kennt),
+  und mit HA ein letztes Mal die Lease. ReadWriteOncePod (Default) lässt den Scheduler zusätzlich keinen zweiten
+  Pod mit dem Claim einplanen; `spec.nodeName`, das den Scheduler umgeht, lehnt die Validierung ab. Erzwungenes
+  Löschen eines Pods und ein Node-Ausfall sind die Grenzen (deploy/kubernetes/README.md, „Persistente Daten“).
+  Andere Provider lehnen `persistence` ab.
 * Grace Period beim Löschen: `provider.kubernetes.deleteGracePeriod` (Default 30 s, mindestens 1 s). Das Gateway
   setzt `QUACKMUX_STOP_TIMEOUT` der Engine auf 5 s weniger (mindestens 1 s), damit der Entrypoint DuckDB samt
   Checkpoint stoppt, bevor das Kubelet den Container tötet.
 * RBAC (Namespace-scoped):
   * pods: get, list, watch, create, delete, patch
   * secrets: get, list, create, delete, patch
+  * persistentvolumeclaims: get, list, create, patch, delete (persistente Profile)
   * events: create
   * leases: für HA
 
@@ -307,7 +327,8 @@ Weitere Provider:
   ATTACH 'quack:quackmux.example.com:9494' AS lake;   -- ggf. (DISABLE_SSL true) ohne TLS
   ```
 * Policy:
-  * Profile: `allowedShareLevels`, `allowedUsers`, `allowedGroups`.
+  * Profile: `allowedShareLevels`, `allowedUsers`, `allowedGroups`, `allowedSubdomains` (Pflicht mit
+    `persistence`, ohne Wirkung bei `CONNECTION`).
   * `overrides[]` (erster Treffer gewinnt): eigene Defaults, `allowedShareLevels`, `allowedProfiles` und
     `maxSessions` je Benutzer- oder Gruppenmatch.
   * Limits:
@@ -330,6 +351,8 @@ Weitere Provider:
   * `GET /api/v1/engines`
   * `POST /api/v1/engines/{id}/drain`
   * `DELETE /api/v1/engines/{id}`
+  * `GET /api/v1/volumes[?owner=]`, `DELETE /api/v1/volumes/{name}` (Daten-Volumes persistenter Profile; Löschen
+    nur ohne Engine des Schlüssels und nur auf dem Leader)
   * `/healthz`, `/readyz`, `/metrics` (Prometheus)
 * **Metriken:**
   * `quackmux_sessions{share_level,profile}` und `quackmux_sessions_opened_total`,

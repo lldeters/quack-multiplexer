@@ -244,9 +244,10 @@ docker run --rm --name quack-engine -p 9494:9494 -v quack-data:/data \
 
 Der Kubernetes-Provider des Gateways setzt die Umgebungsvariablen, holt das Token aus einem Secret und mountet ein
 `emptyDir` auf `/tmp`. Das Root-Dateisystem ist read-only, nur `/tmp` muss beschreibbar sein. Die Readiness-Probe ist
-`GET /` auf Port 9494. Der numerische `USER 1000:1000` erfüllt `runAsNonRoot`. Ein PVC auf `/data` (mit
-`fsGroup: 1000`) im `podTemplate` mounten alle Engines des Profils gleichzeitig; eine Datenbankdatei darauf kann nur
-eine Engine schreibend öffnen. Wann das trotzdem passt, steht in
+`GET /` auf Port 9494. Der numerische `USER 1000:1000` erfüllt `runAsNonRoot`. Mit `profiles.<name>.persistence`
+legt das Gateway pro Engine-Schlüssel ein PVC an und mountet es auf `/data` (Datenbank `/data/engine.duckdb`,
+`fsGroup: 1000`). Ein PVC im `podTemplate` mounten dagegen alle Engines des Profils gleichzeitig; eine
+Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
 [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Persistente Daten“.
 
 ## Sicherheit

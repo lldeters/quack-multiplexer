@@ -20,8 +20,10 @@ bei Bedarf, multiplext Sessions darauf und räumt nach Timeouts auf, genau wie A
 | `GROUP` | ein Pod pro Gruppe |
 | `SERVER` | ein Pod für alle |
 
-Dazu kommen **Subdomains** (mehrere getrennte Engines je Owner), **Pools** (N Engines pro Key, RANDOM/POLLING)
-und ein **Warm-Pool** vorgestarteter Pods für schnelle `CONNECTION`-Sessions.
+Dazu kommen **Subdomains** (mehrere getrennte Engines je Owner), **Pools** (N Engines pro Key, RANDOM/POLLING),
+ein **Warm-Pool** vorgestarteter Pods für schnelle `CONNECTION`-Sessions und **persistente Profile** mit einem
+eigenen Volume pro Benutzer, Gruppe oder Subdomain (`profiles.<name>.persistence`, siehe
+[deploy/kubernetes/README.md](deploy/kubernetes/README.md#persistente-daten)).
 
 ## Optionen setzen
 
