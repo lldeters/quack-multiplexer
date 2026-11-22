@@ -45,6 +45,10 @@ import (
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
+// labelCloseTimeout bounds the removal of the leader label at shutdown,
+// before the lease is released (terminationGracePeriodSeconds covers it).
+const labelCloseTimeout = 2 * time.Second
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -304,12 +308,15 @@ func cmdServe(args []string) error {
 	engines.SetSessionCloser(sessions)
 
 	var elector *ha.Elector
+	var podNamespace, podName string
 	if cfg.HA.Enabled {
-		identity := os.Getenv("POD_NAME")
-		if identity == "" {
-			identity, _ = os.Hostname()
+		// The leader labels its own pod (see the labeler below), so the
+		// gateway must run as a pod that knows its name and namespace; the
+		// pod name is its identity in the lease.
+		if podNamespace, podName, err = ha.OwnPod(); err != nil {
+			return err
 		}
-		elector, err = ha.New(ha.Options{Config: cfg.HA, Client: kube, Namespace: namespace, Identity: identity, Log: log})
+		elector, err = ha.New(ha.Options{Config: cfg.HA, Client: kube, Namespace: namespace, Identity: podName, Log: log})
 		if err != nil {
 			return err
 		}
@@ -323,19 +330,51 @@ func cmdServe(args []string) error {
 	var leading atomic.Bool
 	var started atomic.Bool
 	var stopping atomic.Bool
-	ready := func() (bool, string) {
+	// serving reports whether this process serves Quack requests. With HA
+	// only the leader with a fresh lease does; its pod carries the label that
+	// the Service selects.
+	serving := func() (bool, string) {
 		if stopping.Load() {
 			return false, "shutting down"
 		}
-		if cfg.HA.Enabled && !leading.Load() {
-			return false, "not the leader"
+		if elector != nil && (!leading.Load() || !elector.Fresh()) {
+			return false, proxy.ReasonNotLeader
 		}
 		if !started.Load() || !engines.Synced() {
 			return false, "starting up"
 		}
 		return true, ""
 	}
-	gw := proxy.New(proxy.Options{Config: cfg, Auth: authn, Engines: engines, Sessions: sessions, Upstream: up, Log: log, Metrics: met, Ready: ready})
+	var labeler *ha.Labeler
+	if elector != nil {
+		labeler, err = ha.NewLabeler(ha.LabelerOptions{
+			Client: kube, Namespace: podNamespace, Pod: podName, Log: log, Metrics: met,
+			Want: func() bool { ok, _ := serving(); return ok },
+		})
+		if err != nil {
+			return err
+		}
+		// Remove a label that an earlier container of this pod left behind,
+		// and refuse to start if the pod can never be labelled.
+		if err := labeler.Init(ctx); err != nil {
+			return err
+		}
+	}
+	// ready is the readiness of the pod (/readyz). Without HA it is serving.
+	// With HA every healthy replica is ready, so that rollouts, the
+	// PodDisruptionBudget and health checks work as usual; the Service
+	// routes Quack traffic by the leader label. A replica that does not
+	// serve is ready only once the label is confirmed absent from its pod
+	// (else the Service could route to it) and it campaigns for the lease
+	// (so that it can take over at once).
+	ready := func() (bool, string) {
+		ok, why := serving()
+		if ok || labeler == nil || stopping.Load() {
+			return ok, why
+		}
+		return ha.StandbyReady(elector, labeler)
+	}
+	gw := proxy.New(proxy.Options{Config: cfg, Auth: authn, Engines: engines, Sessions: sessions, Upstream: up, Log: log, Metrics: met, Ready: serving})
 
 	adminToken, err := readTokenFile(cfg.Admin.TokenFile)
 	if err != nil {
@@ -364,6 +403,9 @@ func cmdServe(args []string) error {
 		}
 		go sessions.Run(ctx)
 		started.Store(true)
+		if labeler != nil {
+			labeler.Kick() // label the pod now: from then on the Service routes to it
+		}
 		log.Info("gateway ready", "listen", cfg.Server.Listen)
 		<-ctx.Done()
 		return nil
@@ -392,23 +434,36 @@ func cmdServe(args []string) error {
 	defer cancelRun()
 	electorDone := make(chan struct{})
 	if elector != nil {
+		// The label outlives the leadership: it goes when serving ends, and
+		// at shutdown before the lease is released.
+		labelCtx, stopLabels := context.WithCancel(context.Background())
+		defer stopLabels()
+		go labeler.Run(labelCtx)
 		go func() {
 			defer close(electorDone)
 			err := elector.Run(runCtx,
 				func(lctx context.Context) {
 					leading.Store(true)
 					met.IsLeader.Set(1)
+					if prev := elector.Displaced(); prev != "" {
+						// The previous leader did not release the lease: its pod
+						// may still carry the label, and on a lost node it stays
+						// ready for a while.
+						go func() { _ = labeler.RemoveStale(lctx, prev, elector.Fresh) }()
+					}
 					if err := run(lctx); err != nil {
 						errc <- err
 					}
 					// The leader context ended (lease lost or released): stop
-					// reporting ready at once, not only once client-go has tried
-					// to release the lease, which can take another renewDeadline.
+					// serving at once, not only once client-go has tried to
+					// release the lease, which can take another renewDeadline.
 					leading.Store(false)
+					labeler.Kick()
 					met.IsLeader.Set(0)
 				},
 				func() {
 					leading.Store(false)
+					labeler.Kick()
 					met.IsLeader.Set(0)
 					// Losing the lease while serving: exit so that the pod
 					// restarts as a clean follower.
@@ -451,16 +506,35 @@ func cmdServe(args []string) error {
 	defer abort.Stop()
 	stopping.Store(true)
 	if elector != nil {
-		// Hand the lease over first, and wait until it is released: another
-		// replica then takes over within seconds, while this one finishes its
-		// in-flight requests, instead of after the drain or the expiry of the
-		// lease. The background work ends with the leadership (and is fenced
-		// by its freshness anyway).
+		// Take the pod out of the Service at once (without waiting for the
+		// readiness probe) by removing the label, then hand the lease over
+		// and wait until it is released: another replica takes over within
+		// seconds, while this one finishes its in-flight requests, instead
+		// of after the drain or the expiry of the lease. The background work
+		// ends with the leadership (and is fenced by its freshness anyway).
+		// Idle keep-alive connections close now, so that their clients
+		// reconnect through the Service.
+		quackSrv.SetKeepAlivesEnabled(false)
+		lctx, lcancel := context.WithTimeout(context.Background(), labelCloseTimeout)
+		if err := labeler.Close(lctx); err != nil {
+			log.Warn("could not remove the leader label before handing over; the readiness probe takes the pod out of the Service instead", "err", err)
+		}
+		lcancel()
+		unlabelled := time.Now()
 		cancelRun()
 		select {
 		case <-electorDone:
 		case <-time.After(cfg.HA.RenewDeadline.Duration + time.Second):
 			log.Warn("leader election did not stop in time; the lease may expire instead of being released")
+		}
+		if started.Load() {
+			// This pod was an endpoint of the Service. Until kube-proxy has
+			// caught up, new connections still arrive: answer them (with an
+			// error) rather than let them hang in connect once the pod is gone.
+			select {
+			case <-time.After(time.Until(unlabelled.Add(cfg.HA.DeregistrationDelay.Duration))):
+			case <-shutdownCtx.Done():
+			}
 		}
 	}
 	_ = quackSrv.Shutdown(shutdownCtx)
