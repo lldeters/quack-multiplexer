@@ -139,10 +139,10 @@ neue Benutzernamen mit der Run-ID und beendet die Engines, die er gestartet hat,
 | k2 | Zwei Sessions desselben Benutzers mit `share_level=user`; die erste legt eine Tabelle an, die zweite liest sie | Beide Sessions teilen sich genau einen Engine-Pod und dessen Datenbank. |
 | k3 | Der Engine-Pod einer `USER`-Session wird gelöscht. Danach eine Query auf demselben Attachment, dann `DETACH` und erneutes `ATTACH` | Das Gateway erkennt den Verlust über den Informer und schließt die Session. Die nächste Query scheitert mit „session closed“ statt zu hängen. Ein neues `ATTACH` startet einen neuen Pod und funktioniert. |
 | k4 | Eine offene Session, dann `kubectl rollout restart` des Gateways, danach eine Query auf demselben Attachment | Das neue Gateway findet die Engine-Pods wieder (Discovery) und übernimmt die Session aus der versiegelten Connection-ID (Adoption): Die Query klappt, die Admin-API zeigt die Session mit `"adopted": true` auf derselben Engine. Das Dev-Overlay nutzt die Strategie `Recreate`; dass Heartbeats in der kurzen Pause scheitern, toleriert der Client. Scheitert die erste Query nach dem Neustart mit einem Transportfehler, wiederholt das Skript sie bis zu zweimal und meldet das als Warnung. |
-| k5 | Eine Session mit `profile=persistent` legt eine Tabelle an. Der Engine-Pod wird gelöscht, und der Client attacht sofort neu, während der alte Pod noch herunterfährt. | Die Engine mountet einen eigenen Claim (`ReadWriteOncePod`, `Bound`, Annotation `quackmux.io/key` mit dem Schlüssel des Benutzers). Das Gateway startet die neue Engine erst, wenn der alte Pod aus der API verschwunden ist: Ein Watch auf `quackmux.io/key-hash` sieht nie zwei Pods. Die neue Engine mountet denselben Claim, die Tabelle ist noch da. |
+| k5 | Eine Session mit `profile=persistent` legt eine Tabelle an. Die Admin-API draint ihre Engine, während die Session angehängt bleibt, und eine zweite Session desselben Benutzers attacht; dann detacht die erste. Danach wird der Engine-Pod gelöscht, und die zweite Session attacht neu. | Die Engine mountet einen eigenen Claim (`ReadWriteOncePod`, `Bound`, Annotation `quackmux.io/key` mit dem Schlüssel des Benutzers). Die zweite Session wartet, solange die gedrainte Engine eine Session hat: Ihr `ATTACH` bleibt offen, das Gateway-Log meldet `a new session waits for the previous engine of its key`. Die nächste Engine startet erst, wenn der alte Pod aus der API verschwunden ist, mit demselben Claim und der Tabelle. Auch nach dem Löschen des Pods ist die Tabelle da. Ein Watch auf `quackmux.io/key-hash` sieht nie zwei Pods. |
 | k6 | Zwei Benutzer mit `profile=persistent`; der zweite fragt die Tabelle des ersten ab. Ein dritter Client wählt `subdomain=other`. | Jeder Benutzer hat seinen eigenen Claim und sieht nur seine Daten („does not exist“). Eine Subdomain außerhalb von `allowedSubdomains` lehnt das Gateway ab („does not allow subdomain“). |
 | k7 | Das Profil `persistent` wird geändert (eine neue ConfigMap mit zusätzlichem Label, Rollout des Gateways). Eine zweite Session kommt hinzu, danach enden beide; dann attacht eine dritte. | Die veraltete Engine nimmt weiter Sessions an (`replacement pending`, zwei Sessions), statt neben einer Nachfolgerin zu laufen. Sie endet, sobald sie idle ist (nach `engine.recoveryGrace` des neu gestarteten Gateways, daher dauert k7 etwa fünf Minuten); erst dann startet die Nachfolgerin, mit demselben Claim und denselben Daten. Der Watch sieht nie zwei Pods des Schlüssels. Danach stellt das Skript die Konfiguration wieder her. |
-| k8 | `GET /api/v1/volumes?owner=…`, `DELETE /api/v1/volumes/{name}` mit und ohne laufende Engine | Die Admin-API listet den Claim mit seiner Engine, lehnt das Löschen ab, solange die Engine existiert (409), und löscht ihn danach (202). |
+| k8 | `GET /api/v1/volumes?owner=…`, `DELETE /api/v1/volumes/{name}` mit laufender Engine, mit einem Debug-Pod, der den Claim mountet, und ohne beides | Die Admin-API listet den Claim mit seiner Engine. Sie lehnt das Löschen ab (409), solange die Engine existiert und solange ein anderer Pod den Claim mountet (das Gateway fragt dafür die Kubernetes-API, nicht seine Registry), und löscht ihn danach (202). |
 
 Anforderungen an das Overlay (das Dev-Overlay erfüllt sie): `auth.mode: none`, ein gemeinsamer Session-Key
 (`server.sessionKeyFile` oder `QUACKMUX_SESSION_KEY`, sonst scheitert k4 mit „Invalid connection id“), ein Service mit
@@ -200,6 +200,21 @@ unterwegs ist, darf scheitern (nie doppelt laufen); das Skript wiederholt sie bi
 h3 braucht `docker exec` auf dem kind-Node (`crictl inspect` liefert die PID des Gateway-Containers). Wer
 Fehler untersuchen will, lässt das HA-Deployment mit `KEEP_HA=1` stehen; das erzeugte Overlay mit seinen Secrets
 bleibt dann ebenfalls liegen.
+
+**h6, persistente Schlüssel mit HA:** ha.sh fügt der Konfiguration des erzeugten Overlays das Profil `persistent`
+hinzu (ein Volume pro Benutzer, Subdomains `default` und `late`); hat das Overlay keine `config.yaml` mit
+`profiles:`, entfällt h6 mit einer Warnung. Eine Session des Profils legt eine Tabelle an, dann friert das Skript
+den Leader ein wie in h3. Währenddessen verbindet sich ein zweiter Client direkt mit dem eingefrorenen Pod, für die
+Subdomain `late` (ein Schlüssel ohne Engine), und nach der Übernahme attacht ein dritter über den Service. Geprüft
+wird:
+
+* Der neue Leader übernimmt die Engine und gibt der neuen Session des Schlüssels dieselbe; sie sieht die Tabelle.
+  Ein Watch auf `quackmux.io/key-hash` sieht nie zwei Pods des Schlüssels.
+* Der aufgeweckte Leader beantwortet das wartende `ATTACH` mit einem Fehler und startet keine Engine für `late`:
+  Ohne frische Lease startet er keine Engine eines persistenten Schlüssels.
+* Auf dem Follower antworten `GET` und `DELETE /api/v1/volumes` mit 503.
+* Die Session von vor dem Einfrieren arbeitet weiter. Am Ende löscht das Skript Engine und Claim über die
+  Admin-API des Leaders.
 
 | Variable | Default | Bedeutung |
 |---|---|---|

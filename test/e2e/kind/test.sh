@@ -163,6 +163,9 @@ cleanup() {
 	key_watch_stop
 	restore_gateway_config || rc=1
 	cleanup_engines
+	if [ -n "$MOUNT_POD" ]; then
+		kctl -n "$NS" delete pod "$MOUNT_POD" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	fi
 	cleanup_volumes
 	pf_stop
 	if [ -z "${KEEP_CLIENT:-}" ]; then
@@ -362,12 +365,6 @@ SELECT 'k4_r1-attempt-$attempt' AS result;" || return 1
 # (kind's local-path does).
 
 PERSISTENT_OPTS=profile=persistent
-DATA_VOLUME=quackmux-data
-
-# claim_of POD prints the claim that engine pod POD mounts as its data volume.
-claim_of() {
-	kctl -n "$NS" get pod "$1" -o jsonpath="{.spec.volumes[?(@.name==\"$DATA_VOLUME\")].persistentVolumeClaim.claimName}" 2>/dev/null
-}
 
 # claim_field CLAIM JSONPATH prints a field of a claim.
 claim_field() { kctl -n "$NS" get pvc "$1" -o jsonpath="$2" 2>/dev/null; }
@@ -388,48 +385,6 @@ engine_of() {
 engine_message_has() {
 	api GET "$ADMIN_URL" "/api/v1/engines/$1" "$E2E_WORK/engine-message.json"
 	grep -qF -- "$2" "$E2E_WORK/engine-message.json"
-}
-
-# key_hash_of POD prints the key hash label of engine pod POD; all pods (and
-# the claim) of one engine key carry the same one.
-key_hash_of() {
-	kctl -n "$NS" get pod "$1" -o jsonpath='{.metadata.labels.quackmux\.io/key-hash}' 2>/dev/null
-}
-
-# key_watch_start HASH FILE records every pod of the key HASH, as the API
-# server reports it, in FILE (until key_watch_stop).
-KEY_WATCH_PID=''
-key_watch_start() {
-	key_watch_stop
-	(
-		close_session_fds
-		exec kubectl --context "$KUBE_CONTEXT" -n "$NS" get pods -l "quackmux.io/key-hash=$1" --watch \
-			--output-watch-events -o jsonpath='{.type} {.object.metadata.name}{"\n"}'
-	) >"$2" 2>&1 &
-	KEY_WATCH_PID=$!
-	# The watch starts with an ADDED event per existing pod.
-	wait_for 30 "the watch of the pods of key $1" grep -q ADDED "$2"
-}
-
-key_watch_stop() {
-	if [ -n "$KEY_WATCH_PID" ]; then
-		kill "$KEY_WATCH_PID" 2>/dev/null || true
-		wait "$KEY_WATCH_PID" 2>/dev/null || true
-		KEY_WATCH_PID=''
-	fi
-}
-
-# expect_one_pod_at_a_time FILE HASH stops the watch and checks that at no
-# time more than one pod object of the key existed.
-expect_one_pod_at_a_time() {
-	local max
-	key_watch_stop
-	max=$(awk '$1 == "ADDED" { live[$2] = 1 } $1 == "DELETED" { delete live[$2] }
-		{ n = 0; for (p in live) n++; if (n > max) max = n } END { print max + 0 }' "$1")
-	if ! expect_eq "$max" 1 "never more than one engine pod of the key existed (watch of key-hash $2)"; then
-		indent "$1"
-		return 1
-	fi
 }
 
 # set_gateway_config NAME points the gateway at ConfigMap NAME, waits for the
@@ -472,12 +427,29 @@ SELECT '$id-attempt-$attempt' AS result;" || return 1
 	done
 }
 
+# gateway_log_has SINCE TEXT... succeeds when one line of the gateway log
+# since SINCE (RFC 3339) contains every TEXT.
+gateway_log_has() {
+	local since=$1 line t
+	shift
+	kctl -n "$NS" logs "deployment/$DEPLOY" --since-time="$since" >"$E2E_WORK/gateway-since.log" 2>/dev/null || return 1
+	while IFS= read -r line; do
+		for t in "$@"; do
+			case $line in *"$t"*) ;; *) continue 2 ;; esac
+		done
+		return 0
+	done <"$E2E_WORK/gateway-since.log"
+	return 1
+}
+
 # k5: a USER engine of the persistent profile keeps its data on its own
-# claim. Its pod is deleted and the user attaches again while it still stops:
-# the gateway starts the next engine only once the old pod object is gone
-# (never two pods of the key), and the new engine mounts the same claim.
+# claim, and a key never has two engine pods. The engine is drained while
+# its session stays attached: a second session of the key then waits (its
+# ATTACH stays open) until the old pod is gone, and gets the next engine on
+# the same claim, with the data. The data also survives the deletion of the
+# engine pod.
 scenario_persistent_data() {
-	local user=e2e-erin-$RUN_ID p1 p2 claim hash events=$E2E_WORK/k5.events
+	local user=e2e-erin-$RUN_ID p1 p2 p3 claim hash since events=$E2E_WORK/k5.events
 	open_client k5_d1 "$user" user "$PERSISTENT_OPTS" || return 1
 	p1=$(engine_of "$user")
 	claim=$(claim_of "$p1")
@@ -494,31 +466,59 @@ SELECT 'k5_d1-created' AS result;" || return 1
 	session_wait k5_d1 'k5_d1-created' 60 || return 1
 	hash=$(key_hash_of "$p1")
 	key_watch_start "$hash" "$events" || return 1
-	say "  deleting engine pod $p1 and attaching again while it stops"
-	kctl -n "$NS" delete pod "$p1" --wait=false >/dev/null || {
-		bad "kubectl delete pod $p1 failed"
-		return 1
-	}
-	wait_for 60 "the gateway to close the session of the deleted engine" session_count_is "$ADMIN_URL" "$user" 0 || return 1
-	session_send k5_d1 "DETACH remote;
+
+	since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	api POST "$ADMIN_URL" "/api/v1/engines/$p1/drain" "$E2E_WORK/k5-drain.json"
+	expect_eq "$HTTP_STATUS" 202 "POST /api/v1/engines/$p1/drain (its session stays attached)" || return 1
+	session_start k5_d2 "${CLIENT_CMD[@]}" || return 1
+	session_send k5_d2 "$(client_preamble)
+$(secret_sql "$user" user "$PERSISTENT_OPTS")
 $(attach_sql)
-SELECT 'k5_d1-sees=' || CAST(x AS VARCHAR) AS result FROM remote.e2e_persist;" || return 1
-	session_wait k5_d1 'k5_d1-sees=42' "$ATTACH_TIMEOUT" '' || return 1
-	ok "the table survived the deletion of the engine pod"
-	if ! pod_gone "$p1"; then
-		bad "the new engine serves while the old pod $p1 still exists"
+SELECT 'k5_d2-sees=' || CAST(x AS VARCHAR) AS result FROM remote.e2e_persist;" || return 1
+	wait_for 60 "the gateway to log that the new session waits for $p1" \
+		gateway_log_has "$since" "a new session waits for the previous engine of its key" "$p1" || return 1
+	sleep 3
+	case $(session_output k5_d2) in
+	*k5_d2-sees=*)
+		bad "the second session got an engine while $p1 still holds the data volume"
+		return 1
+		;;
+	esac
+	if pod_gone "$p1"; then
+		bad "engine pod $p1 is gone although its session is still attached"
 		return 1
 	fi
-	expect_eq "$(claim_field "$claim" '{.metadata.name}')" "$claim" "the claim outlives the engine pod" || return 1
+	ok "the second session waits while the drained engine $p1 still has a session"
+	close_client k5_d1 || return 1
+	session_wait k5_d2 'k5_d2-sees=42' "$ATTACH_TIMEOUT" '' || return 1
+	if ! pod_gone "$p1"; then
+		bad "the next engine serves while the old pod $p1 still exists"
+		return 1
+	fi
 	p2=$(engine_of "$user")
 	if [ -z "$p2" ] || [ "$p2" = "$p1" ]; then
 		bad "expected a new engine pod instead of $p1, found '$p2'"
 		return 1
 	fi
-	expect_eq "$(claim_of "$p2")" "$claim" "the new engine pod $p2 mounts the same claim" || return 1
+	expect_eq "$(claim_of "$p2")" "$claim" "once $p1 was gone, the next engine $p2 mounts the same claim and sees the table" || return 1
+
+	say "  deleting engine pod $p2"
+	kctl -n "$NS" delete pod "$p2" --wait=false >/dev/null || {
+		bad "kubectl delete pod $p2 failed"
+		return 1
+	}
+	wait_for 60 "the gateway to close the session of the deleted engine" session_count_is "$ADMIN_URL" "$user" 0 || return 1
+	session_send k5_d2 "DETACH remote;
+$(attach_sql)
+SELECT 'k5_d2-again=' || CAST(x AS VARCHAR) AS result FROM remote.e2e_persist;" || return 1
+	session_wait k5_d2 'k5_d2-again=42' "$ATTACH_TIMEOUT" '' || return 1
+	ok "the table survived the deletion of the engine pod"
+	expect_eq "$(claim_field "$claim" '{.metadata.name}')" "$claim" "the claim outlives the engine pods" || return 1
+	p3=$(engine_of "$user")
+	expect_eq "$(claim_of "$p3")" "$claim" "the engine pod $p3 after the deletion mounts the same claim" || return 1
 	expect_one_pod_at_a_time "$events" "$hash" || return 1
-	close_client k5_d1 errors-expected || return 1
-	terminate_engine "$p2" || return 1
+	close_client k5_d2 errors-expected || return 1
+	terminate_engine "$p3" || return 1
 }
 
 # k6: two users of the persistent profile get two claims, and neither sees
@@ -636,10 +636,58 @@ restore_gateway_config() {
 	PERSIST_RESTORE_CONFIG=''
 }
 
-# k8: the admin API lists the claim with its engine, refuses to delete it
-# while the engine exists and deletes it afterwards.
+# mount_claim_pod NAME CLAIM starts a pod that is no engine (like a debug
+# pod) and mounts CLAIM; cleanup deletes it if a scenario fails.
+MOUNT_POD=''
+mount_claim_pod() {
+	MOUNT_POD=$1
+	kctl -n "$NS" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $1
+  labels:
+    app.kubernetes.io/part-of: quackmux-e2e
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: $CLIENT_UID
+    runAsGroup: $CLIENT_UID
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: debug
+      image: $ENGINE_IMAGE
+      imagePullPolicy: IfNotPresent
+      command: ["/usr/local/bin/duckdb"]
+      stdin: true
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: $2
+EOF
+}
+
+# k8: the admin API lists the claim with its engine and refuses to delete it
+# while the engine exists, and while a pod that is no engine mounts it (the
+# gateway asks the API server, not its registry). Then it deletes it.
 scenario_volume_admin() {
-	local user=e2e-ivy-$RUN_ID e claim out=$E2E_WORK/k8.json
+	local user=e2e-ivy-$RUN_ID e claim out=$E2E_WORK/k8.json debug=quackmux-e2e-debug-$RUN_ID
 	open_client k8_v "$user" user "$PERSISTENT_OPTS" || return 1
 	e=$(engine_of "$user")
 	claim=$(claim_of "$e")
@@ -650,8 +698,14 @@ scenario_volume_admin() {
 	expect_eq "$HTTP_STATUS" 409 "DELETE /api/v1/volumes/$claim is refused while the engine exists" || return 1
 	close_client k8_v || return 1
 	terminate_engine "$e" || return 1
+	mount_claim_pod "$debug" "$claim" || return 1
 	api DELETE "$ADMIN_URL" "/api/v1/volumes/$claim" "$out"
-	expect_eq "$HTTP_STATUS" 202 "DELETE /api/v1/volumes/$claim is accepted once the engine is gone" || return 1
+	expect_eq "$HTTP_STATUS" 409 "DELETE /api/v1/volumes/$claim is refused while pod $debug mounts it" || return 1
+	expect_output "$out" "pod $debug mounts it" "the gateway names the pod" || return 1
+	kctl -n "$NS" delete pod "$debug" --wait=true >/dev/null || return 1
+	MOUNT_POD=''
+	api DELETE "$ADMIN_URL" "/api/v1/volumes/$claim" "$out"
+	expect_eq "$HTTP_STATUS" 202 "DELETE /api/v1/volumes/$claim is accepted once no pod uses it" || return 1
 	wait_for 60 "claim $claim to be deleted" claim_gone "$claim" || return 1
 	ok "claim $claim is deleted"
 }
@@ -702,7 +756,7 @@ run_scenario k1 "CONNECTION share level: an engine pod per session, removed on D
 run_scenario k2 "USER share level: one engine pod per user" scenario_user
 run_scenario k3 "a deleted engine pod closes its sessions; ATTACH again works" scenario_engine_loss
 run_scenario k4 "a gateway restart keeps existing attachments (session adoption)" scenario_gateway_restart
-run_scenario k5 "persistence: the data of a USER engine survives the deletion of its pod" scenario_persistent_data
+run_scenario k5 "persistence: a new session waits for the drained engine; the data survives" scenario_persistent_data
 run_scenario k6 "persistence: two users get two claims" scenario_persistent_users
 run_scenario k7 "persistence: a profile change replaces the engine without overlap" scenario_persistent_replace
 run_scenario k8 "persistence: the admin API lists and deletes data volumes" scenario_volume_admin
