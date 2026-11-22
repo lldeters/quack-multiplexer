@@ -35,7 +35,11 @@ import (
 // which the kubelet does after the containers stopped and the volumes were
 // unmounted). The manager never asks it to terminate an engine whose launch
 // has not returned yet (terminateLocked): the instance could appear after
-// the provider reported it gone.
+// the provider reported it gone. Right before it creates the instance, the
+// provider checks the fence of the launch again (LaunchRequest.Fence) and,
+// for Kubernetes, that no other pod of the key exists: that covers pods the
+// registry does not know (one the initial List skipped, one another gateway
+// process created).
 
 // Errors of persistent keys and data volumes.
 var (

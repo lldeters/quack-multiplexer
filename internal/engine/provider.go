@@ -65,6 +65,12 @@ type LaunchRequest struct {
 	// engine (QUACK_TOKEN) and store it so that List can return it later.
 	Token    string
 	SpecHash string
+	// Fence, if set, must report true right before the provider creates the
+	// instance; otherwise Launch fails with ErrNotLeader. The manager sets
+	// it for persistent keys with leader election: a leader that resumes
+	// after a freeze must not start a second engine on a data volume next
+	// to the one the new leader started meanwhile (see persistence.go).
+	Fence func() bool
 }
 
 // ErrNotSupported is returned by providers that cannot perform an operation

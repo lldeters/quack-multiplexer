@@ -346,6 +346,32 @@ func TestLaunchRefusesSecondPodOfKey(t *testing.T) {
 	}
 }
 
+// A launch whose fence fails right before the pod would be created (a leader
+// whose lease went stale meanwhile) creates no pod and leaves no token
+// secret behind.
+func TestLaunchFence(t *testing.T) {
+	e := newTestEnv(t, testConfig(t, persistentYAML))
+	ctx := context.Background()
+	req := launchRequest(e.p, personalKey, false, "alice", "tok-123")
+	req.Fence = func() bool { return false }
+	if _, err := e.p.Launch(ctx, req); !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("launch with a stale lease: %v", err)
+	}
+	pods, _ := e.client.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{})
+	secrets, _ := e.client.CoreV1().Secrets(testNamespace).List(ctx, metav1.ListOptions{})
+	if len(pods.Items) != 0 || len(secrets.Items) != 0 {
+		t.Fatalf("left behind: %d pods, %d secrets", len(pods.Items), len(secrets.Items))
+	}
+	if _, ok := e.p.cachedToken(req.ID); ok {
+		t.Error("the token of the fenced launch is still cached")
+	}
+	req = launchRequest(e.p, personalKey, false, "alice", "tok-456")
+	req.Fence = func() bool { return true }
+	if _, err := e.p.Launch(ctx, req); err != nil {
+		t.Fatalf("launch with a fresh lease: %v", err)
+	}
+}
+
 func TestLaunchClaimErrors(t *testing.T) {
 	e := newTestEnv(t, testConfig(t, persistentYAML))
 	e.client.PrependReactor("create", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {

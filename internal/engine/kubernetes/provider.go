@@ -462,7 +462,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		p.forgetToken(req.ID)
 		return engine.Instance{}, fmt.Errorf("create token secret %s: %w", secret.Name, err)
 	}
-	created, err := p.client.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{FieldManager: eventComponent})
+	created, err := p.createPod(ctx, pod, req.Fence)
 	if err != nil {
 		p.forgetToken(req.ID)
 		// The caller's context may be what failed; clean up regardless.
@@ -492,6 +492,16 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		inst.CreatedAt = p.now()
 	}
 	return inst, nil
+}
+
+// createPod creates the engine pod. The fence of a launch (see
+// engine.LaunchRequest.Fence) is checked right before, as late as possible:
+// the lease may have gone stale during the calls of Launch before.
+func (p *Provider) createPod(ctx context.Context, pod *corev1.Pod, fence func() bool) (*corev1.Pod, error) {
+	if fence != nil && !fence() {
+		return nil, engine.ErrNotLeader
+	}
+	return p.client.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{FieldManager: eventComponent})
 }
 
 // attachSecret makes the pod the owner of its token secret, so that

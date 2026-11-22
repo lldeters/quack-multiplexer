@@ -46,13 +46,14 @@ type guardedProvider struct {
 	hold     bool
 	held     []string
 	vols     map[string]engine.Volume
-	block    chan struct{} // DeleteVolume waits for it if set
-	entered  chan struct{} // DeleteVolume signals here before it waits
-	gate     chan struct{} // Launch waits for it if set (a slow API server)
+	block    chan struct{}   // DeleteVolume waits for it if set
+	entered  chan struct{}   // DeleteVolume signals here before it waits
+	gate     chan struct{}   // Launch waits for it if set (a slow API server)
+	fenced   map[string]bool // launches that carried a fence
 }
 
 func newGuarded() *guardedProvider {
-	return &guardedProvider{Provider: fake.New(), vols: map[string]engine.Volume{}}
+	return &guardedProvider{Provider: fake.New(), vols: map[string]engine.Volume{}, fenced: map[string]bool{}}
 }
 
 func (g *guardedProvider) List(ctx context.Context) ([]engine.Instance, error) {
@@ -71,10 +72,16 @@ func (g *guardedProvider) Launch(ctx context.Context, req engine.LaunchRequest) 
 		}
 	}
 	g.order = append(g.order, "launch "+req.ID)
+	g.fenced[req.ID] = req.Fence != nil
 	gate := g.gate
 	g.mu.Unlock()
 	if gate != nil {
 		<-gate
+	}
+	// Like the Kubernetes provider: the fence right before the instance is
+	// created.
+	if req.Fence != nil && !req.Fence() {
+		return engine.Instance{}, engine.ErrNotLeader
 	}
 	return g.Provider.Launch(ctx, req)
 }
@@ -453,6 +460,50 @@ func TestPersistentLaunchNeedsFreshLease(t *testing.T) {
 	}
 	if g.Launches() != 0 {
 		t.Fatal("launched without a fresh lease")
+	}
+}
+
+// The fence travels with the launch of a persistent key: a lease that goes
+// stale while the launch waits for the API server stops it before the
+// instance is created. Launches for other profiles carry no fence.
+func TestPersistentLaunchFencedUntilCreate(t *testing.T) {
+	g := newGuarded()
+	gate := make(chan struct{})
+	g.gate = gate
+	var fresh atomic.Bool
+	fresh.Store(true)
+	m, _ := startPersistent(t, g, newTestClock(), fresh.Load, "")
+	done := make(chan error, 1)
+	go func() {
+		_, err := acquire(t, m, 10*time.Second)
+		done <- err
+	}()
+	waitUntil(t, "the launch", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return len(g.order) > 0
+	})
+	fresh.Store(false) // the process froze, another replica took over
+	close(gate)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), engine.ErrNotLeader.Error()) {
+		t.Fatalf("connect whose launch lost the lease: %v", err)
+	}
+	if g.Launches() != 0 {
+		t.Fatal("an instance was created with a stale lease")
+	}
+
+	fresh.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	l, err := m.Acquire(ctx, engine.Key{ShareLevel: engine.ShareUser, Owner: "alice", Subdomain: "default", Profile: "default"}, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Commit()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fenced[l.ID] {
+		t.Error("the launch of a profile without persistence carried a fence")
 	}
 }
 

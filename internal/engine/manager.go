@@ -779,6 +779,11 @@ func (m *Manager) launch(e *engine, prof config.Profile) {
 		Token:       e.Token,
 		SpecHash:    e.SpecHash,
 	}
+	if prof.Persistence != nil {
+		// Checked once more right before the instance is created: the lease
+		// may have gone stale since reserve checked it (persistence.go).
+		req.Fence = m.fence
+	}
 	m.log.Info("launching engine", "engine", e.ID, "key", e.Key.String(), "warm", e.Warm, "user", e.User)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), m.cfg.EngineStartupTimeout(e.ProfileName))
