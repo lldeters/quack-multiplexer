@@ -1,6 +1,8 @@
 // Package ha elects a leader among gateway replicas on a Kubernetes Lease
 // (coordination.k8s.io/v1). Only the leader serves Quack traffic and manages
-// engines; the other replicas stay unready until they acquire the lease.
+// engines. Every healthy replica is ready; the leader labels its pod
+// (LeaderLabel, see Labeler), and the Service selects that label, so that
+// Quack traffic reaches the leader alone.
 //
 // A leader that loses the lease steps down: the context handed to its
 // onStartedLeading callback is cancelled and Run returns ErrLeadershipLost.
@@ -93,7 +95,10 @@ type Elector struct {
 
 	running   atomic.Bool
 	campaigns atomic.Bool // set by the first Run
-	elector   atomic.Pointer[leaderelection.LeaderElector]
+	// campaigning is set while Run competes for the lease or leads (after
+	// the campaign delay).
+	campaigning atomic.Bool
+	elector     atomic.Pointer[leaderelection.LeaderElector]
 	// renew tracks the renewals of the current Run (see Fresh).
 	renew atomic.Pointer[renewTracker]
 
@@ -277,6 +282,26 @@ func (e *Elector) Fresh() bool {
 	return ok && since <= e.renewDeadline
 }
 
+// Campaigning reports whether Run competes for the lease or leads: the
+// campaign delay of a fresh process is over, and Run has not returned. A
+// follower reports ready only then, so that a ready follower can take over
+// at once (a rollout removes the old leader only once its replacements are
+// ready).
+func (e *Elector) Campaigning() bool { return e.campaigning.Load() }
+
+// Displaced returns the holder whose expired lease this replica took over at
+// the start of its current term, or "" if the lease was free (released by its
+// holder, or never held) or held by this replica itself. The pod of that
+// holder may still carry LeaderLabel (Labeler.RemoveStale).
+func (e *Elector) Displaced() string {
+	if t := e.renew.Load(); t != nil {
+		if p := t.displaced.Load(); p != nil {
+			return *p
+		}
+	}
+	return ""
+}
+
 // Leader returns the identity of the last observed lease holder ("" if none
 // was observed yet or the lease was released).
 func (e *Elector) Leader() string {
@@ -397,7 +422,11 @@ func (e *Elector) Run(ctx context.Context, onStartedLeading func(ctx context.Con
 	}
 	e.log.Info("campaigning for leadership", "leaseDuration", e.leaseDuration, "renewDeadline", e.renewDeadline,
 		"retryPeriod", e.retryPeriod)
+	if electCtx.Err() == nil {
+		e.campaigning.Store(true)
+	}
 	le.Run(klog.NewContext(electCtx, e.clientLog))
+	e.campaigning.Store(false)
 
 	mu.Lock()
 	closed = true
@@ -487,6 +516,9 @@ type renewTracker struct {
 	last atomic.Int64
 	// holder is the holder in the record read last ("" before any read).
 	holder atomic.Pointer[string]
+	// displaced is the holder of an expired lease that this candidate took
+	// over (see Elector.Displaced); nil if there was none.
+	displaced atomic.Pointer[string]
 }
 
 // errNotHolder refuses the release of a lease that another candidate holds.
@@ -524,9 +556,21 @@ func (t *renewTracker) Update(ctx context.Context, r resourcelock.LeaderElection
 			return errNotHolder
 		}
 	}
+	// Before client-go takes the lease over, it reads the record: its holder
+	// is the candidate this one displaces. A released lease names nobody.
+	// Renewals do not overwrite the value (the CompareAndSwap below): a
+	// renewal either read the record (holder: this candidate) or skipped
+	// the read (prev is the one of the takeover).
+	var prev string
+	if h := t.holder.Load(); h != nil {
+		prev = *h
+	}
 	start := time.Since(t.base)
 	err := t.Interface.Update(ctx, r)
 	t.observe(start, r, err)
+	if err == nil && r.HolderIdentity == t.Identity() && prev != "" && prev != t.Identity() {
+		t.displaced.CompareAndSwap(nil, &prev)
+	}
 	return err
 }
 

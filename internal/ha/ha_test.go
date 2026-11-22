@@ -979,3 +979,89 @@ func TestRunningCandidateWinsOverFreshOne(t *testing.T) {
 		}
 	}
 }
+
+// ---- campaigning and the displaced holder ---------------------------------
+
+func TestCampaigning(t *testing.T) {
+	e := newElector(t, fake.NewSimpleClientset(), "gw-a", shortTimings(), nil)
+	e.campaignDelay = 200 * time.Millisecond
+	c := start(t, e, true)
+	time.Sleep(50 * time.Millisecond)
+	if e.Campaigning() {
+		t.Fatal("campaigning during the campaign delay")
+	}
+	c.waitLeading(t)
+	if !e.Campaigning() {
+		t.Fatal("not campaigning while leading")
+	}
+	if err := c.stop(t); err != nil {
+		t.Fatal(err)
+	}
+	if e.Campaigning() {
+		t.Fatal("campaigning after Run returned")
+	}
+}
+
+// A follower that waits for the lease campaigns, too.
+func TestCampaigningWhileFollowing(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	a := newElector(t, client, "gw-a", shortTimings(), nil)
+	a.campaignDelay = 0
+	ca := start(t, a, true)
+	ca.waitLeading(t)
+	b := newElector(t, client, "gw-b", shortTimings(), nil)
+	b.campaignDelay = 0
+	start(t, b, true)
+	waitFor(t, "the follower to campaign", b.Campaigning)
+	if b.IsLeader() {
+		t.Fatal("two leaders")
+	}
+}
+
+func TestDisplaced(t *testing.T) {
+	lease := func(holder string, renewed time.Time) *coordinationv1.Lease {
+		d := int32(1)
+		rt := metav1.NewMicroTime(renewed)
+		return &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: testLease, Namespace: testNamespace},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &d, RenewTime: &rt, AcquireTime: &rt},
+		}
+	}
+	tests := []struct {
+		name  string
+		lease *coordinationv1.Lease
+		want  string
+	}{
+		{"no lease yet", nil, ""},
+		{"released lease", lease("", time.Now()), ""},
+		{"expired lease of another pod", lease("gw-old", time.Now().Add(-time.Hour)), "gw-old"},
+		{"own lease from an earlier container", lease("gw-a", time.Now()), ""},
+		{"own expired lease", lease("gw-a", time.Now().Add(-time.Hour)), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewSimpleClientset()
+			if tc.lease != nil {
+				client = fake.NewSimpleClientset(tc.lease)
+			}
+			e := newElector(t, client, "gw-a", shortTimings(), nil)
+			e.campaignDelay = 0
+			if got := e.Displaced(); got != "" {
+				t.Fatalf("Displaced() before Run = %q", got)
+			}
+			c := start(t, e, true)
+			c.waitLeading(t)
+			if got := e.Displaced(); got != tc.want {
+				t.Errorf("Displaced() = %q, want %q", got, tc.want)
+			}
+			// Renewals keep it.
+			time.Sleep(3 * e.retryPeriod)
+			if got := e.Displaced(); got != tc.want {
+				t.Errorf("after renewals: Displaced() = %q, want %q", got, tc.want)
+			}
+			if err := c.stop(t); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
