@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"quackmux/internal/ha"
 	"quackmux/internal/metrics"
 	"quackmux/internal/proxy"
 	"quackmux/internal/upstream"
@@ -38,7 +39,9 @@ func (l *lockedBuffer) String() string {
 // reach a follower (a port-forward to a pod, a Service without the leader
 // label). The follower answers each one with HTTP 200 and an ERROR_RESPONSE
 // without running it, also when it does not read a large body, counts it as
-// outcome not_leader and warns once.
+// outcome not_leader and warns once. A leader that steps down (its clients
+// still hold keep-alive connections to it) answers the same way, but that
+// is no misrouted Service: outcome not_ready, no warning.
 func TestFollowerAnswersEveryRequest(t *testing.T) {
 	h := newHarness(t, "", nil)
 	connID := h.connect("tok?user=alice", nil) // a valid session on the leader
@@ -48,9 +51,10 @@ func TestFollowerAnswersEveryRequest(t *testing.T) {
 		warnings        int
 	}{
 		{proxy.ReasonNotLeader, "not_leader", 1},
+		{ha.ReasonSteppingDown, "not_ready", 0},
 		{"starting up", "not_ready", 0},
 	} {
-		t.Run(tc.outcome, func(t *testing.T) {
+		t.Run(tc.reason, func(t *testing.T) {
 			met := metrics.New()
 			logs := &lockedBuffer{}
 			gw := proxy.New(proxy.Options{

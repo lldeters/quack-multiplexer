@@ -7,11 +7,13 @@ import (
 	"quackmux/internal/wire"
 )
 
-// ReasonNotLeader is the reason Options.Ready gives on a replica that does
-// not lead. Quack traffic should never reach such a replica: the Service of
-// the HA overlay selects the leader's pod by its label. Requests that do (a
-// Service without that selector, a port-forward to a follower) count with
-// outcome "not_leader".
+// ReasonNotLeader is the reason Options.Ready gives on a follower, a replica
+// that does not lead (and did not lead in its current term). Quack traffic
+// should never reach a follower: the Service of the HA overlay selects the
+// leader's pod by its label. Requests that do (a Service without that
+// selector, a port-forward to a follower) count with outcome "not_leader",
+// and a warning says so. Other reasons, such as a leader that is stepping
+// down, count as "not_ready".
 const ReasonNotLeader = "not the leader"
 
 // notLeaderWarnInterval rate-limits the warning about Quack requests that
