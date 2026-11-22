@@ -517,7 +517,7 @@ var errRetry = errors.New("engine left service while waiting")
 
 // reserve finds, claims or launches the engine for key and reserves it.
 func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config.Profile, deadline time.Time) (*engine, error) {
-	claimFailed := false
+	claimFailed, waitLogged := false, false
 	for {
 		m.mu.Lock()
 		if e := m.findLocked(key); e != nil {
@@ -529,7 +529,7 @@ func (m *Manager) reserve(ctx context.Context, key Key, user string, prof config
 			// Only one engine may use the data volume of the key (see
 			// persistence.go). awaitPredecessorLocked keeps m.mu only when
 			// the key may get a new engine now.
-			waited, err := m.awaitPredecessorLocked(ctx, key, deadline)
+			waited, err := m.awaitPredecessorLocked(ctx, key, deadline, &waitLogged)
 			if err != nil {
 				return nil, err
 			}

@@ -145,7 +145,8 @@ func (m *Manager) mountsVolumeLocked(e *engine) bool {
 //
 // The lease is checked first: a leader that resumes after a freeze must
 // neither stop an engine that the new leader serves by now nor wait for one.
-func (m *Manager) awaitPredecessorLocked(ctx context.Context, key Key, deadline time.Time) (bool, error) {
+// The first wait of a connect is logged (*logged).
+func (m *Manager) awaitPredecessorLocked(ctx context.Context, key Key, deadline time.Time, logged *bool) (bool, error) {
 	if err := m.persistentLaunchAllowedLocked(key); err != nil {
 		m.mu.Unlock()
 		return false, err
@@ -153,6 +154,11 @@ func (m *Manager) awaitPredecessorLocked(ctx context.Context, key Key, deadline 
 	h := m.holderLocked(key)
 	if h == nil {
 		return false, nil
+	}
+	if !*logged {
+		*logged = true
+		m.log.Info("a new session waits for the previous engine of its key to end (it holds the data volume)",
+			"key", key.String(), "engine", h.ID, "state", h.State, "deadline", deadline)
 	}
 	return true, m.waitHolder(ctx, h, deadline)
 }

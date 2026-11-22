@@ -191,6 +191,12 @@ func (g *guardedProvider) DeleteVolume(_ context.Context, name string, fence fun
 // empty).
 func startPersistent(t *testing.T, g *guardedProvider, clock *testClock, fence func() bool, yaml string) (*engine.Manager, *closerRecorder) {
 	t.Helper()
+	return startPersistentLogging(t, g, clock, fence, yaml, io.Discard)
+}
+
+// startPersistentLogging is startPersistent with the manager's log in w.
+func startPersistentLogging(t *testing.T, g *guardedProvider, clock *testClock, fence func() bool, yaml string, w io.Writer) (*engine.Manager, *closerRecorder) {
+	t.Helper()
 	if yaml == "" {
 		yaml = persistentConfig
 	}
@@ -198,7 +204,7 @@ func startPersistent(t *testing.T, g *guardedProvider, clock *testClock, fence f
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := engine.NewManager(cfg, g, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New())
+	m := engine.NewManager(cfg, g, slog.New(slog.NewTextHandler(w, nil)), metrics.New())
 	m.SetClock(clock.Now)
 	rec := &closerRecorder{}
 	m.SetSessionCloser(rec)
@@ -601,7 +607,8 @@ func TestPersistentHandoverTimeout(t *testing.T) {
 	g := newGuarded()
 	clock := newTestClock()
 	old := recoverOutdated(t, g, clock)
-	m, _ := startPersistent(t, g, clock, nil, strings.Replace(persistentConfig, "startupTimeout: 30s", "startupTimeout: 2s", 1))
+	var logs syncBuffer
+	m, _ := startPersistentLogging(t, g, clock, nil, strings.Replace(persistentConfig, "startupTimeout: 30s", "startupTimeout: 2s", 1), &logs)
 	g.mu.Lock()
 	g.hold = true // the old pod never goes away (a lost node)
 	g.mu.Unlock()
@@ -619,6 +626,28 @@ func TestPersistentHandoverTimeout(t *testing.T) {
 	if g.Launches() != 0 || len(g.heldIDs()) != 1 {
 		t.Fatalf("launches %d, held %v", g.Launches(), g.heldIDs())
 	}
+	// The wait is logged once per connect, not at every re-check.
+	if n := strings.Count(logs.String(), "a new session waits for the previous engine of its key"); n != 1 {
+		t.Errorf("the wait was logged %d times, want once:\n%s", n, logs.String())
+	}
+}
+
+// syncBuffer collects log output written from several goroutines.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 // Launches for persistent keys need a fresh leader lease.
