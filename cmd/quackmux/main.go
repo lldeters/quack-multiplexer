@@ -491,36 +491,17 @@ func cmdServe(args []string) error {
 	defer abort.Stop()
 	stopping.Store(true)
 	if elector != nil {
-		// Take the pod out of the Service at once (without waiting for the
-		// readiness probe) by removing the label, then hand the lease over
-		// and wait until it is released: another replica takes over within
-		// seconds, while this one finishes its in-flight requests, instead
-		// of after the drain or the expiry of the lease. The background work
-		// ends with the leadership (and is fenced by its freshness anyway).
-		// Idle keep-alive connections close now, so that their clients
-		// reconnect through the Service.
-		quackSrv.SetKeepAlivesEnabled(false)
-		lctx, lcancel := context.WithTimeout(context.Background(), labelCloseTimeout)
-		if err := labeler.Close(lctx); err != nil {
-			log.Warn("could not remove the leader label before handing over; the readiness probe takes the pod out of the Service instead", "err", err)
-		}
-		lcancel()
-		unlabelled := time.Now()
-		cancelRun()
-		select {
-		case <-electorDone:
-		case <-time.After(cfg.HA.RenewDeadline.Duration + time.Second):
-			log.Warn("leader election did not stop in time; the lease may expire instead of being released")
-		}
-		if started.Load() {
-			// This pod was an endpoint of the Service. Until kube-proxy has
-			// caught up, new connections still arrive: answer them (with an
-			// error) rather than let them hang in connect once the pod is gone.
-			select {
-			case <-time.After(time.Until(unlabelled.Add(cfg.HA.DeregistrationDelay.Duration))):
-			case <-shutdownCtx.Done():
-			}
-		}
+		// Take the pod out of the Service at once (by its label, without
+		// waiting for the readiness probe), hand the lease over and keep
+		// answering until kube-proxy has caught up (see handover). The
+		// background work ends with the leadership (and is fenced by its
+		// freshness anyway).
+		handover{
+			keepAlives: quackSrv.SetKeepAlivesEnabled,
+			unlabel:    labeler.Close, unlabelTimeout: labelCloseTimeout,
+			release: cancelRun, released: electorDone, releaseTimeout: cfg.HA.RenewDeadline.Duration + time.Second,
+			served: started.Load, delay: cfg.HA.DeregistrationDelay.Duration, log: log,
+		}.run(shutdownCtx)
 	}
 	_ = quackSrv.Shutdown(shutdownCtx)
 	if adminSrv != nil {
