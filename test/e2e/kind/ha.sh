@@ -28,8 +28,9 @@
 # default heartbeat timeout (60 s) and one with HEARTBEAT_TIMEOUT 5, whose
 # session lease (5 s + session.heartbeatGrace 15 s) is shorter than h3 keeps
 # the leader frozen. Afterwards the cluster runs the dev overlay again, so
-# that test.sh works as before. h3 freezes the gateway process on its kind
-# node (docker exec).
+# that test.sh works as before, and the ConfigMaps and Secrets that only the
+# generated overlay used are deleted. h3 freezes the gateway process on its
+# kind node (docker exec).
 #
 # Optional environment (see env.sh for more):
 #   HA_OVERLAY         the overlay under test, relative to the generated one
@@ -61,6 +62,10 @@ trap '' PIPE
 DEV_OVERLAY_DIR=$OVERLAY_DIR
 resolve_names
 resolve_images
+# The objects of the dev overlay ("KIND NAMESPACE NAME"); restore_dev never
+# deletes them. HA_OBJECTS: those of the generated overlay.
+DEV_OBJECTS=$(overlay_objects)
+HA_OBJECTS=''
 
 HA_WORK=$KIND_DIR/.work
 HA_DIR=$HA_WORK/ha-overlay
@@ -520,6 +525,45 @@ restore_dev() {
 		return 1
 	fi
 	ok "deployment/$DEPLOY runs the dev overlay again"
+	remove_generated
+}
+
+# has_hash_suffix NAME succeeds if NAME ends in the content hash kustomize
+# appends to generated ConfigMaps and Secrets ("-" and ten characters of its
+# alphabet).
+has_hash_suffix() { printf '%s\n' "$1" | grep -Eq -- '-[2456789bcdfghkmt]{10}$'; }
+
+# remove_generated deletes the ConfigMaps and Secrets that the generated
+# overlay created and the dev overlay does not use: the hash-suffixed ones of
+# the HA render (the HA configuration, the fresh secrets) that are neither
+# part of the dev render nor named by a Deployment or pod of their
+# namespace. Objects without a suffix (quackmux-users, which both overlays
+# write) and everything the dev overlay renders or references stay.
+remove_generated() {
+	local kind ns name res refs removed='' kept=''
+	while read -r kind ns name; do
+		case $kind in
+		ConfigMap) res=configmap ;;
+		Secret) res=secret ;;
+		*) continue ;;
+		esac
+		has_hash_suffix "$name" || continue
+		if printf '%s\n' "$DEV_OBJECTS" | grep -qxF -- "$kind $ns $name"; then continue; fi
+		[ "$ns" != - ] || ns=$NS
+		refs=$(kctl -n "$ns" get deployments,pods -o json) || return 1
+		case $refs in
+		*"\"$name\""*)
+			kept="$kept $res/$name"
+			continue
+			;;
+		esac
+		kctl -n "$ns" delete "$res" "$name" --ignore-not-found >/dev/null || return 1
+		removed="$removed $res/$name"
+	done <<GENERATED
+$HA_OBJECTS
+GENERATED
+	ok "deleted what only the generated overlay used:${removed:- nothing}"
+	if [ -n "$kept" ]; then warn "kept, still named by a Deployment or pod:$kept"; fi
 }
 
 # Cleanup ----------------------------------------------------------------------------
@@ -798,6 +842,7 @@ kctl -n "$NS" get deployment "$DEPLOY" >/dev/null 2>&1 || die "deployment/$DEPLO
 make_overlay
 OVERLAY_DIR=$HA_DIR OVERLAY_RENDERED=''
 render_overlay
+HA_OBJECTS=$(overlay_objects)
 case $OVERLAY_RENDERED in
 *"kind: PodDisruptionBudget"*) ;;
 *) die "$HA_OVERLAY does not look like overlays/ha (no PodDisruptionBudget)" ;;

@@ -174,7 +174,10 @@ wie ein Betreiber nach [deploy/kubernetes/README.md](../../deploy/kubernetes/REA
    `test/e2e/kind/.work/ha-overlay` (von Git ignoriert) und wird danach gelöscht.
 2. Es skaliert das laufende Gateway auf 0 und rollt das Overlay aus.
 3. Am Ende stellt es das Dev-Overlay wieder her, damit test.sh wie gewohnt läuft (auch der Selektor des Service
-   verliert dabei `quackmux.io/leader`, das prüft es).
+   verliert dabei `quackmux.io/leader`, das prüft es), und löscht die ConfigMaps und Secrets, die nur das erzeugte
+   Overlay verwendet hat: die mit Hash-Suffix aus dessen Render (HA-Konfiguration, frische Secrets), die das
+   Dev-Overlay nicht enthält und die kein Deployment und kein Pod im Namespace nennt. Objekte ohne Suffix wie
+   `quackmux-users` (beide Overlays schreiben sie) und alles, was das Dev-Overlay rendert oder nutzt, bleiben.
 
 Zwei Clients desselben Benutzers bleiben über alle Szenarien angehängt (`share_level=user`, eine gemeinsame
 Engine). Der erste nutzt den Default-Heartbeat-Timeout (60 s). Der zweite nutzt `HEARTBEAT_TIMEOUT 5`; seine
