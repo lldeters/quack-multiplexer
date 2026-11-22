@@ -14,6 +14,8 @@
 #                        (default /opt/duckdb/extensions; empty: DuckDB default)
 #   E2E_QUACK_PORT, E2E_ADMIN_PORT, E2E_IDLE_QUACK_PORT, E2E_IDLE_ADMIN_PORT
 #                        host ports on 127.0.0.1 (19494, 19495, 19594, 19595)
+#   E2E_PROJECT          Compose project name (default quackmux-e2e); with its
+#                        own name and ports a second run can go on in parallel
 set -euo pipefail
 
 COMPOSE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -34,10 +36,11 @@ export E2E_ENGINE_IMAGE=${E2E_ENGINE_IMAGE:-quackmux/duckdb-engine:2.0.0}
 export E2E_GATEWAY_IMAGE=${E2E_GATEWAY_IMAGE:-quackmux/quackmux:e2e}
 export E2E_QUACK_PORT=${E2E_QUACK_PORT:-19494} E2E_ADMIN_PORT=${E2E_ADMIN_PORT:-19495}
 export E2E_IDLE_QUACK_PORT=${E2E_IDLE_QUACK_PORT:-19594} E2E_IDLE_ADMIN_PORT=${E2E_IDLE_ADMIN_PORT:-19595}
+E2E_PROJECT=${E2E_PROJECT:-quackmux-e2e}
 
 GATEWAY_ADMIN=http://127.0.0.1:$E2E_ADMIN_PORT
 IDLE_ADMIN=http://127.0.0.1:$E2E_IDLE_ADMIN_PORT
-COMPOSE=(docker compose -p quackmux-e2e --env-file "$ENV_FILE" -f "$COMPOSE_DIR/docker-compose.yaml")
+COMPOSE=(docker compose -p "$E2E_PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE_DIR/docker-compose.yaml")
 # A fresh DuckDB CLI container for every client. Its stdin is the SQL script.
 CLIENT=("${COMPOSE[@]}" run --rm -T --no-deps client)
 
@@ -60,7 +63,7 @@ cleanup() {
 	fi
 	if [ -n "${E2E_KEEP:-}" ]; then
 		say "E2E_KEEP is set: the containers keep running. Remove them with"
-		say "  docker compose -p quackmux-e2e --env-file $ENV_FILE -f $COMPOSE_DIR/docker-compose.yaml down -v"
+		say "  docker compose -p $E2E_PROJECT --env-file $ENV_FILE -f $COMPOSE_DIR/docker-compose.yaml down -v"
 	else
 		"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || warn "docker compose down failed"
 	fi

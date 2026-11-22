@@ -87,6 +87,7 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | `E2E_EXTENSION_DIR` | `/opt/duckdb/extensions` | Extension-Verzeichnis im Engine-Image; leer: DuckDB-Default |
 | `E2E_QUACK_PORT`, `E2E_ADMIN_PORT` | 19494, 19495 | Host-Ports von `gateway` |
 | `E2E_IDLE_QUACK_PORT`, `E2E_IDLE_ADMIN_PORT` | 19594, 19595 | Host-Ports von `gateway-idle` |
+| `E2E_PROJECT` | `quackmux-e2e` | Compose-Projektname; mit eigenem Namen und eigenen Ports kann ein zweiter Lauf parallel laufen |
 | `NO_COLOR` | – | gesetzt: Ausgabe ohne Farben |
 
 ### Von Hand ausprobieren
