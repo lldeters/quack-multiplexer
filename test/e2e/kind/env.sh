@@ -125,6 +125,8 @@ pod_gone() {
 diagnostics() {
 	step "diagnostics (namespace $NS)"
 	kctl -n "$NS" get pods -o wide >&2 || true
+	say "data volume claims:"
+	kctl -n "$NS" get pvc -l app.kubernetes.io/component=engine-data >&2 || true
 	say "recent events:"
 	kctl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 25 >&2 || true
 	say "gateway log (last 150 lines):"
