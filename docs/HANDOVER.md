@@ -1,4 +1,4 @@
-# Übergabe: quackmux weiterbauen (Stand 2026-11-21)
+# Übergabe: quackmux weiterbauen (Stand 2026-11-22)
 
 Diese Datei ist der Übergabeprompt für eine neue Claude-Code-Session in der Cloud. Sie ist vollständig und
 braucht keinen weiteren Kontext.
@@ -146,9 +146,11 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    Downtime gestorben sind, werden nie adoptiert. Der Quack-Server räumt Verbindungen nicht selbst auf (Leases
    laufen nur beim nächsten Zugriff ab). Bis zum Ende der Engine bleiben sie offen; `engine.maxLifetime` begrenzt
    das.
-2. **Ein PVC im `podTemplate` teilen sich alle Engines eines Profils.** Eine DuckDB-Datei darauf kann nur eine
-   davon schreibend öffnen. Nur für read-only angehängte Daten oder ein Profil mit genau einer Engine geeignet
-   (`deploy/kubernetes/README.md`, „Persistente Daten“).
+2. **Persistente Daten pro Engine-Schlüssel** (`persistence` im Profil, ein PVC je Schlüssel, nie zwei Engines
+   eines Schlüssels gleichzeitig): Ein erzwungenes Löschen eines Pods, ein Node-Ausfall, ein eigener Scheduler
+   und mit HA ein Restfenster von Sekunden umgehen die Prüfungen des Gateways; dann schützen nur
+   `ReadWriteOncePod` und die Dateisperre von DuckDB. `kubectl delete -k` löscht mit dem Namespace alle Claims.
+   Alles in `deploy/kubernetes/README.md`, „Persistente Daten“.
 3. **HA: Nur der Leader ist ready.** `kubectl rollout status` meldet nie Erfolg. Ein Rollout braucht einen
    kontrollierten Failover. Die PDB verhindert den Drain des Leader-Nodes. Fällt der Leader aus, übernimmt der
    Follower erst nach Ablauf der Lease (gemessen etwa 20 s). Bei jeder Übergabe hat der Service ein bis drei
@@ -164,18 +166,16 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
 
 ## Nächste Schritte (priorisiert)
 
-1. **CI und Release:** GitHub Actions mit build, vet, gofmt, test, race und den Images, optional dem Compose-E2E.
-2. **HA-Test in CI:** `test/e2e/kind/ha.sh` braucht kind und `docker exec` auf den Node (für das Einfrieren
-   in h3) und läuft etwa zehn Minuten.
-3. **PVCs pro Engine-Schlüssel** (etwa pro Benutzer): ein Volume-Template je Profil, das Gateway legt PVCs pro
-   Schlüssel an. Eine Ersatz-Engine darf erst starten, wenn die alte die Datei freigegeben hat.
-4. **HA ohne „nur der Leader ist ready“:** Follower werden ready und leiten an den Leader weiter, oder ein
+Erledigt seit dem 2026-11-21: CI und Release mit GitHub Actions (`.github/workflows`, [docs/releasing.md](releasing.md)),
+der HA-Test nächtlich in CI und PVCs pro Engine-Schlüssel (`persistence`, kind-Szenarien k5–k8 und h6).
+
+1. **HA ohne „nur der Leader ist ready“:** Follower werden ready und leiten an den Leader weiter, oder ein
    Leader-Label steuert den Service. Dann funktionieren `rollout status` und die PDB normal.
-5. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
+2. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
    Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`.
-6. **Engine-Image:** ein Haken für SQL nach dem Serverstart (etwa `SET enable_external_access = false`) und eine
+3. **Engine-Image:** ein Haken für SQL nach dem Serverstart (etwa `SET enable_external_access = false`) und eine
    Vorlage für `quack_authorization_function` gegen `quack_stop` und Co.
-7. Optional:
+4. Optional:
    * Query-/Request-Timeout (CANCEL nach X)
    * Helm-Chart
    * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)

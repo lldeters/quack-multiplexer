@@ -566,8 +566,9 @@ verschwunden ist; dann sind seine Container beendet und seine Volumes ausgehäng
   Sonst bleibt ihr Pod wie bisher `engine.failedRetention` lang zur Analyse stehen.
 * Mit Leader-Election startet nur ein Gateway mit frischer Lease eine Engine für einen solchen Schlüssel, und nur
   dieses beendet dafür eine alte. Es prüft die Lease beim `ATTACH`, vor dem Anlegen des Pods und noch einmal in dem
-  Moment, in dem der Request die Kubernetes-API erreicht: Das clientseitige Rate-Limit (`provider.kubernetes.qps`
-  und `burst`) kann Requests bei vielen gleichzeitigen Starts sekundenlang zurückhalten. Die Leader-Election hat
+  Moment, in dem sein API-Client den Request abschickt, also nach dem clientseitigen Rate-Limit
+  (`provider.kubernetes.qps` und `burst`), das Requests bei vielen gleichzeitigen Starts sekundenlang zurückhalten
+  kann. Die Leader-Election hat
   einen eigenen API-Client mit eigenem Rate-Limit, damit solche Starts die Erneuerung der Lease nicht verzögern.
   Ein Leader, der nach einem Einfrieren aufwacht, lässt die Engines in Ruhe; ein `ATTACH`, das ihn bis zu seinem
   Neustart noch erreicht, scheitert (etwa mit `… this gateway does not hold a fresh leader lease`) und kann
@@ -675,6 +676,9 @@ alte Datei übernehmen, während keine Clients arbeiten:
 3. Einen Hilfs-Pod starten, der das alte PVC und den neuen Claim mountet (etwa unter `/alt` und `/neu`; Pod
    Security `restricted` verlangt einen gehärteten Security-Context), und kopieren:
    `cp /alt/<datei>.duckdb /neu/engine.duckdb`, eine `<datei>.duckdb.wal` daneben als `/neu/engine.duckdb.wal`.
+   Der Hilfs-Pod läuft dabei als Benutzer und Gruppe 1000 wie die Engine (`runAsUser: 1000`, `runAsGroup: 1000`);
+   sonst gehören die Kopien einem anderen Benutzer, und die Engine kann sie nicht schreiben (dann
+   `chown 1000:1000 /neu/engine.duckdb*`).
 4. Den Hilfs-Pod löschen, dann attachen. Solange er den Claim mountet, plant der Scheduler mit `ReadWriteOncePod`
    keine Engine des Schlüssels ein; mit `ReadWriteOnce` könnte eine starten, deshalb bis hierher keine Clients.
 

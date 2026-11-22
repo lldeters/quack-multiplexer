@@ -114,7 +114,7 @@ HTTP).
 ```bash
 bash test/e2e/kind/setup.sh      # Cluster "quackmux", Images bauen und laden, Overlay dev ausrollen
 bash test/e2e/kind/test.sh       # Szenarien k1–k8 (beliebig oft wiederholbar, etwa 6 min)
-bash test/e2e/kind/ha.sh         # Hochverfügbarkeit: Szenarien h1–h5 mit overlays/ha
+bash test/e2e/kind/ha.sh         # Hochverfügbarkeit: Szenarien h1–h6 mit overlays/ha
 bash test/e2e/kind/teardown.sh   # Cluster löschen
 ```
 
