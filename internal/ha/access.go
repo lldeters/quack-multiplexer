@@ -7,6 +7,7 @@ import (
 	"time"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -30,8 +31,10 @@ func (p permission) String() string {
 }
 
 // CheckAccess asks the API server (SelfSubjectAccessReview) whether this
-// replica may do what it needs to lead: get, create and update the lease,
-// and list and watch the engine pods in engineNamespace, from which a new
+// replica may do what it needs to lead: get and update the lease, create it
+// while it does not exist yet (RBAC cannot grant create for one name, so a
+// Role may leave it out for a lease created beforehand), and list and watch
+// the engine pods in engineNamespace, from which a new
 // leader syncs its engine registry before it serves ("" skips them). Every
 // replica campaigns, and one that may not do all of that would take the
 // lease over and never serve, or never take it over. CheckAccess then
@@ -44,9 +47,11 @@ func (e *Elector) CheckAccess(ctx context.Context, engineNamespace string) error
 	const coordination = "coordination.k8s.io"
 	need := []permission{
 		{verb: "get", group: coordination, resource: leases, namespace: e.namespace, name: e.name},
-		// RBAC cannot restrict create to a name: the request has none yet.
-		{verb: "create", group: coordination, resource: leases, namespace: e.namespace},
 		{verb: "update", group: coordination, resource: leases, namespace: e.namespace, name: e.name},
+	}
+	if !e.leaseExists(ctx) {
+		// RBAC cannot restrict create to a name: the request has none yet.
+		need = append(need, permission{verb: "create", group: coordination, resource: leases, namespace: e.namespace})
 	}
 	if ns := strings.TrimSpace(engineNamespace); ns != "" {
 		need = append(need,
@@ -75,6 +80,16 @@ func (e *Elector) CheckAccess(ctx context.Context, engineNamespace string) error
 	return fmt.Errorf("ha: this replica could never lead: the gateway may not %s. The namespace of the lease "+
 		"(ha.namespace, else the engine namespace) and the engine namespace (provider.kubernetes.namespace, else the "+
 		"gateway's) each need the Role and RoleBinding of deploy/kubernetes/base/rbac.yaml", strings.Join(denied, ", "))
+}
+
+// leaseExists reports whether the lease can be read and exists. Any error
+// other than NotFound counts as "exists": a denied get shows up in the
+// access review of get anyway, and create is then not what is missing.
+func (e *Elector) leaseExists(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, accessCheckTimeout)
+	defer cancel()
+	_, err := e.client.CoordinationV1().Leases(e.namespace).Get(ctx, e.name, metav1.GetOptions{})
+	return !apierrors.IsNotFound(err)
 }
 
 // allowed asks the API server whether the gateway may make the request p.

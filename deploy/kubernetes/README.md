@@ -417,12 +417,14 @@ kubectl -n quackmux rollout status deployment/quackmux
   Solange er die Lease verlängert, kann kein anderer übernehmen. Bis dahin nennt `/readyz` den Grund.
 * **Voraussetzungen:** Das Gateway läuft als Pod und kennt dessen Namen und Namespace aus der Downward-API
   (`POD_NAME`, `POD_NAMESPACE`, wie in `base/deployment.yaml`), und seine Role erlaubt `patch` auf Pods im eigenen
-  Namespace (`base/rbac.yaml`). Beim Start fragt es die API außerdem, ob es die Lease lesen, anlegen und ändern
-  (`get`, `create`, `update` im Namespace der Lease: `ha.namespace`, sonst der Engine-Namespace) und die
-  Engine-Pods auflisten und beobachten darf (`list`, `watch` im Engine-Namespace). Ohne das könnte es nie
-  bedienen. Fehlt etwas davon, startet das Gateway mit `ha.enabled` nicht und nennt den Grund; ein Rollout mit
-  solchen Pods bleibt stehen, die alten bedienen weiter. Leader-Election außerhalb des Clusters (per Kubeconfig)
-  ist nicht möglich.
+  Namespace (`base/rbac.yaml`). Beim Start fragt es die API außerdem, ob es die Lease lesen und ändern (`get`,
+  `update` im Namespace der Lease: `ha.namespace`, sonst der Engine-Namespace), sie anlegen, solange es sie noch
+  nicht gibt (`create`; eine Role ohne `create` passt also zu einer vorher angelegten Lease), und die Engine-Pods
+  auflisten und beobachten darf (`list`, `watch` im Engine-Namespace). Ohne das könnte es nie bedienen. Verneint
+  die API etwas davon, startet das Gateway mit `ha.enabled` nicht und nennt den Grund; ein Rollout mit solchen
+  Pods bleibt stehen, die alten bedienen weiter. Kann die API die Frage nicht beantworten, startet es mit einer
+  Warnung im Log; ein Follower wird dann trotzdem erst ready, wenn er die Lease lesen konnte. Leader-Election
+  außerhalb des Clusters (per Kubeconfig) ist nicht möglich.
 * Leader anzeigen: `kubectl -n quackmux get pods -L quackmux.io/leader` oder
   `kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}'` (Metriken
   `quackmux_is_leader`, `quackmux_leader_label`).
@@ -441,7 +443,8 @@ kubectl -n quackmux rollout status deployment/quackmux
   wartet der Follower auf seinen nächsten Versuch (alle `ha.retryPeriod` plus Jitter, bis 4,4 s). Ein frisch
   gestarteter Pod bewirbt sich erst nach `3 × ha.retryPeriod`. Bis kube-proxy seine Regeln erneuert hat
   (höchstens einmal pro Sekunde), schickt er neue Verbindungen noch zum alten Pod. Der alte Leader beantwortet sie
-  deshalb noch `ha.deregistrationDelay` (Default 3 s, höchstens die Hälfte von `server.shutdownTimeout`) nach dem
+  deshalb noch `ha.deregistrationDelay` (Default 3 s, bei kurzem `server.shutdownTimeout` dessen Hälfte; ein
+  gesetzter Wert muss kürzer sein als `server.shutdownTimeout`) nach dem
   Entfernen des Labels mit einem Fehler; ein beendeter Pod ließe sie bis zu zwei Minuten im Verbindungsaufbau
   hängen. Queries, die beim Herunterfahren noch laufen, bekommen kurz vor `server.shutdownTimeout` einen Fehler und
   werden auf der Engine abgebrochen, damit libcurl sie nicht unbemerkt ein zweites Mal sendet.

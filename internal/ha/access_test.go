@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -66,8 +68,8 @@ func TestCheckAccess(t *testing.T) {
 		}
 		want := []string{
 			"get coordination.k8s.io/leases " + testNamespace + "/" + testLease,
-			"create coordination.k8s.io/leases " + testNamespace + "/", // a create has no name yet
 			"update coordination.k8s.io/leases " + testNamespace + "/" + testLease,
+			"create coordination.k8s.io/leases " + testNamespace + "/", // a create has no name yet
 			"list /pods engines/",
 			"watch /pods engines/",
 		}
@@ -92,6 +94,33 @@ func TestCheckAccess(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "list pods") || strings.Contains(err.Error(), "watch pods") {
 			t.Errorf("the error names allowed requests: %v", err)
+		}
+	})
+	t.Run("an existing lease needs no create", func(t *testing.T) {
+		// A Role may grant get and update for the lease's name only and leave
+		// out create, which RBAC cannot restrict to a name, once the lease
+		// exists.
+		client := fake.NewSimpleClientset(&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testLease},
+		})
+		r := newReviewer(client, allowExcept("create leases "+testNamespace))
+		e := newElector(t, client, testPod, shortTimings(), nil)
+		if err := e.CheckAccess(context.Background(), "engines"); err != nil {
+			t.Fatalf("a replica refuses to start without create on an existing lease: %v", err)
+		}
+		for _, a := range r.asked {
+			if a.Verb == "create" {
+				t.Errorf("asked for create on the existing lease: %+v", a)
+			}
+		}
+	})
+	t.Run("a missing lease needs create", func(t *testing.T) {
+		client := fake.NewSimpleClientset()
+		newReviewer(client, allowExcept("create leases "+testNamespace))
+		e := newElector(t, client, testPod, shortTimings(), nil)
+		err := e.CheckAccess(context.Background(), "engines")
+		if err == nil || !strings.Contains(err.Error(), "create leases.coordination.k8s.io in namespace "+testNamespace) {
+			t.Fatalf("CheckAccess = %v, want an error about create", err)
 		}
 	})
 	t.Run("engine pods may not be watched", func(t *testing.T) {

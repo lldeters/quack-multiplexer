@@ -247,9 +247,10 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
     (`node-monitor-grace-period` des Node-Controllers).
   * Das Gateway muss dafür als Pod laufen und dessen Namen und Namespace kennen (`POD_NAME`, `POD_NAMESPACE` aus
     der Downward-API); sonst, oder wenn es seinen Pod nicht patchen darf, startet es mit `ha.enabled` nicht.
-    Ebenso wenig, wenn die API (per SelfSubjectAccessReview) verneint, dass es die Lease lesen, anlegen und
-    ändern und die Engine-Pods auflisten und beobachten darf: Ohne das könnte es nie bedienen. Ein Rollout mit
-    fehlenden Rechten oder falschem Namespace bleibt so stehen, statt die alten Pods zu ersetzen.
+    Ebenso wenig, wenn die API (per SelfSubjectAccessReview) verneint, dass es die Lease lesen und ändern, sie
+    anlegen (nur solange es sie nicht gibt) und die Engine-Pods auflisten und beobachten darf: Ohne das könnte es
+    nie bedienen. Ein Rollout mit fehlenden Rechten oder falschem Namespace bleibt so stehen, statt die alten
+    Pods zu ersetzen. Kann die API nicht antworten, startet es mit einer Warnung.
   * Verliert der Leader die Lease, beendet sich der Prozess und startet als Follower neu. Der neue Leader
     übernimmt per Discovery und Adoption. Die Sessions überleben.
 * **Veralteter Leader:** Friert der Leader ein (gestoppter Container oder VM, hängender Node), verlängert er die
@@ -274,8 +275,8 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   erst nach `3 × ha.retryPeriod` und ist erst dann ready. So übernimmt ein Follower, der schon wartet; ein
   Rollout entfernt den alten Leader erst, wenn seine Ersatz-Pods bereit sind. Bis kube-proxy die Regeln erneuert
   hat (`minSyncPeriod` 1 s), leitet er neue Verbindungen noch zum alten Pod. Der hält seinen Listener deshalb
-  noch `ha.deregistrationDelay` (3 s, höchstens die Hälfte von `server.shutdownTimeout`) nach dem Entfernen des
-  Labels offen und beantwortet sie mit einem Fehler; ein beendeter Pod ließe sie bis zum Timeout des
+  noch `ha.deregistrationDelay` (Default 3 s, bei kurzem `server.shutdownTimeout` dessen Hälfte) nach dem
+  Entfernen des Labels offen und beantwortet sie mit einem Fehler; ein beendeter Pod ließe sie bis zum Timeout des
   Verbindungsaufbaus hängen (in kind gemessen; ein hängender Heartbeat blockiert das `DETACH` des Clients).
   `test/e2e/kind/ha.sh` prüft die Verzögerung am Log des alten Leaders (h2, h4).
 * **Laufende Requests beim Shutdown:** Das Gateway wartet bis zu `server.shutdownTimeout` auf laufende Requests.
