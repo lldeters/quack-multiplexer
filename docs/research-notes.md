@@ -41,8 +41,11 @@ Everything quackmux relies on is listed here. File paths refer to
 - **Leases expire lazily**, only when a request with that id arrives (`RenewConnectionLease`). There is no
   sweeper, so abandoned connections live until the process dies. quackmux sends DISCONNECT itself.
 - `quack_authentication_function(connection_id, auth_string, server_token)` and
-  `quack_authorization_function(connection_id, query)` can be SQL macros. An authorization function that
-  returns VARCHAR rewrites the SQL.
+  `quack_authorization_function(connection_id, query)` can be SQL macros. The server runs
+  `SELECT <setting>(?, ?)` (the setting's value is pasted into the SQL) on a fresh connection for every PREPARE,
+  catalog queries included, with the query text as the client sent it. An error, NULL or false rejects the query
+  ("Authorization failed", or "Authorization callback failed: <error>"); a VARCHAR result replaces the SQL (the
+  default `quack_nop_authorization` returns the query itself). `src/quack_server.cpp`.
 - cpp-httplib server limits:
   - 5 s socket read and write timeouts, so a stalled peer gets dropped;
   - bodies up to 100 MiB;
@@ -69,7 +72,8 @@ Everything quackmux relies on is listed here. File paths refer to
   `extension_directory` and disable autoinstall at runtime. The release assets are
   `duckdb-cli-linux-{amd64,arm64}.tar.gz`.
 - **quackmux's engine image** (`images/engine`) keeps a FIFO open on fd 3 and feeds statements through it. That
-  covers the init SQL, `quack_serve` (with `.output /dev/null` around it) and, on SIGTERM, `quack_stop`,
+  covers the init SQL, `quack_serve` (with `.output /dev/null` around it), the post-start SQL and, on SIGTERM,
+  `quack_stop`,
   `CHECKPOINT` and `.quit`.
 
 ## Kyuubi semantics mirrored
@@ -124,10 +128,31 @@ docker compose and kind (Kubernetes v1.37). Recordings of the traffic are fixtur
   mirror (`custom_extension_repository`) load with a plain `LOAD`, because they are core-signed.
 - **Hardening of shared engines.**
   - `SET lock_configuration = true` as the last init statement works: clients attach and query, only their own
-    `SET`s fail ("the configuration has been locked").
+    `SET`s fail ("the configuration has been locked"). It blocks every `SET` and `RESET` except `schema` and
+    `search_path` (and settings in `allowed_configs`), and `enable_logging()` and `enable_profiling()`
+    (`DBConfig::CheckLock`). `SET VARIABLE` still works.
   - `SET enable_external_access = false` before `quack_serve` breaks the start: `getenv` is then disabled, and
     `quack_serve` itself needs file access (`$HOME/.duckdb/stored_secrets`). Set after `quack_serve`, it blocks
     `getenv` and file access for every session while the server keeps working (queries, uploads, fetches).
   - `quack_stop(…)` stays callable by any session, with or without a locked configuration.
+  - Once `enable_external_access` is false it cannot be set to true again. `allowed_paths` and
+    `allowed_directories` (prefixes, URLs included) set before it keep working; `INSTALL`, `LOAD` of a file,
+    `COPY … TO`, `EXPORT`/`IMPORT DATABASE` and `ATTACH` of a file fail. `quack_stop` and `FORCE CHECKPOINT` on
+    the engine's own connection still work.
+  - The CLI hands its own state to every connection: `FROM _` (a replacement scan of the CLI) returns the last
+    result of the CLI's connection, which after the start was the row of `quack_serve` with the token, and
+    `shell_history()` returns the lines it read from stdin (not the contents of `.read` files). With file access,
+    a session can write into the CLI's stdin through `/proc/self/fd/0` (`COPY … TO`); the CLI runs that on its
+    own connection, dot commands such as `.shell` included. The entrypoint selects only `listen_uri` from
+    `quack_serve`, ends with a harmless SELECT and makes the FIFO read-only (mode 0400) once fd 3 is open.
+  - A macro in `main` takes precedence over a built-in function of the same name for all connections, also over
+    operators that are functions (`CREATE MACRO "||"(a, b)` changes `||`); `system.main.<name>` is not affected,
+    but a schema named `system` makes it ambiguous. `CREATE TYPE` cannot shadow built-in types.
+  - DuckDB 2.0 parses with a PEG tokenizer: identifiers have no escape sequences (no `U&"…"`), may be quoted with
+    `"` or backticks, and Unicode spaces outside quotes become spaces (`Parser::NormalizeSQLString`). Function
+    names and keywords match case-insensitively for ASCII letters only (a Kelvin sign for `k` does not resolve).
+  - The authorization macro of the image (`images/engine/authorize.sql`) costs about 1 to 2 ms per query: the
+    server binds it, and compiles its regular expression, for every PREPARE (2.1 ms without, 3.7 to 4.1 ms with
+    it for a trivial query through `r.query`).
 - **Kubernetes.** From Kubernetes 1.35 on the kubelet refuses hosts with cgroup v1 (`failCgroupV1: true`); kind needs
   a KubeletConfiguration patch there (`test/e2e/README.md`).

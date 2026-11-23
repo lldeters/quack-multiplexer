@@ -104,7 +104,7 @@ Releases veröffentlichen Binaries und Images für amd64 und arm64 (`ghcr.io/lld
 | [internal/auth](internal/auth) | Authentifizierung `static` (Token-Hashes), `jwt` (Keys/JWKS), `none` |
 | [internal/policy](internal/policy) | Optionen, Defaults, Overrides, Rechte |
 | [internal/admin](internal/admin), [internal/ha](internal/ha) | Admin-API, Metriken, Leader-Election |
-| [images/engine](images/engine) | Engine-Image (DuckDB 2.0 + quack/httpfs, tini, FIFO-Entrypoint) |
+| [images/engine](images/engine) | Engine-Image (DuckDB 2.0 + quack/httpfs, tini, FIFO-Entrypoint, Autorisierungs-Makro für geteilte Engines) |
 | [deploy/kubernetes](deploy/kubernetes) | Manifeste (RBAC, NetworkPolicy, Overlays `dev`/`ha`) |
 | [examples](examples) | Beispielkonfigurationen und Client-SQL |
 | [test/e2e](test/e2e) | End-to-End-Tests mit echtem DuckDB (Docker Compose, kind) |

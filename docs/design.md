@@ -45,7 +45,7 @@ Details und Byte-Layouts: [protocol.md](protocol.md).
 | **Session** | Eine Quack-Verbindung eines Clients (ein `ATTACH` bzw. ein `quack_query`-Aufruf). Entspricht einer Kyuubi-Session. |
 | **Engine** | Ein DuckDB-Prozess mit Quack-Server, in Kubernetes ein Pod. Entspricht einer Kyuubi-Engine. |
 | **Engine-Key** | `(ShareLevel, Owner, Subdomain, Profil, PoolIndex)`. Sessions mit gleichem Key teilen sich eine Engine. |
-| **Profil** | Engine-Typ: Image, Ressourcen, Init-SQL, DuckDB-Settings, Pod-Template, Pool-Größe, Rechte. |
+| **Profil** | Engine-Typ: Image, Ressourcen, Init- und Post-Start-SQL, DuckDB-Settings, Pod-Template, Pool-Größe, Rechte. |
 | **Backend-Connection-ID** | Die von der Engine vergebene `connection_id`. |
 | **Gateway-Connection-ID** | Die ID, die der Client sieht: eine versiegelte Route (siehe 4.2). |
 
@@ -290,17 +290,21 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 ## 7. Engines in Kubernetes
 
 * Pod `quack-<level>-<owner>-<rand>` mit Container `engine` (Image und Pull-Policy aus dem Profil, sonst aus dem
-  `podTemplate`, sonst `ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0` mit `IfNotPresent`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus und
-  startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP. Das Token kommt aus der Umgebungsvariable
-  `QUACK_TOKEN`.
-* Token: 32 Zufallsbytes pro Engine, in einem Secret `<pod>-token`. Das Secret wird zuerst angelegt und danach
-  per OwnerReference an den Pod gehängt, damit Kubernetes es per Garbage Collection mitlöscht. Verwaiste Secrets
-  räumt der Reconciler ab.
+  `podTemplate`, sonst `ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0` mit `IfNotPresent`, siehe `images/engine`). Der Entrypoint führt Settings und Init-SQL aus,
+  startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP und führt dann das Post-Start-SQL aus. Das Token kommt
+  aus der Umgebungsvariable `QUACK_TOKEN`.
+* Token: 32 Zufallsbytes pro Engine, in einem Secret `<pod>-token`, zusammen mit Init- und Post-Start-SQL
+  (Schlüssel `init.sql` und `post-start.sql`; ihre Hashes stehen als Annotationen am Pod und gehen in den
+  Spec-Hash ein). Das Secret wird zuerst angelegt und danach per OwnerReference an den Pod gehängt, damit
+  Kubernetes es per Garbage Collection mitlöscht. Verwaiste Secrets räumt der Reconciler ab.
 * Readiness-Probe: `GET /` auf 9494. Der Quack-Server liefert dort sein Banner.
 * Härtung:
   * Pod: `automountServiceAccountToken: false`, `runAsNonRoot`, `seccompProfile: RuntimeDefault`.
   * Container: alle Capabilities gedroppt, read-only Root-FS mit `emptyDir` für `/tmp`.
   * Netz: eine NetworkPolicy erlaubt Ingress auf 9494 nur vom Gateway.
+  * SQL geteilter Engines (pro Profil, optional): das Autorisierungs-Makro des Images im `initSQL`,
+    `enable_external_access = false` und `lock_configuration = true` im `postStartSQL`
+    ([deploy/kubernetes/README.md](../deploy/kubernetes/README.md), „Gehärtete geteilte Engines“).
 * Profile formen den Pod: Ressourcen, Env, NodeSelector, Tolerations, Affinity, ServiceAccount, PullSecrets,
   Labels und Annotationen. Optional dient ein komplettes `podTemplate` als Basis, das Gateway ergänzt seine
   Pflichtfelder. Ein PVC im Template mounten **alle** Engines des Profils (jeder Benutzer, jede Subdomain, Pool-
@@ -419,6 +423,9 @@ Weitere Provider:
 * Optionen per Header funktionieren nicht mit `ssl_fingerprint`-Pinning. Dieser Client-Pfad sendet keine
   Extra-Header. Dort Token-Optionen nutzen.
 * Das Gateway prüft kein SQL. Autorisierung innerhalb geteilter Engines bleibt Sache der Engine (Init-SQL,
-  Rechte der angehängten Daten) oder der Wahl des Share-Levels.
+  Rechte der angehängten Daten) oder der Wahl des Share-Levels. Das Engine-Image bringt dafür ein Makro für
+  `quack_authorization_function` mit, eine Sperrliste über den SQL-Text. Schickt das Gateway künftig selbst
+  Anfragen an Engines (etwa `quack_active_connections()` zum Aufräumen), muss das Makro sie durchlassen; heute
+  sendet es nur Handshake, Heartbeats, `DISCONNECT` und `CANCEL`.
 * Der Client verlangt eine exakte Protokollversion (3). Neue Quack-Versionen erfordern ein Gateway-Update. Das
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.

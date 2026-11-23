@@ -807,27 +807,16 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   angehängten Datenbanken und in der Engine angelegten Secrets. `SET GLOBAL` wirkt für alle, Dateien unter
   `/tmp` und die Zugangsdaten der Engine (etwa aus `env`) stehen allen offen. Eine teure Query bremst alle,
   Speicherdruck trifft alle.
-* **Server-Funktionen:** Jede Session kann mit `quack_stop(…)` den Quack-Server einer Engine für alle anhalten
-  oder mit `quack_serve(…)` weitere Server öffnen, und mit `getenv('QUACK_TOKEN')` das Engine-Token lesen. Die
+* **Server-Funktionen:** Ohne Härtung kann jede Session mit `quack_stop(…)` den Quack-Server einer Engine für alle
+  anhalten, mit `quack_serve(…)` weitere Server öffnen und mit `getenv('QUACK_TOKEN')` das Engine-Token lesen. Die
   NetworkPolicy lässt nur das Gateway an Port 9494 der Engines; ein ausgelesenes Token oder ein zusätzlicher
   Server nützt deshalb von außen nichts. Gegen `quack_stop` hilft sie nicht.
-* **Init-SQL:** Es steht im Secret der Engine (`<pod>-token`, Schlüssel `init.sql`), nicht in der Pod-Spec; wer
-  nur Pods lesen darf, sieht es nicht. In der Engine selbst kann es aber jede Session aus der Umgebung lesen
+* **Init- und Post-Start-SQL:** Beide stehen im Secret der Engine (`<pod>-token`, Schlüssel `init.sql` und
+  `post-start.sql`), nicht in der Pod-Spec; wer nur Pods lesen darf, sieht sie nicht. Mit Dateizugriff, dem
+  DuckDB-Default, kann sie aber jede Session in der Engine aus der Umgebung lesen
   (`read_text('/proc/1/environ')`). Schlüssel im `initSQL` sind also für alle Benutzer der Engine sichtbar;
   besser `PROVIDER credential_chain` mit Workload Identity.
-* **Gegenmittel im `initSQL`** des Profils (läuft nach den `settings`, bevor der Server startet):
-  * `quack_authorization_function`: Die Quack-Extension kann vor der Ausführung von Anfragen eine eigene
-    SQL-Funktion zur Autorisierung aufrufen. Damit lassen sich etwa `quack_stop`, `quack_serve` oder
-    Dateizugriffe sperren (Signatur: Dokumentation der Quack-Extension).
-  * `SET lock_configuration = true` als letzte Anweisung verhindert weitere `SET`s der Sessions, etwa
-    `SET GLOBAL threads` oder ein Zurückdrehen von Einstellungen. Clients können sich weiter verbinden und
-    abfragen (mit DuckDB 2.0.0 geprüft).
-  * `SET enable_external_access = false` gehört **nicht** ins `initSQL`: Die Engine startet dann nicht, weil
-    der Entrypoint das Token danach per `getenv()` liest und `quack_serve` selbst Dateizugriff braucht. Nach dem
-    Serverstart gesetzt, würde es Datei- und Netzwerkzugriffe und `getenv()` für alle Sessions sperren, ohne den
-    Quack-Server zu stören. Dafür bietet das Engine-Image derzeit keinen Haken.
-  * `quack_stop(…)` bleibt für jede Session aufrufbar, auch mit gesperrter Konfiguration. Dagegen hilft nur die
-    `quack_authorization_function`.
+* **Gegenmittel:** ein gehärtetes Profil, siehe [unten](#gehärtete-geteilte-engines).
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
 * **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
@@ -840,6 +829,97 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   (`profiles.<name>.podTemplate.spec.runtimeClassName`, z. B. gVisor).
 * **Namespace:** Pod Security `restricted` ist aktiv. Das Gateway darf alle Secrets des Namespace lesen;
   lassen Sie dort nichts anderes laufen.
+
+### Gehärtete geteilte Engines
+
+Für `GROUP`- und `SERVER`-Engines, deren Benutzer einander nicht in allem vertrauen:
+
+```yaml
+profiles:
+  shared:
+    allowedShareLevels: [GROUP, SERVER]
+    initSQL: |
+      .read /usr/local/share/quackmux/authorize.sql
+    postStartSQL: |
+      SET enable_external_access = false;
+      SET lock_configuration = true;
+```
+
+Die Teile brauchen einander:
+
+1. **`postStartSQL`** läuft direkt nach `quack_serve` auf der Verbindung des Init-SQL. Es kommt wie das Init-SQL
+   über das Secret der Engine (`QUACKMUX_POST_START_SQL`, Schlüssel `post-start.sql`). Eine Änderung ändert den
+   Spec-Hash: Neue Sessions bekommen neue Engines, die alten laufen aus. Die beiden Einstellungen gehören hierher,
+   weil sie vor `quack_serve` den Start verhindern: Das Token kommt per `getenv()`, und `quack_serve` braucht
+   Dateizugriff. Der erste Fehler beendet die Engine.
+2. **`SET enable_external_access = false`** sperrt für alle Sessions Dateien und Netz (`read_text`, `read_csv` und
+   Co. auf Pfade und URLs, `COPY … TO`, `EXPORT` und `IMPORT DATABASE`, `ATTACH` von Dateien, `INSTALL`, `LOAD` aus
+   Dateien) und `getenv()`. Token und Init-SQL in `/proc` sind dann nicht mehr lesbar. Es lässt sich nicht wieder
+   einschalten. Was Sessions trotzdem lesen dürfen, erlauben `allowed_paths` (Dateien) und `allowed_directories`
+   (Präfixe von Pfaden und URLs) im `postStartSQL` davor, etwa
+   `SET allowed_directories = ['/data/import/', 'https://data.example.com/lake/'];` (geprüft mit lokalen Pfaden
+   und `http://`). Angehängte Daten über httpfs, S3 oder DuckLake brauchen einen solchen Eintrag.
+3. **`SET lock_configuration = true`** sperrt `SET` und `RESET` (außer `schema` und `search_path`) und
+   `enable_logging()`. So dreht niemand `quack_authorization_function` oder die Server-Settings zurück. Clients,
+   die beim Verbinden selbst `SET`s schicken, scheitern daran; DuckDB-Clients über Quack tun das nicht.
+4. **Das Makro `quackmux_authorize`** aus dem Engine-Image
+   ([images/engine/authorize.sql](../../images/engine/authorize.sql)) wird `quack_authorization_function`. Der
+   Quack-Server ruft es vor jeder Anfrage eines Clients mit ihrem SQL-Text auf, auch vor den Katalog-Abfragen von
+   `ATTACH`. Es lehnt Anfragen ab, die eines dieser Wörter enthalten:
+   * `quack_*` (Server-Steuerung: `quack_stop`, `quack_serve`, `quack_active_connections`, `quack_identify`, die
+     `quack_*`-Settings …) und `quackmux_*` (das Makro selbst);
+   * `getenv` und `shell_history` (was die CLI der Engine von stdin gelesen hat);
+   * `query` vor `(`, `json_execute_serialized_sql` und `json_serialize_plan`: SQL, das erst zur Laufzeit aus
+     Strings entsteht, umginge jede Textprüfung;
+   * `checkpoint` (`FORCE CHECKPOINT` bricht die Transaktionen aller Sessions ab), `attach` und `detach`;
+   * `create` oder `drop` mit später `secret`, `macro` oder `function`: Secrets und Makros gelten für alle
+     Sessions, und ein Makro verdeckt sogar eingebaute Funktionen und Operatoren gleichen Namens;
+   * `schema` mit später `system`.
+
+   Bis das `postStartSQL` beide Einstellungen gesetzt hat, lehnt es jede Anfrage ab: Vorher ist die Engine nicht
+   gehärtet, und mit Dateizugriff ließe sich eine Textprüfung umgehen. Abgelehnte Anfragen scheitern beim Client
+   mit `Authorization callback failed: … quackmux_authorize: not allowed on this engine: "quack_stop"` bzw.
+   `… the engine is not hardened yet …; try again`.
+
+Mit dem `process`-Provider gilt dasselbe Profil, nur mit dem absoluten Pfad von `images/engine/authorize.sql` im
+`.read`. Für Engines des `static`-Providers setzen Sie `QUACKMUX_INIT_SQL` und `QUACKMUX_POST_START_SQL` am
+Engine-Image selbst ([images/engine/README.md](../../images/engine/README.md), „Sicherheit“); `initSQL` und
+`postStartSQL` eines Profils wirken dort nicht, `quackmux validate` warnt.
+
+**Was das garantiert** (geprüft mit DuckDB 2.0.0 und dem Engine-Image: 146 Fälle direkt und durch das Gateway,
+dazu Szenario i des Compose-Tests):
+
+* Eine Anfrage mit einem der Wörter läuft nicht, wie auch immer es geschrieben ist: in Groß- und Kleinbuchstaben,
+  in `"…"` oder `` `…` ``, qualifiziert (`system.main.quack_stop`), mit Kommentaren oder Unicode-Leerzeichen vor
+  der Klammer, in einer CTE oder einem `UNION`, in `PREPARE` oder `EXPLAIN`, als zweites Statement, über
+  `remote.query(…)`. DuckDB kennt keine andere Schreibweise eines Namens: Bezeichner haben keine
+  Escape-Sequenzen, und Namen vergleicht DuckDB nur für ASCII-Buchstaben ohne Groß- und Kleinschreibung.
+* SQL aus Strings läuft nicht (`query()` ist gesperrt, `query_table()` erreicht nur Tabellen).
+* Clients können weder das Makro noch die eingebauten Funktionen, die es aufruft, ersetzen oder verdecken, und
+  die Einstellungen nicht zurückdrehen.
+* Token und Init-SQL bleiben unlesbar: kein `getenv()`, kein `/proc`, kein `shell_history()`, und `FROM _` (das
+  letzte Ergebnis der CLI der Engine) zeigt nur `started`.
+* `ATTACH`, Katalog, Queries, Transaktionen, temporäre Tabellen, Views, Schemas, Uploads und Downloads laufen wie
+  ohne Härtung, ebenso das Stoppen der Engine (`quack_stop`, `FORCE CHECKPOINT`).
+* Das Gateway selbst schickt keine Anfragen (nur Handshake, Heartbeats, `DISCONNECT` und `CANCEL`), es ist nicht
+  betroffen.
+
+**Was es nicht garantiert:**
+
+* Das Makro prüft Text, nicht Bedeutung: Es ist eine Sperrliste. Funktionen, die eine spätere DuckDB-Version oder
+  eine geladene Extension mitbringt, sperrt es nicht. Prüfen Sie die Liste nach jedem Update von DuckDB oder den
+  Extensions des Images (`SELECT function_name FROM duckdb_functions()`).
+* Fehlalarme: Auch ein Wort in einem String oder Kommentar führt zur Ablehnung (`SELECT 'attach'`, `-- getenv`,
+  `CREATE TABLE notizen AS SELECT 'secret'`). Makros, Funktionen und Secrets können Clients nicht anlegen.
+* Daten trennt es nicht: Jede Session liest und ändert alle Tabellen und angehängten Datenbanken der Engine.
+  `duckdb_secrets()` zeigt die Secrets des Init-SQL (Werte geschwärzt, die `KEY_ID` nicht), `duckdb_settings()`
+  alle Einstellungen: Zugangsdaten gehören deshalb nicht in `SET`-Anweisungen. Teure Queries bremsen weiter
+  alle.
+* Beim Start antwortet `GET /`, und damit die Readiness-Probe, schon während das `postStartSQL` läuft. Sessions,
+  die in diesem Moment kommen, lehnt das Makro ab; ohne das Makro liefen ihre Anfragen ungehärtet. Halten Sie das
+  `postStartSQL` kurz.
+* Jede Anfrage kostet rund 1 bis 2 ms mehr, weil der Quack-Server das Makro bei jedem `PREPARE` neu übersetzt
+  (gemessen: 2,1 ms ohne, 3,7 bis 4,1 ms mit Makro für eine triviale Query).
 
 ## Fehlersuche
 

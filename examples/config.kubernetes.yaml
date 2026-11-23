@@ -339,9 +339,9 @@ profiles:
     # (images/engine). Without it, the image of the podTemplate's engine
     # container applies, else ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0. The engine
     # container contract: the gateway sets QUACK_TOKEN, QUACKMUX_DATABASE,
-    # QUACKMUX_INIT_SQL, QUACKMUX_PORT (9494), QUACKMUX_ENGINE_ID,
-    # QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER, QUACKMUX_SUBDOMAIN,
-    # QUACKMUX_PROFILE and QUACKMUX_STOP_TIMEOUT.
+    # QUACKMUX_INIT_SQL, QUACKMUX_POST_START_SQL, QUACKMUX_PORT (9494),
+    # QUACKMUX_ENGINE_ID, QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER,
+    # QUACKMUX_SUBDOMAIN, QUACKMUX_PROFILE and QUACKMUX_STOP_TIMEOUT.
     image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
     # Always | IfNotPresent | Never (without it: the podTemplate's, else
     # IfNotPresent)
@@ -358,6 +358,17 @@ profiles:
     # initSQL: |
     #   ATTACH 'https://data.example.com/lake.duckdb' AS lake (READ_ONLY);
     #   CREATE VIEW trips AS FROM lake.main.trips;
+    # SQL that runs right after the Quack server has started, on the same
+    # connection: settings that would break the start. Clients may already
+    # connect while it runs; a failing statement fails the engine. Shared
+    # engines (GROUP, SERVER) are hardened with the authorization macro of
+    # the engine image in initSQL and these two settings
+    # (deploy/kubernetes/README.md, "Gehärtete geteilte Engines"):
+    postStartSQL: ""
+    # initSQL: .read /usr/local/share/quackmux/authorize.sql
+    # postStartSQL: |
+    #   SET enable_external_access = false;
+    #   SET lock_configuration = true;
     # DuckDB settings, applied as SET name = 'value' (sorted by name) before
     # initSQL. Names must be identifiers; quote numbers ("4"). Most DuckDB
     # options are global; options with session scope only affect the init
