@@ -17,8 +17,13 @@
 # are written to fd 3 instead of being passed as arguments. The init SQL is
 # handed over as private files that DuckDB reads with .read, so it is executed
 # byte for byte and can contain any quoting. The token is read inside DuckDB
-# with getenv('QUACK_TOKEN'); it never appears in a command line, a statement
-# or a log line. Never enable xtrace (set -x) in this script.
+# with getenv('QUACK_TOKEN'); it never appears in a command line, a statement,
+# a result or a log line. Never enable xtrace (set -x) in this script.
+#
+# Every connection can read the last result of the CLI's own connection
+# (FROM _, a replacement scan of the CLI) and the statements the CLI read from
+# its stdin (shell_history()). Only harmless statements and the .read commands
+# go through the FIFO, and the last statement leaves a harmless result.
 
 set -euo pipefail
 
@@ -196,7 +201,8 @@ prepare_workdir() {
 # build_bootstrap sets $bootstrap: the commands that prepare DuckDB, run the
 # init SQL (from the environment, then from the file) and start the server.
 # After quack_serve has succeeded, DuckDB creates the marker file "started";
-# with -bail it never gets there if an earlier statement fails.
+# with -bail it never gets there if an earlier statement fails. The SELECT that
+# writes the marker replaces the last result (see FROM _ above).
 build_bootstrap() {
 	local nl=$'\n'
 	bootstrap="SET extension_directories = [$(sql_string "$extension_dir")];$nl"
@@ -221,11 +227,12 @@ build_bootstrap() {
 		fi
 		bootstrap+=".read $workdir/init-file.sql$nl"
 	fi
-	# quack_serve returns a row that includes the token: discard it.
+	# quack_serve returns a row that includes the token. Selecting only the
+	# address keeps the token out of the output and out of FROM _.
 	bootstrap+=".output /dev/null$nl"
-	bootstrap+="CALL quack_serve($(sql_string "$uri"), token = getenv('QUACK_TOKEN'), allow_other_hostname = true, disable_ssl = true);$nl"
+	bootstrap+="SELECT listen_uri FROM quack_serve($(sql_string "$uri"), token = getenv('QUACK_TOKEN'), allow_other_hostname = true, disable_ssl = true);$nl"
 	bootstrap+=".output $workdir/started$nl"
-	bootstrap+=".print started$nl"
+	bootstrap+="SELECT 'started' AS quackmux_engine;$nl"
 	bootstrap+=".output stdout$nl"
 }
 
@@ -233,6 +240,11 @@ start_duckdb() {
 	# Opening the FIFO read-write never blocks, and it keeps a writer around,
 	# so DuckDB does not see EOF before this script closes fd 3 (or dies).
 	exec 3<>"$workdir/stdin"
+	# Nobody may open the FIFO for writing again, not even a SQL session
+	# through /proc/<pid>/fd/0 (COPY ... TO): whatever reaches the CLI's stdin
+	# runs on its own connection, dot commands such as .shell included. DuckDB
+	# still opens it for reading below.
+	chmod 0400 "$workdir/stdin"
 	(
 		# The init SQL reaches DuckDB as a file; keep it out of DuckDB's
 		# environment, where SQL users could read it with getenv().

@@ -6,8 +6,11 @@
 # with a database file, init SQL from the environment and from a file, and
 # server settings. Each time it waits until the Quack server answers GET /,
 # checks that the token shows up neither in a process command line nor in the
-# output, stops the engine with SIGTERM and expects exit status 0. Finally it
-# opens the database file and checks that both init scripts ran.
+# output, stops the engine with SIGTERM and expects exit status 0. In the
+# second scenario a Quack client (the DuckDB CLI of the image) checks what a
+# session of the engine must not get: the token through FROM _ and the
+# standard input of the engine's CLI. Finally it opens the database file and
+# checks that both init scripts ran.
 #
 # The image build runs it (build argument ENGINE_SELFTEST=true). It also works
 # in derived images:
@@ -55,6 +58,38 @@ show_log() {
 	sed 's/^/  | /' "$1"
 }
 
+# check_session NAME PORT LOG runs a Quack client against the engine on PORT
+# (whose output goes to LOG). The CLI of the engine answers FROM _ with its
+# last result, which must not be the row of quack_serve with the token, and
+# its standard input must not be writable through /proc.
+check_session() {
+	local name=$1 port=$2 log=$3 out=$dir/$1-client.log
+	(
+		umask 077
+		cat >"$dir/client.sql" <<EOF
+SET extension_directories = ['${QUACKMUX_EXTENSION_DIR:-/opt/duckdb/extensions}'];
+LOAD quack;
+CREATE SECRET (TYPE quack, TOKEN '$QUACK_TOKEN', SCOPE 'quack:127.0.0.1:$port');
+ATTACH 'quack:127.0.0.1:$port' AS engine (DISABLE_SSL true);
+SELECT 'session: ' || quackmux_engine FROM engine.query('FROM _');
+FROM engine.query('COPY (SELECT ''.print selftest-injected'') TO ''/proc/self/fd/0'' (FORMAT csv, HEADER false, QUOTE '''')');
+EOF
+	)
+	timeout 60 "$duckdb_bin" -init /dev/null -noheader -list <"$dir/client.sql" >"$out" 2>&1 || true
+	if ! grep -q '^session: started$' "$out"; then
+		show_log "$out" >&2
+		fail "scenario '$name': a session of the engine did not get the harmless last result through FROM _"
+	fi
+	if grep -qF -f "$dir/token" "$out"; then
+		fail "scenario '$name': a session of the engine read the token"
+	fi
+	sleep 0.5
+	if grep -q selftest-injected "$log"; then
+		fail "scenario '$name': a session of the engine wrote to the standard input of its CLI"
+	fi
+	say "scenario '$name': a session gets neither the token nor the CLI's standard input"
+}
+
 # check_duckdb_env fails if a running DuckDB process has VAR in its
 # environment (the entrypoint keeps the init SQL out of it).
 check_duckdb_env() {
@@ -70,11 +105,12 @@ check_duckdb_env() {
 	done
 }
 
-# run_scenario NAME PORT [VAR=VALUE...] starts the engine with the given
-# environment, probes it on PORT and stops it again.
+# run_scenario NAME PORT CHECK [VAR=VALUE...] starts the engine with the given
+# environment, probes it on PORT, runs the function CHECK (unless it is "-")
+# with NAME, PORT and the engine's log and stops the engine again.
 run_scenario() {
-	local name=$1 port=$2 out pid response rc=0 deadline
-	shift 2
+	local name=$1 port=$2 check=$3 out pid response rc=0 deadline
+	shift 3
 	out=$dir/$name.log
 	say "scenario '$name': starting the engine"
 	env "$@" "$entrypoint" >"$out" 2>&1 &
@@ -106,6 +142,9 @@ run_scenario() {
 		fail "scenario '$name': the token is visible in a process command line"
 	fi
 	check_duckdb_env QUACKMUX_INIT_SQL
+	if [[ $check != - ]]; then
+		"$check" "$name" "$port" "$out"
+	fi
 
 	kill -TERM "$pid"
 	wait "$pid" || rc=$?
@@ -119,14 +158,14 @@ run_scenario() {
 	say "scenario '$name': stopped cleanly"
 }
 
-run_scenario defaults "${QUACKMUX_PORT:-9494}"
+run_scenario defaults "${QUACKMUX_PORT:-9494}" -
 
 cat >"$dir/init.sql" <<'EOF'
 -- quackmux engine self-test: a comment with a 'quote
 CREATE TABLE selftest_file AS
     SELECT 'it''s from the file' AS s;
 EOF
-run_scenario configured 19494 \
+run_scenario configured 19494 check_session \
 	QUACKMUX_PORT=19494 \
 	QUACKMUX_BIND=0.0.0.0 \
 	QUACKMUX_DATABASE="$dir/selftest.duckdb" \

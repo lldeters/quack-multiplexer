@@ -41,9 +41,10 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 ## Start
 
 1. Der Entrypoint prüft die Variablen. Bei einem Fehler endet er mit Exit-Code 78.
-2. Er legt ein privates Verzeichnis (`mktemp -d`, Modus 0700) mit einer FIFO an und hält sie auf fd 3 read-write
-   offen. Dann startet er `duckdb -init /dev/null -bail <Datenbank>` mit der FIFO als stdin. Das Init-SQL kopiert er
-   in private Dateien (Modus 0600).
+2. Er legt ein privates Verzeichnis (`mktemp -d`, Modus 0700) mit einer FIFO an, hält sie auf fd 3 read-write offen
+   und setzt sie dann auf Modus 0400: Niemand kann sie danach noch zum Schreiben öffnen (siehe „Sicherheit“). Dann
+   startet er `duckdb -init /dev/null -bail <Datenbank>` mit der FIFO als stdin. Das Init-SQL kopiert er in private
+   Dateien (Modus 0600).
 3. Über die FIFO bekommt DuckDB:
 
    ```sql
@@ -56,9 +57,11 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
    .read <Kopie von QUACKMUX_INIT_SQL>
    .read <Kopie von QUACKMUX_INIT_SQL_FILE>
    .output /dev/null
-   CALL quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
-                    allow_other_hostname = true, disable_ssl = true);
+   SELECT listen_uri FROM quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
+                                      allow_other_hostname = true, disable_ssl = true);
    .output <Marker-Datei>
+   SELECT 'started' AS quackmux_engine;
+   .output stdout
    ```
 
 4. Legt DuckDB die Marker-Datei an, ist alles fehlerfrei gelaufen, denn `-bail` bricht beim ersten Fehler ab. Der
@@ -70,8 +73,8 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 
 Warum eine FIFO: Die DuckDB-CLI beendet sich beim EOF auf stdin, und Kubernetes liefert ohne `stdin: true` sofort EOF.
 `duckdb -serve` ist kein Daemon-Modus und kann nicht an `0.0.0.0` binden. Über die FIFO landen keine Statements in den
-Prozessargumenten. Das Token liest DuckDB selbst per `getenv('QUACK_TOKEN')`. Die Ergebniszeile von `quack_serve`,
-die das Token enthält, geht nach `/dev/null`.
+Prozessargumenten. Das Token liest DuckDB selbst per `getenv('QUACK_TOKEN')`. Von der Ergebniszeile von
+`quack_serve`, die das Token enthält, wählt der Entrypoint nur die Adresse aus, und sie geht nach `/dev/null`.
 
 ### Hinweise zum Init-SQL
 
@@ -261,5 +264,12 @@ Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
   erreichen (NetworkPolicy). Zugangsdaten im Init-SQL kann jeder Benutzer der Engine auslesen: In geteilten
   Engines (`GROUP`, `SERVER`) gehören dorthin nur Secrets, die alle Benutzer verwenden dürfen. Besser sind
   Provider ohne Schlüssel im SQL, etwa `CREATE SECRET (TYPE s3, PROVIDER credential_chain)` mit Workload Identity.
+* Jede Session kann zwei Dinge der CLI lesen, auf deren Verbindung der Entrypoint arbeitet: das letzte Ergebnis
+  (`FROM _`) und die Zeilen, die die CLI von stdin gelesen hat (`shell_history()`). Das letzte Ergebnis ist deshalb
+  immer harmlos (`SELECT 'started'`), und über stdin kommen nur die Anweisungen aus „Start“, nie Init-SQL oder Token.
+* Was die CLI auf stdin liest, führt sie auf ihrer eigenen Verbindung aus, auch Dot-Commands wie `.shell`. Mit
+  External Access könnte eine Session die FIFO über `/proc/<pid>/fd/0` zum Schreiben öffnen (`COPY … TO`). Weil der
+  Entrypoint sie nach dem Öffnen auf Modus 0400 setzt, scheitert das mit „Permission denied“. Der Selbsttest prüft
+  beides mit einem Quack-Client.
 * Das Extension-Verzeichnis ist schreibgeschützt und Autoinstall ist aus. Engines brauchen deshalb keinen
   Internetzugang.
