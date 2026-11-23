@@ -161,9 +161,12 @@ messages against the engine image and runs of the DuckDB 2.0 CLI through the gat
 - **Client.** Each query has a random uuid. The fetcher sends read-ahead FETCHes (16 with 4 cores) and finishes a
   scan only when every one is answered, so late read-aheads do not overlap the next query. A scan that stops early
   sends CANCEL with its uuid (`~QuackScanBindData`), except catalog scans, whose bind data keeps uuid `{0,0}`.
-- **Where long queries meet the limit.** DuckDB 2.0 pushes `count(*)` and other expressions over `remote.query(…)`
-  into the engine, and results are cut into batches of up to 32 MiB (`quack_target_batch_bytes`), emitted in order:
-  a long query usually still waits in its PREPARE when the limit passes. A FETCH-phase timeout needs a result the
-  client must pull itself, e.g. a join of a remote scan with a local table.
+- **Where long queries meet the limit.** DuckDB 2.0 often pushes an aggregate over `remote.query(…)` into the engine
+  (`SELECT count(*) FROM remote.query(…)` was pushed, `SELECT 'x=' || CAST(count(*) AS VARCHAR) FROM remote.query(…)`
+  was not: the client fetched every row). Results are cut into batches of up to 32 MiB (`quack_target_batch_bytes`),
+  emitted in order; a selective filter over a huge range emitted nothing until its end. A long query computed on the
+  engine therefore still waits in its PREPARE when the limit passes. When the client pulls the rows (a join with a
+  local table, or an aggregate that is not pushed down), a FETCH gets the error; the client then needs seconds to
+  wind down its read-aheads (5-15 s on a loaded 4-core machine with 32 MiB batches).
 - **Engine-side alternative.** `SET max_execution_time = <ms>` makes the engine end a query with `INTERRUPT` "Query
   exceeded maximum execution time"; a client can change it with `SET` unless the configuration is locked.

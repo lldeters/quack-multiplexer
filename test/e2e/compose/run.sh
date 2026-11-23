@@ -277,8 +277,9 @@ SELECT 'short=' || CAST(count(*) AS VARCHAR) AS result FROM remote.query('SELECT
 	session_wait h_limit 'short=100000' 120 || return 1
 	ok "a query below the limit returns its result"
 	t0=$(now)
-	# Counting 10^12 rows takes far longer than the limit.
-	session_send h_limit "SELECT 'long=' || CAST(count(*) AS VARCHAR) AS result FROM remote.query('SELECT range FROM range(1000000000000)');
+	# Counting 10^12 rows on the engine takes far longer than the limit. (A
+	# count outside remote.query would make the client fetch the rows.)
+	session_send h_limit "SELECT 'long=' || CAST(n AS VARCHAR) AS result FROM remote.query('SELECT count(*) AS n FROM range(1000000000000)');
 SELECT 'after=' || engine AS result FROM remote.whoami;" || return 1
 	session_wait h_limit 'after=shared' 120 '' || return 1
 	elapsed=$(($(now) - t0))
@@ -286,7 +287,7 @@ SELECT 'after=' || engine AS result FROM remote.whoami;" || return 1
 		"the long query fails with the gateway's error" || return 1
 	expect_no_output "$log" 'long=1000000000000' "the long query returned no result" || return 1
 	ok "the session runs the next query"
-	expect_ge 60 "$elapsed" "the error came at the limit, not at the end of the query (after ${elapsed}s)" || return 1
+	expect_ge 30 "$elapsed" "the error came at the limit, not at the end of the query (after ${elapsed}s)" || return 1
 	after=$(metric_sum "$GATEWAY_ADMIN" quackmux_query_timeouts_total 'result="cancelled"')
 	expect_ge "$after" $((before + 1)) "quackmux_query_timeouts_total{result=\"cancelled\"} counted it ($before -> $after)" || return 1
 	session_send h_limit "DETACH remote;" || true

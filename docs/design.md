@@ -269,8 +269,9 @@ das Gateway keine Queries.
   `query timeout` (Benutzer, Session, Engine, `queryUuid`, `clientQueryId`, Limit, Quelle, Dauer, Ergebnis des
   CANCEL).
 
-DuckDB 2.0 schiebt ganze Queries samt Aggregaten zur Engine, und viele lange Queries liefern ihr erstes Batch spät
-(Batches bis 32 MiB). Das Limit trifft sie deshalb meist schon während des PREPARE.
+DuckDB 2.0 schiebt Aggregate über `remote.query(…)` oft mit zur Engine, und viele lange Queries liefern ihr erstes
+Batch spät (Batches bis 32 MiB). Das Limit trifft sie dann schon während des PREPARE. Muss der Client die Zeilen selbst
+holen, trifft es einen FETCH; bis der Client danach seine Read-Aheads abgewickelt hat, können Sekunden vergehen.
 
 ## 6. Neustart und Hochverfügbarkeit
 
