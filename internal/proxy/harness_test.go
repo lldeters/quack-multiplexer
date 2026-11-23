@@ -72,6 +72,7 @@ type harness struct {
 	clock    *clock
 	cancel   context.CancelFunc
 	sealer   *session.Sealer
+	met      *metrics.Metrics
 }
 
 const baseConfig = `
@@ -148,6 +149,7 @@ func newHarnessWith(t *testing.T, yamlExtra string, inner *fake.Provider, prov e
 		log = slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	met := metrics.New()
+	h.met = met
 	up := upstream.New(cfg.Server.Upstream)
 	h.sealer, err = session.NewSealer(testKey)
 	if err != nil {

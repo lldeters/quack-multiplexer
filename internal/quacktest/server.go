@@ -77,6 +77,8 @@ type Server struct {
 	// CancelError, if set, answers every CANCEL_REQUEST with this error,
 	// and the statement keeps running.
 	CancelError string
+	// CancelDelay delays every CANCEL_REQUEST before the engine acts on it.
+	CancelDelay time.Duration
 	// Supersede makes a PREPARE_REQUEST interrupt the statement before it,
 	// as the Quack server does. It is off by default, so that tests can run
 	// queries side by side on one connection. Set it before the first query.

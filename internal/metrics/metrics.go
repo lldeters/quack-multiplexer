@@ -27,6 +27,9 @@ type Metrics struct {
 	Bytes            *prometheus.CounterVec
 	InFlight         prometheus.Gauge
 	IsLeader         prometheus.Gauge
+	// QueryTimeouts counts queries cancelled at their time limit
+	// (limits.queryTimeout and the profile and override values).
+	QueryTimeouts *prometheus.CounterVec
 
 	// LeaderLabel and LeaderLabelUpdates follow the label quackmux.io/leader
 	// on the gateway's own pod. Only leader election (ha.enabled) uses them:
@@ -87,6 +90,10 @@ func New() *Metrics {
 		IsLeader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "quackmux_is_leader", Help: "1 if this replica serves traffic.",
 		}),
+		QueryTimeouts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "quackmux_query_timeouts_total",
+			Help: "Queries the gateway cancelled at their time limit, by profile and result (cancelled: the engine confirmed, or the query had not reached it; failed: the gateway could not cancel it on the engine).",
+		}, []string{"profile", "result"}),
 		LeaderLabel: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "quackmux_leader_label", Help: "1 if this replica's pod carries the label quackmux.io/leader (as confirmed by the API server).",
 		}),
@@ -96,7 +103,7 @@ func New() *Metrics {
 	}
 	r.MustRegister(m.SessionsOpen, m.SessionsOpened, m.SessionsClosed, m.ConnectFailures, m.AuthFailures,
 		m.Engines, m.EngineStarts, m.EngineStartTime, m.EngineTerminated, m.Requests, m.RequestSeconds,
-		m.Bytes, m.InFlight, m.IsLeader)
+		m.Bytes, m.InFlight, m.IsLeader, m.QueryTimeouts)
 	return m
 }
 

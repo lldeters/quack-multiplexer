@@ -87,6 +87,10 @@ func (s *Server) cancel(c *conn, body []byte, rec *Received) []byte {
 	}
 	rec.QueryUUID = u
 	s.mu.Lock()
+	delay := s.CancelDelay
+	s.mu.Unlock()
+	time.Sleep(delay)
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.CancelError != "" {
 		return errorResponse("%s", s.CancelError)
