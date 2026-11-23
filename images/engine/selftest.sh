@@ -2,16 +2,19 @@
 #
 # quackmux-engine-selftest - smoke test of the quackmux engine image.
 #
-# Runs the entrypoint in two scenarios: once with the image defaults, once
+# Runs the entrypoint in three scenarios: once with the image defaults, once
 # with a database file, init and post-start SQL from the environment and from
-# a file, and server settings. Each time it waits until the Quack server
-# answers GET /,
+# a file, and server settings, once hardened like a shared engine (the
+# authorization macro of the image and the post-start settings of its README).
+# Each time it waits until the Quack server answers GET /,
 # checks that the token shows up neither in a process command line nor in the
 # output, stops the engine with SIGTERM and expects exit status 0. In the
 # second scenario a Quack client (the DuckDB CLI of the image) checks what a
 # session of the engine must not get: the token through FROM _ and the
-# standard input of the engine's CLI. Finally it opens the database file and
-# checks that all four scripts ran, the post-start SQL while the server ran.
+# standard input of the engine's CLI; in the third one that the macro lets
+# ordinary queries through and rejects quack_stop and getenv, and that file
+# access is off. Finally it opens the database files and checks that all four
+# scripts ran, the post-start SQL while the server ran.
 #
 # The image build runs it (build argument ENGINE_SELFTEST=true). It also works
 # in derived images:
@@ -25,6 +28,7 @@
 set -euo pipefail
 
 entrypoint=${1:-/usr/local/bin/quackmux-engine}
+authorize_sql=/usr/local/share/quackmux/authorize.sql
 duckdb_bin=${QUACKMUX_DUCKDB_BIN:-duckdb}
 timeout=${SELFTEST_TIMEOUT:-120}
 
@@ -89,6 +93,43 @@ EOF
 		fail "scenario '$name': a session of the engine wrote to the standard input of its CLI"
 	fi
 	say "scenario '$name': a session gets neither the token nor the CLI's standard input"
+}
+
+# check_hardened NAME PORT LOG runs a Quack client against an engine with the
+# authorization macro and the post-start settings.
+check_hardened() {
+	local name=$1 port=$2 out=$dir/$1-client.log
+	(
+		umask 077
+		cat >"$dir/client.sql" <<EOF
+SET extension_directories = ['${QUACKMUX_EXTENSION_DIR:-/opt/duckdb/extensions}'];
+LOAD quack;
+CREATE SECRET (TYPE quack, TOKEN '$QUACK_TOKEN', SCOPE 'quack:127.0.0.1:$port');
+ATTACH 'quack:127.0.0.1:$port' AS engine (DISABLE_SSL true);
+SELECT 'query: ' || answer FROM engine.selftest_hardened;
+FROM engine.query('CALL quack_stop(''quack:0.0.0.0:$port'')');
+FROM engine.query('SELECT getenv(''QUACK_TOKEN'')');
+FROM engine.query('SELECT * FROM read_text(''/proc/1/environ'')');
+SELECT 'still serving: ' || answer FROM engine.selftest_hardened;
+EOF
+	)
+	timeout 60 "$duckdb_bin" -init /dev/null -noheader -list <"$dir/client.sql" >"$out" 2>&1 || true
+	if ! grep -q '^query: 42$' "$out" || ! grep -q '^still serving: 42$' "$out"; then
+		show_log "$out" >&2
+		fail "scenario '$name': an ordinary query of a session failed"
+	fi
+	if [[ $(grep -c 'quackmux_authorize: not allowed on this engine' "$out") != 2 ]]; then
+		show_log "$out" >&2
+		fail "scenario '$name': the authorization macro did not reject quack_stop and getenv"
+	fi
+	if ! grep -q 'Permission Error' "$out"; then
+		show_log "$out" >&2
+		fail "scenario '$name': a session could read a file"
+	fi
+	if grep -qF -f "$dir/token" "$out"; then
+		fail "scenario '$name': a session of the engine read the token"
+	fi
+	say "scenario '$name': the macro rejects quack_stop and getenv, file access is off, queries run"
 }
 
 # check_duckdb_env fails if a running DuckDB process has VAR in its
@@ -185,6 +226,20 @@ run_scenario configured 19494 check_session \
 	QUACKMUX_ENGINE_ID=quack-selftest \
 	QUACKMUX_SHARE_LEVEL=SERVER \
 	QUACKMUX_PROFILE=selftest
+
+run_scenario hardened 19495 check_hardened \
+	QUACKMUX_PORT=19495 \
+	QUACKMUX_DATABASE="$dir/hardened.duckdb" \
+	QUACKMUX_INIT_SQL="CREATE OR REPLACE TABLE selftest_hardened AS SELECT 42 AS answer;
+.read $authorize_sql" \
+	QUACKMUX_POST_START_SQL="SET enable_external_access = false;
+SET lock_configuration = true;"
+# The engine stopped cleanly with the configuration locked; the table is on
+# disk.
+if ! result=$("$duckdb_bin" -init /dev/null -bail "$dir/hardened.duckdb" -c "SELECT answer FROM selftest_hardened;" 2>&1) ||
+	[[ $result != *42* ]]; then
+	fail "reading the database of the hardened engine failed: $result"
+fi
 
 # All four scripts must have run, quotes intact, the post-start SQL while
 # the server was listed, and the data must be on disk.

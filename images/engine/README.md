@@ -16,6 +16,7 @@ als einzelner Quack-Server.
 | `/opt/duckdb/extensions` | vorinstallierte Extensions, gehört `root` und ist für die Engine nur lesbar |
 | `/usr/local/bin/quackmux-engine` | Entrypoint ([`entrypoint.sh`](entrypoint.sh)) |
 | `/usr/local/bin/quackmux-engine-selftest` | Smoke-Test des Images ([`selftest.sh`](selftest.sh)) |
+| `/usr/local/share/quackmux/authorize.sql` | Autorisierungs-Makro für geteilte Engines ([`authorize.sql`](authorize.sql), siehe „Sicherheit“) |
 | `/data` | leerer Mountpoint für Datenbankdateien, gehört dem Engine-Benutzer |
 
 Der Prozess läuft als Benutzer `duckdb` (UID/GID 1000) mit `HOME=/tmp` und Arbeitsverzeichnis `/tmp`. Port: 9494.
@@ -120,7 +121,7 @@ Prozessargumenten. Das Token liest DuckDB selbst per `getenv('QUACK_TOKEN')`. Vo
   bedeutet und was es nicht verhindert:
   [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Härtung geteilter Engines“.
 * Der Server nimmt schon Verbindungen an, während es läuft. Bis zu seinem Ende ist die Engine also nicht gehärtet.
-  Halten Sie es kurz.
+  Halten Sie es kurz; das Makro aus [`authorize.sql`](authorize.sql) lehnt bis dahin jede Anfrage ab.
 * Der erste Fehler beendet DuckDB und damit die Engine (Exit-Code mindestens 1). Weil `GET /` schon antwortet, kann
   das Gateway die Engine kurz für bereit gehalten haben; ihre Sessions scheitern dann.
 
@@ -301,5 +302,16 @@ Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
   External Access könnte eine Session die FIFO über `/proc/<pid>/fd/0` zum Schreiben öffnen (`COPY … TO`). Weil der
   Entrypoint sie nach dem Öffnen auf Modus 0400 setzt, scheitert das mit „Permission denied“. Der Selbsttest prüft
   beides mit einem Quack-Client.
+* Für geteilte Engines bringt das Image ein Makro für `quack_authorization_function` mit, das `quack_stop`,
+  `quack_serve`, `getenv` und andere gefährliche Aufrufe der Clients ablehnt. Es wirkt nur zusammen mit dem
+  Post-Start-SQL oben:
+
+  ```sh
+  -e QUACKMUX_INIT_SQL=".read /usr/local/share/quackmux/authorize.sql"
+  -e QUACKMUX_POST_START_SQL="SET enable_external_access = false; SET lock_configuration = true;"
+  ```
+
+  Was es abdeckt und was nicht: [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Härtung geteilter
+  Engines“. Der Selbsttest prüft diese Kombination mit einem Quack-Client.
 * Das Extension-Verzeichnis ist schreibgeschützt und Autoinstall ist aus. Engines brauchen deshalb keinen
   Internetzugang.

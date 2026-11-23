@@ -97,16 +97,17 @@ RUN set -eu; \
     HOME=/tmp duckdb -init /dev/null -bail -c "$sql$load FROM duckdb_extensions() WHERE installed ORDER BY 1;"; \
     chmod -R a+rX,go-w /opt/duckdb
 
-# The entrypoint and the self-test (line endings normalized for checkouts on
-# Windows).
-COPY entrypoint.sh selftest.sh /usr/local/src/quackmux-engine/
+# The entrypoint, the self-test and the authorization macro for shared
+# engines (line endings normalized for checkouts on Windows).
+COPY entrypoint.sh selftest.sh authorize.sql /usr/local/src/quackmux-engine/
 RUN set -eu; \
     cd /usr/local/src/quackmux-engine; \
-    sed -i 's/\r$//' entrypoint.sh selftest.sh; \
+    sed -i 's/\r$//' entrypoint.sh selftest.sh authorize.sql; \
     bash -n entrypoint.sh; \
     bash -n selftest.sh; \
     install -m 0755 entrypoint.sh /usr/local/bin/quackmux-engine; \
-    install -m 0755 selftest.sh /usr/local/bin/quackmux-engine-selftest
+    install -m 0755 selftest.sh /usr/local/bin/quackmux-engine-selftest; \
+    install -D -m 0644 authorize.sql /usr/local/share/quackmux/authorize.sql
 
 # -----------------------------------------------------------------------------
 # Stage 2: the runtime image.
@@ -136,13 +137,15 @@ RUN set -eu; \
 COPY --from=duckdb /usr/local/bin/duckdb /usr/local/bin/duckdb
 COPY --from=duckdb /opt/duckdb/extensions /opt/duckdb/extensions
 COPY --from=duckdb /usr/local/bin/quackmux-engine /usr/local/bin/quackmux-engine-selftest /usr/local/bin/
+COPY --from=duckdb /usr/local/share/quackmux /usr/local/share/quackmux
 
 ENV HOME=/tmp
 WORKDIR /tmp
 USER 1000:1000
 
 # Smoke test of the finished image as the engine user: start, GET /, SIGTERM,
-# init SQL results (see selftest.sh). ENGINE_SELFTEST=false skips it.
+# init and post-start SQL, what a session may do (see selftest.sh).
+# ENGINE_SELFTEST=false skips it.
 ARG ENGINE_SELFTEST=true
 RUN if [ "$ENGINE_SELFTEST" = "true" ]; then \
         quackmux-engine-selftest && find /tmp -mindepth 1 -delete; \
