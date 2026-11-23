@@ -186,6 +186,10 @@ overrides: []
 #     allowedProfiles: [large]
 #     # Replaces limits.maxSessionsPerUser for matching users (0 = keep it).
 #     maxSessions: 20
+#     # Replaces the query time limit of the profile and limits.queryTimeout
+#     # for matching users (0s = no limit). Sessions that the gateway adopts
+#     # after a restart have no groups: only "users" entries apply to them.
+#     queryTimeout: 6h
 
 # -----------------------------------------------------------------------------
 # Session lifecycle.
@@ -261,6 +265,13 @@ limits:
   maxEnginesPerUser: 0
   # Engines launching at the same time (0 means the default, 20).
   maxStartingEngines: 20
+  # Longest time a query may run: from the moment the gateway forwards it
+  # until its result is complete, time the client spends between fetches
+  # included. Then the gateway cancels it on the engine, the client gets an
+  # error, and the session stays usable. 0s disables (default). Choose it
+  # generously: it also counts for big results that a slow client fetches.
+  # profiles.<name>.queryTimeout and overrides[].queryTimeout replace it.
+  queryTimeout: 0s
 
 # -----------------------------------------------------------------------------
 # Where engines run.
@@ -426,6 +437,11 @@ profiles:
     # idleTimeout: 5m
     maxLifetime: null
     # maxLifetime: 24h
+    # Query time limit of the sessions on this profile (null =
+    # limits.queryTimeout, 0s = no limit). Gateway policy only: changing it
+    # does not replace running engines.
+    queryTimeout: null
+    # queryTimeout: 30m
 
     # Kubernetes pod shaping (provider kubernetes only).
     # Resources of the engine container. Keep settings.memory_limit below
