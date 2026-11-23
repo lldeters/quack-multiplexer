@@ -264,9 +264,39 @@ SQL
 	expect_ge "$after" $((before + 1)) "SEND_DATA_REQUEST messages went through the gateway ($before -> $after)" || return 1
 }
 
-# (h) Nothing above may have crashed a request handler.
+# (h) bob's queries have a time limit of 5s (overrides in gateway.yaml). A
+# query below it is not touched; a long one is cancelled on the engine, bob
+# gets the gateway's error, and his session runs the next query.
+scenario_query_timeout() {
+	local log=$E2E_WORK/h_limit.log before after t0 elapsed
+	before=$(metric_sum "$GATEWAY_ADMIN" quackmux_query_timeouts_total 'result="cancelled"')
+	session_start h_limit "${CLIENT[@]}" || return 1
+	session_send h_limit "$(client_preamble)
+$(attach_sql "${E2E_BOB_TOKEN}?share_level=server" gateway)
+SELECT 'short=' || CAST(count(*) AS VARCHAR) AS result FROM remote.query('SELECT range FROM range(100000)');" || return 1
+	session_wait h_limit 'short=100000' 120 || return 1
+	ok "a query below the limit returns its result"
+	t0=$(now)
+	# Counting 10^12 rows takes far longer than the limit.
+	session_send h_limit "SELECT 'long=' || CAST(count(*) AS VARCHAR) AS result FROM remote.query('SELECT range FROM range(1000000000000)');
+SELECT 'after=' || engine AS result FROM remote.whoami;" || return 1
+	session_wait h_limit 'after=shared' 120 '' || return 1
+	elapsed=$(($(now) - t0))
+	expect_output "$log" 'ran longer than its time limit of 5s (overrides[0].queryTimeout) and was cancelled' \
+		"the long query fails with the gateway's error" || return 1
+	expect_no_output "$log" 'long=1000000000000' "the long query returned no result" || return 1
+	ok "the session runs the next query"
+	expect_ge 60 "$elapsed" "the error came at the limit, not at the end of the query (after ${elapsed}s)" || return 1
+	after=$(metric_sum "$GATEWAY_ADMIN" quackmux_query_timeouts_total 'result="cancelled"')
+	expect_ge "$after" $((before + 1)) "quackmux_query_timeouts_total{result=\"cancelled\"} counted it ($before -> $after)" || return 1
+	session_send h_limit "DETACH remote;" || true
+	# The exit status is 1: a statement failed (as expected).
+	session_end h_limit || true
+}
+
+# (i) Nothing above may have crashed a request handler.
 scenario_no_panics() {
-	local log=$E2E_WORK/h_gateways.log
+	local log=$E2E_WORK/i_gateways.log
 	"${COMPOSE[@]}" logs --no-color gateway gateway-idle >"$log" 2>&1 || {
 		bad "docker compose logs failed"
 		return 1
@@ -297,6 +327,7 @@ run_scenario d "a wrong token is rejected" scenario_wrong_token
 run_scenario e "the admin API lists an open attachment" scenario_admin_sessions
 run_scenario f "the idle timeout closes a quiet session" scenario_idle_timeout
 run_scenario g "CREATE TABLE AS uploads rows with SEND_DATA" scenario_send_data
-run_scenario h "no panics in the gateway logs" scenario_no_panics
+run_scenario h "the query time limit cancels a long query" scenario_query_timeout
+run_scenario i "no panics in the gateway logs" scenario_no_panics
 
 summary "compose e2e" || exit 1

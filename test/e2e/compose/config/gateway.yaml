@@ -59,6 +59,11 @@ profiles:
   default:
     description: DuckDB 2.0 engines run by docker compose (engine-shared, engine-analytics)
 
+overrides:
+  # Scenario h: bob's queries are cancelled after 5s, alice's have no limit.
+  - users: [bob]
+    queryTimeout: 5s
+
 audit:
   # Exercise the audit log with real PREPARE requests.
   enabled: true

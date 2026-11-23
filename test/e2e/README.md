@@ -73,7 +73,8 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | e | bob hält ein Attachment offen (der Client liest weiter von einer FIFO). Währenddessen: `GET /api/v1/sessions?user=bob`, `GET /api/v1/sessions/{id}`, ein Request ohne Token. Danach `DETACH`. | Session-Tracking und Admin-API (Session `OPEN`, Share-Level `SERVER`, Engine `READY`), Bearer-Authentifizierung (401 ohne Token), Abmelden beim `DETACH`. |
 | f | alice über `gateway-idle`: Query, 20 s Pause, Query | Der Idle-Reaper schließt die Session nach 15 s ohne Query, obwohl der Client weiter Heartbeats schickt. Die nächste Query bekommt den Grund („idle timeout“), `quackmux_sessions_closed_total{reason="idle timeout"}` zählt mit. |
 | g | `CREATE TABLE remote.e2e_range AS SELECT range FROM range(100000)` und `CREATE TABLE remote.e2e_upload AS SELECT id FROM e2e_local` (lokale Tabelle), danach `count(*)` und `sum(id)` | Der Client streamt die Zeilen mit `SEND_DATA_REQUEST` durch das Gateway (`quackmux_requests_total{type="SEND_DATA_REQUEST",outcome="ok"}` steigt). 100 000 Zeilen kommen vollständig und unverfälscht an. |
-| h | Logs beider Gateways | Kein Request-Handler ist mit einem Panic abgestürzt. |
+| h | bob (Query-Zeitlimit 5 s per `overrides`): eine kurze Query, dann `count(*)` über 10¹² Zeilen, danach eine weitere Query | Die kurze Query bleibt unberührt. Die lange bricht das Gateway nach 5 s auf der Engine ab (CANCEL), bob bekommt „ran longer than its time limit of 5s“, und die nächste Query der Session läuft. `quackmux_query_timeouts_total{result="cancelled"}` zählt mit. |
+| i | Logs beider Gateways | Kein Request-Handler ist mit einem Panic abgestürzt. |
 
 ### Variablen
 
