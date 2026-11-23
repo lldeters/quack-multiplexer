@@ -26,22 +26,24 @@ overrides:
 		groups  []string
 		profile string
 		want    time.Duration
+		source  string
 	}{
-		{"global limit", "carol", nil, "default", 30 * time.Minute},
-		{"profile replaces the global limit", "carol", nil, "adhoc", 5 * time.Minute},
-		{"explicit 0 on the profile disables it", "carol", nil, "batch", 0},
-		{"user override wins over the profile", "etl-bot", nil, "batch", 6 * time.Hour},
-		{"group override wins over the profile", "dave", []string{"analytics"}, "adhoc", 10 * time.Minute},
+		{"global limit", "carol", nil, "default", 30 * time.Minute, "limits.queryTimeout"},
+		{"profile replaces the global limit", "carol", nil, "adhoc", 5 * time.Minute, "profiles.adhoc.queryTimeout"},
+		{"explicit 0 on the profile disables it", "carol", nil, "batch", 0, "profiles.batch.queryTimeout"},
+		{"user override wins over the profile", "etl-bot", nil, "batch", 6 * time.Hour, "overrides[0].queryTimeout"},
+		{"group override wins over the profile", "dave", []string{"analytics"}, "adhoc", 10 * time.Minute, "overrides[2].queryTimeout"},
 		// The first matching override counts, even if it sets no limit:
 		// then the profile's applies, not that of a later override.
-		{"first match without a limit falls back", "erin", []string{"ops", "analytics"}, "adhoc", 5 * time.Minute},
-		{"first match without a limit, global", "erin", []string{"ops", "analytics"}, "default", 30 * time.Minute},
-		{"unknown profile uses the global limit", "carol", nil, "gone", 30 * time.Minute},
+		{"first match without a limit falls back", "erin", []string{"ops", "analytics"}, "adhoc", 5 * time.Minute, "profiles.adhoc.queryTimeout"},
+		{"first match without a limit, global", "erin", []string{"ops", "analytics"}, "default", 30 * time.Minute, "limits.queryTimeout"},
+		{"unknown profile uses the global limit", "carol", nil, "gone", 30 * time.Minute, "limits.queryTimeout"},
 		// After a gateway restart the groups of a session are unknown.
-		{"adopted session: no groups", "dave", nil, "adhoc", 5 * time.Minute},
+		{"adopted session: no groups", "dave", nil, "adhoc", 5 * time.Minute, "profiles.adhoc.queryTimeout"},
 	} {
-		if got := QueryTimeout(c, tc.user, tc.groups, tc.profile); got != tc.want {
-			t.Errorf("%s: QueryTimeout(%s, %v, %s) = %s, want %s", tc.name, tc.user, tc.groups, tc.profile, got, tc.want)
+		if got, source := QueryTimeout(c, tc.user, tc.groups, tc.profile); got != tc.want || source != tc.source {
+			t.Errorf("%s: QueryTimeout(%s, %v, %s) = %s, %s, want %s, %s", tc.name, tc.user, tc.groups, tc.profile,
+				got, source, tc.want, tc.source)
 		}
 	}
 }
