@@ -147,6 +147,9 @@ messages against the engine image and runs of the DuckDB 2.0 CLI through the gat
   its uuid after it finished, so a CANCEL with the uuid of a finished query succeeds. A waiting PREPARE and every
   waiting FETCH get `INTERRUPT` "Interrupted: query was cancelled" at once, later FETCHes of the uuid the same error;
   the next PREPARE works. The upload streams of the statement are closed.
+- **`quack_cancel(catalog, connection_id)`** (`quack_cancel.cpp`) is a client-side table function: it sends CANCEL
+  with the zero uuid and the *target* connection id in the header over the catalog's connection. Through the gateway
+  the target must be a gateway connection id like any other routed request.
 - **Idle CANCEL is harmless.** A CANCEL (own uuid or `{0,0}`) on a connection whose query is over, also inside
   `BEGIN … COMMIT`, does not affect the next statement or the commit. Cancelling a running query inside a transaction
   aborts it ("Current transaction is aborted (please ROLLBACK)"); the transaction is rolled back.

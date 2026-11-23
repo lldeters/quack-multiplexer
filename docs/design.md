@@ -484,6 +484,7 @@ Weitere Provider:
   nächsten Query der Session oder bis die Session endet. Scheitert das CANCEL, bekommt der Client trotzdem den Fehler,
   die Query kann aber auf der Engine weiterlaufen. Uploads, die vor einem Gateway-Neustart begannen, zählen erst ab
   dem FETCH ihres Ergebnisses. Für Sessions, die nach einem Neustart übernommen wurden, gelten keine Overrides nach
-  Gruppen.
+  Gruppen. Ein Abbruch über die Admin-API (`POST /api/v1/sessions/{id}/cancel`) geht am Zeitlimit vorbei: Wartete
+  gerade kein Request auf die Query, hält das Gateway sie weiter für unfertig und zählt sie an ihrem Limit als Timeout.
 * Der Client verlangt eine exakte Protokollversion (3). Neue Quack-Versionen erfordern ein Gateway-Update. Das
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.

@@ -438,8 +438,8 @@ profiles:
     maxLifetime: null
     # maxLifetime: 24h
     # Query time limit of the sessions on this profile (null =
-    # limits.queryTimeout, 0s = no limit). Gateway policy only: changing it
-    # does not replace running engines.
+    # limits.queryTimeout, 0s = no limit). A gateway policy that does not
+    # shape the pod: changing it does not replace running engines.
     queryTimeout: null
     # queryTimeout: 30m
 
