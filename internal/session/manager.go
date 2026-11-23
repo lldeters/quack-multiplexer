@@ -136,6 +136,8 @@ type Manager struct {
 	now     func() time.Time
 	// fence, if set, must report true for Reap to act (see SetFence).
 	fence func() bool
+	// closeHook, if set, runs after every close (see SetCloseHook).
+	closeHook func(*Session)
 
 	mu         sync.RWMutex
 	sessions   map[string]*Session
@@ -178,6 +180,11 @@ func (m *Manager) SetClock(now func() time.Time) { m.now = now }
 // heartbeats of its sessions missing, because the new leader received them,
 // and must not close those sessions on the engines. Call it before Run.
 func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
+
+// SetCloseHook makes f run after a session was closed, for whatever reason,
+// with the closed session; the proxy drops the state it keeps per session
+// there. f must not block. Call it before sessions are opened.
+func (m *Manager) SetCloseHook(f func(*Session)) { m.closeHook = f }
 
 // Reservation holds a slot under the session limits while a connect is in
 // progress. Exactly one of Open or Cancel must be called.
@@ -498,6 +505,9 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 	}
 	m.log.Info("session closed", "session", s.ID, "user", s.User, "engine", s.EngineID, "reason", reason,
 		"age", now.Sub(s.CreatedAt).Round(time.Second))
+	if m.closeHook != nil {
+		m.closeHook(s)
+	}
 
 	if mode.Disconnect || mode.Cancel {
 		if target, ok := m.engines.Lookup(s.EngineID); ok {
