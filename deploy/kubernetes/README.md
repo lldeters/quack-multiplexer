@@ -849,9 +849,9 @@ Die Teile brauchen einander:
 
 1. **`postStartSQL`** läuft direkt nach `quack_serve` auf der Verbindung des Init-SQL. Es kommt wie das Init-SQL
    über das Secret der Engine (`QUACKMUX_POST_START_SQL`, Schlüssel `post-start.sql`). Eine Änderung ändert den
-   Spec-Hash: Neue Sessions bekommen neue Engines, die alten laufen aus. Die beiden Einstellungen gehören hierher,
-   weil sie vor `quack_serve` den Start verhindern: Das Token kommt per `getenv()`, und `quack_serve` braucht
-   Dateizugriff. Der erste Fehler beendet die Engine.
+   Spec-Hash: Die alten Engines gehen auf DRAINING (`engine.replaceOnSpecChange`). Die beiden Einstellungen
+   gehören hierher, weil sie vor `quack_serve` den Start verhindern: Das Token kommt per `getenv()`, und
+   `quack_serve` braucht Dateizugriff. Der erste Fehler beendet die Engine.
 2. **`SET enable_external_access = false`** sperrt für alle Sessions Dateien und Netz (`read_text`, `read_csv` und
    Co. auf Pfade und URLs, `COPY … TO`, `EXPORT` und `IMPORT DATABASE`, `ATTACH` von Dateien, `INSTALL`, `LOAD` aus
    Dateien) und `getenv()`. Token und Init-SQL in `/proc` sind dann nicht mehr lesbar. Es lässt sich nicht wieder
