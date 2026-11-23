@@ -264,6 +264,62 @@ SQL
 	expect_ge "$after" $((before + 1)) "SEND_DATA_REQUEST messages went through the gateway ($before -> $after)" || return 1
 }
 
+# (i) engine-analytics is hardened like a shared engine (the authorization
+# macro of the image and the post-start settings). Through the gateway a
+# session attaches (catalog queries), queries, uploads and keeps a temporary
+# table as usual, and FROM _ only shows the harmless last result of the
+# engine's CLI. Stopping the server, the token, files and settings are out of
+# reach (a client without -bail, every statement must fail), and the engine
+# keeps serving.
+scenario_hardened_engine() {
+	local log=$E2E_WORK/i.log denied=$E2E_WORK/i_denied.log
+	client i <<SQL
+$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?share_level=group&group=analytics" gateway)
+SELECT 'whoami=' || engine AS result FROM remote.whoami;
+SHOW ALL TABLES;
+CREATE TABLE e2e_local AS SELECT range AS id FROM range(1000);
+CREATE TABLE remote.e2e_hardened AS SELECT id FROM e2e_local;
+SELECT 'upload=' || CAST(count(*) AS VARCHAR) AS result FROM remote.e2e_hardened;
+DROP TABLE remote.e2e_hardened;
+FROM remote.query('CREATE TEMP TABLE e2e_scratch AS SELECT 21 AS half');
+SELECT 'temp=' || CAST(half * 2 AS VARCHAR) AS result FROM remote.query('SELECT half FROM e2e_scratch');
+SELECT 'last=' || quackmux_engine AS result FROM remote.query('FROM _');
+DETACH remote;
+SQL
+	expect_status "$CLIENT_RC" 0 "the client ran all statements" || return 1
+	expect_output "$log" 'whoami=analytics' "ATTACH (catalog queries) and a query pass the authorization macro" || return 1
+	expect_output "$log" 'upload=1000' "an upload with SEND_DATA passes the macro" || return 1
+	expect_output "$log" 'temp=42' "a temporary table works on the hardened engine" || return 1
+	expect_output "$log" 'last=started' "FROM _ shows the harmless last result of the engine's CLI" || return 1
+
+	CLIENT_RC=0
+	"${CLIENT[@]}" >"$denied" 2>&1 <<SQL || CLIENT_RC=$?
+$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?share_level=group&group=analytics" gateway)
+FROM remote.query('CALL quack_stop(''quack:0.0.0.0:9494'')');
+FROM remote.query('SELECT getenv(''QUACK_TOKEN'') AS t');
+FROM remote.query('SELECT content FROM read_text(''/proc/1/environ'')');
+FROM remote.query('SET GLOBAL threads = 1');
+SQL
+	if ! expect_eq "$(grep -c 'quackmux_authorize: not allowed on this engine' "$denied")" 2 \
+		"the macro rejects quack_stop and getenv"; then
+		indent "$denied"
+		return 1
+	fi
+	expect_output "$denied" 'Permission Error' "reading a file fails (enable_external_access = false)" || return 1
+	expect_output "$denied" 'the configuration has been locked' "SET fails (lock_configuration = true)" || return 1
+	expect_no_output "$denied" "$E2E_ENGINE_ANALYTICS_TOKEN" "the engine token appears nowhere" || return 1
+
+	client i_after <<SQL
+$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?share_level=group&group=analytics" gateway)
+SELECT 'still=' || engine AS result FROM remote.whoami;
+DETACH remote;
+SQL
+	expect_output "$E2E_WORK/i_after.log" 'still=analytics' "the engine keeps serving" || return 1
+}
+
 # (h) Nothing above may have crashed a request handler.
 scenario_no_panics() {
 	local log=$E2E_WORK/h_gateways.log
@@ -297,6 +353,7 @@ run_scenario d "a wrong token is rejected" scenario_wrong_token
 run_scenario e "the admin API lists an open attachment" scenario_admin_sessions
 run_scenario f "the idle timeout closes a quiet session" scenario_idle_timeout
 run_scenario g "CREATE TABLE AS uploads rows with SEND_DATA" scenario_send_data
+run_scenario i "a hardened engine serves, but not quack_stop, the token or files" scenario_hardened_engine
 run_scenario h "no panics in the gateway logs" scenario_no_panics
 
 summary "compose e2e" || exit 1

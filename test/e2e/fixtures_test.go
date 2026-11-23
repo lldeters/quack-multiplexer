@@ -379,7 +379,7 @@ type composeService struct {
 // contractEnv is the engine container contract (internal/engine/initsql.go).
 var contractEnv = []string{
 	engine.EnvToken, engine.EnvDatabase, engine.EnvInitSQL, engine.EnvPort, engine.EnvEngineID,
-	engine.EnvShareLevel, engine.EnvOwner, engine.EnvSubdomain, engine.EnvProfile,
+	engine.EnvShareLevel, engine.EnvOwner, engine.EnvSubdomain, engine.EnvProfile, engine.EnvPostStartSQL,
 }
 
 func TestComposeFile(t *testing.T) {
@@ -411,8 +411,8 @@ func TestComposeFile(t *testing.T) {
 		if got, ref := env[engine.EnvToken], "${"+want.tokenVar+":?"; !strings.HasPrefix(got, ref) {
 			t.Errorf("%s: %s gets %s=%q, want a reference to %s", composeFile, want.service, engine.EnvToken, got, want.tokenVar)
 		}
-		if got, sql := env[engine.EnvInitSQL], fmt.Sprintf("CREATE TABLE whoami AS SELECT '%s' AS engine;", name); got != sql {
-			t.Errorf("%s: %s gets %s=%q, want %q (run.sh reads whoami)", composeFile, want.service, engine.EnvInitSQL, got, sql)
+		if got, sql := env[engine.EnvInitSQL], fmt.Sprintf("CREATE TABLE whoami AS SELECT '%s' AS engine;", name); !strings.HasPrefix(got, sql) {
+			t.Errorf("%s: %s gets %s=%q, want it to start with %q (run.sh reads whoami)", composeFile, want.service, engine.EnvInitSQL, got, sql)
 		}
 		if got := env[engine.EnvPort]; got != strconv.Itoa(engine.EnginePort) {
 			t.Errorf("%s: %s gets %s=%q, want %d", composeFile, want.service, engine.EnvPort, got, engine.EnginePort)

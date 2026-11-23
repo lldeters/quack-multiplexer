@@ -41,7 +41,7 @@ Container-Logs. Der Exit-Status ist 0 nur, wenn alle Szenarien bestehen. Aufger�
 | Service | Image | Rolle |
 |---|---|---|
 | `engine-shared` | Engine-Image | DuckDB-2.0-Quack-Server für Share-Level `SERVER`. Das Init-SQL legt `whoami` mit `engine = 'shared'` an. |
-| `engine-analytics` | Engine-Image | Dasselbe für Share-Level `GROUP` der Gruppe `analytics` (`engine = 'analytics'`). |
+| `engine-analytics` | Engine-Image | Dasselbe für Share-Level `GROUP` der Gruppe `analytics` (`engine = 'analytics'`), gehärtet wie eine geteilte Engine: Autorisierungs-Makro des Images im Init-SQL, `enable_external_access = false` und `lock_configuration = true` im Post-Start-SQL. |
 | `gateway` | Gateway-Image | quackmux mit [config/gateway.yaml](compose/config/gateway.yaml): Provider `static` auf beide Engines, Auth `static` mit [config/users.yaml](compose/config/users.yaml), Admin-API mit Bearer-Token. |
 | `gateway-idle` | Gateway-Image | Wie `gateway`, aber [config/gateway-idle.yaml](compose/config/gateway-idle.yaml) mit `session.idleTimeout: 15s` und Prüfintervallen von 1 s. |
 | `client` | Engine-Image | Die DuckDB-CLI (`/usr/local/bin/duckdb` als Entrypoint, Profil `client`). Jeder Client ist ein eigener `docker compose run`. |
@@ -73,6 +73,7 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | e | bob hält ein Attachment offen (der Client liest weiter von einer FIFO). Währenddessen: `GET /api/v1/sessions?user=bob`, `GET /api/v1/sessions/{id}`, ein Request ohne Token. Danach `DETACH`. | Session-Tracking und Admin-API (Session `OPEN`, Share-Level `SERVER`, Engine `READY`), Bearer-Authentifizierung (401 ohne Token), Abmelden beim `DETACH`. |
 | f | alice über `gateway-idle`: Query, 20 s Pause, Query | Der Idle-Reaper schließt die Session nach 15 s ohne Query, obwohl der Client weiter Heartbeats schickt. Die nächste Query bekommt den Grund („idle timeout“), `quackmux_sessions_closed_total{reason="idle timeout"}` zählt mit. |
 | g | `CREATE TABLE remote.e2e_range AS SELECT range FROM range(100000)` und `CREATE TABLE remote.e2e_upload AS SELECT id FROM e2e_local` (lokale Tabelle), danach `count(*)` und `sum(id)` | Der Client streamt die Zeilen mit `SEND_DATA_REQUEST` durch das Gateway (`quackmux_requests_total{type="SEND_DATA_REQUEST",outcome="ok"}` steigt). 100 000 Zeilen kommen vollständig und unverfälscht an. |
+| i | alice, `share_level=group&group=analytics` auf der gehärteten Engine: `ATTACH`, `SHOW ALL TABLES`, Upload einer lokalen Tabelle, temporäre Tabelle, `FROM _`. Ein zweiter Client ohne `-bail` versucht `quack_stop`, `getenv('QUACK_TOKEN')`, `read_text('/proc/1/environ')` und `SET GLOBAL threads`, ein dritter fragt danach `whoami` ab. | Das Autorisierungs-Makro lässt die Katalog-Abfragen des Clients, Queries und Uploads durch und lehnt `quack_stop` und `getenv` ab, Dateizugriff und `SET` scheitern an den Einstellungen des Post-Start-SQL, das Engine-Token taucht nirgends auf, und die Engine läuft weiter. |
 | h | Logs beider Gateways | Kein Request-Handler ist mit einem Panic abgestürzt. |
 
 ### Variablen
