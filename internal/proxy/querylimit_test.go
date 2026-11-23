@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -63,6 +64,34 @@ func cancels(srv *quacktest.Server) []wire.Hugeint {
 	return out
 }
 
+// waitCancels waits until the engine received CANCELs for exactly want. The
+// gateway gets the engine's answers to the cancelled requests at the same
+// time as the answer to its CANCEL, so the client may see its error first.
+func waitCancels(t *testing.T, srv *quacktest.Server, want ...wire.Hugeint) {
+	t.Helper()
+	eventually(t, fmt.Sprintf("CANCEL for %v at the engine", want), func() bool {
+		got := cancels(srv)
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// waitTimeouts waits until quackmux_query_timeouts_total for result is n
+// (the gateway counts once the engine answered its CANCEL).
+func waitTimeouts(t *testing.T, met *metrics.Metrics, result string, n float64) {
+	t.Helper()
+	eventually(t, fmt.Sprintf("quackmux_query_timeouts_total{result=%q} = %v", result, n), func() bool {
+		return timeouts(t, met, result) == n
+	})
+}
+
 // timeouts returns quackmux_query_timeouts_total for a result.
 func timeouts(t *testing.T, met *metrics.Metrics, result string) float64 {
 	t.Helper()
@@ -110,13 +139,9 @@ func TestQueryTimeoutCancelsRunningQuery(t *testing.T) {
 	if d := time.Since(start); d < 300*time.Millisecond || d > 10*time.Second {
 		t.Fatalf("the query was cancelled after %s", d)
 	}
-	if got := cancels(srv); len(got) != 1 || got[0] != uuidA {
-		t.Fatalf("engine got CANCEL for %v, want [%v]", got, uuidA)
-	}
+	waitCancels(t, srv, uuidA)
 	mustType(t, h.prepare(c, "SELECT 1", uuidB), wire.TypePrepareResponse)
-	if n := timeouts(t, h.met, "cancelled"); n != 1 {
-		t.Fatalf("quackmux_query_timeouts_total{result=cancelled} = %v, want 1", n)
-	}
+	waitTimeouts(t, h.met, "cancelled", 1)
 	if n := requestCount(t, h.met, "query_timeout"); n != 1 {
 		t.Fatalf("requests with outcome query_timeout: %v, want 1", n)
 	}
@@ -180,9 +205,7 @@ func TestQueryTimeoutWhileFetching(t *testing.T) {
 	if n := srv.CountType(wire.TypeFetchRequest); n != fetches {
 		t.Fatalf("the FETCH after the timeout reached the engine (%d FETCHes, before %d)", n, fetches)
 	}
-	if got := cancels(srv); len(got) != 1 || got[0] != uuidA {
-		t.Fatalf("engine got CANCEL for %v, want [%v]", got, uuidA)
-	}
+	waitCancels(t, srv, uuidA)
 	mustType(t, h.prepare(c, "SELECT 1", uuidB), wire.TypePrepareResponse)
 	if s, q := proxy.TrackedQueries(h.gw); s != 1 || q != 1 {
 		t.Fatalf("%d sessions, %d queries followed, want the new query only", s, q)
@@ -218,9 +241,7 @@ func TestRestingQueryIsCancelledWhenTheClientReturns(t *testing.T) {
 		t.Fatalf("engine got CANCEL for %v while the query rested", got)
 	}
 	mustTimeout(t, h.fetch(c, uuidA, 1), "300ms", "limits.queryTimeout")
-	if got := cancels(srv); len(got) != 1 || got[0] != uuidA {
-		t.Fatalf("engine got CANCEL for %v, want [%v]", got, uuidA)
-	}
+	waitCancels(t, srv, uuidA)
 }
 
 // Uploads count like FETCHes: an upload that runs past the limit is cancelled,
@@ -251,9 +272,7 @@ func TestQueryTimeoutWhenTheCancelFails(t *testing.T) {
 	if d := time.Since(start); d > 2500*time.Millisecond {
 		t.Fatalf("the client waited %s for the query that the engine did not cancel", d)
 	}
-	if n := timeouts(t, h.met, "failed"); n != 1 {
-		t.Fatalf("quackmux_query_timeouts_total{result=failed} = %v, want 1", n)
-	}
+	waitTimeouts(t, h.met, "failed", 1)
 }
 
 // A CANCEL of the client ends the query: the gateway does not cancel it again
@@ -320,9 +339,7 @@ func TestQueryTimeoutForQueryFromBeforeARestart(t *testing.T) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	mustTimeout(t, h.fetch(c, uuidA, 1), "300ms", "limits.queryTimeout")
-	if got := cancels(srv); len(got) != 1 || got[0] != uuidA {
-		t.Fatalf("engine got CANCEL for %v, want [%v]", got, uuidA)
-	}
+	waitCancels(t, srv, uuidA)
 }
 
 // A PREPARE waits until the engine has answered the CANCEL for the previous
@@ -347,9 +364,7 @@ func TestPrepareWaitsForTheTimeoutCancel(t *testing.T) {
 	if len(order) != 2 || order[0] != wire.TypeCancelRequest {
 		t.Fatalf("engine handled %v, want the CANCEL before the next PREPARE", order)
 	}
-	if n := timeouts(t, h.met, "cancelled"); n != 1 {
-		t.Fatalf("quackmux_query_timeouts_total{result=cancelled} = %v, want 1", n)
-	}
+	waitTimeouts(t, h.met, "cancelled", 1)
 }
 
 // A PREPARE that waits for such a CANCEL when the gateway shuts down is
@@ -441,9 +456,7 @@ server: {upstream: {maxBufferedRequestBytes: -1}}
 	mustTimeout(t, h.prepare(c, "SLEEP 30000", uuidA), "300ms", "limits.queryTimeout")
 	mustType(t, h.prepare(c, "STREAM 3 60000", uuidB), wire.TypePrepareResponse)
 	mustTimeout(t, h.fetch(c, uuidB, 1), "300ms", "limits.queryTimeout")
-	if got := cancels(srv); len(got) != 2 || got[0] != uuidA || got[1] != uuidB {
-		t.Fatalf("engine got CANCEL for %v, want [%v %v]", got, uuidA, uuidB)
-	}
+	waitCancels(t, srv, uuidA, uuidB)
 }
 
 // A query with the zero uuid (the client's catalog traffic) has a limit too;
@@ -454,9 +467,7 @@ func TestQueryTimeoutForTheZeroUUID(t *testing.T) {
 	c := h.connect("tok?user=alice", nil)
 	srv := h.prov.Server(h.sessionEngine(c))
 	mustTimeout(t, h.prepare(c, "SLEEP 30000", wire.Hugeint{}), "300ms", "limits.queryTimeout")
-	if got := cancels(srv); len(got) != 1 || !got[0].IsZero() {
-		t.Fatalf("engine got CANCEL for %v, want the zero uuid", got)
-	}
+	waitCancels(t, srv, wire.Hugeint{})
 }
 
 // Two PREPAREs of a session at once: the engine runs the later one and
@@ -475,10 +486,6 @@ func TestQueryTimeoutWithConcurrentPrepares(t *testing.T) {
 	go func() { second <- h.prepare(c, "SLEEP 30000", uuidB) }()
 	mustError(t, wait(t, "the superseded PREPARE", first), quacktest.MsgSuperseded)
 	mustTimeout(t, wait(t, "the second PREPARE", second), "600ms", "limits.queryTimeout")
-	if got := cancels(srv); len(got) != 1 || got[0] != uuidB {
-		t.Fatalf("engine got CANCEL for %v, want [%v]", got, uuidB)
-	}
-	if n := timeouts(t, h.met, "cancelled"); n != 1 {
-		t.Fatalf("quackmux_query_timeouts_total{result=cancelled} = %v, want 1", n)
-	}
+	waitCancels(t, srv, uuidB)
+	waitTimeouts(t, h.met, "cancelled", 1)
 }

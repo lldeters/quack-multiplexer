@@ -732,7 +732,9 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 				g.sessions.ClosedByBackend(sess, e.Message)
 			}
 		}
-		if msg, timedOut := qr.timeoutError(); timedOut && derr == nil && !e.MustInvalidate && !upstream.IsSessionGone(e.Message) {
+		msg, timedOut := qr.timeoutError()
+		qr.finish(ev)
+		if timedOut && derr == nil && !e.MustInvalidate && !upstream.IsSessionGone(e.Message) {
 			// The engine's answer to the query time limit's CANCEL (or a
 			// consequence of it): the client gets the gateway's reason.
 			writeError(w, msg, wire.ExceptionInterrupt, false)
@@ -740,7 +742,6 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 		} else {
 			writeBody(w, body)
 		}
-		qr.finish(ev)
 		g.buffers.Release(n)
 		return outcome
 	}
