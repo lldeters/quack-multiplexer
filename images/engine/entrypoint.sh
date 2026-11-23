@@ -7,18 +7,21 @@
 # QUACKMUX_DATABASE with the DuckDB CLI, loads the quack extension, runs the
 # init SQL and then serves the Quack protocol over plain HTTP on
 # QUACKMUX_BIND:QUACKMUX_PORT (default 0.0.0.0:9494) with the token from
-# QUACK_TOKEN. It stays in the foreground until SIGTERM, SIGINT or SIGHUP and
-# then stops the server gracefully. Run it under an init process that forwards
-# signals (the image uses tini).
+# QUACK_TOKEN. The post-start SQL runs right after the server has started, on
+# the same connection (for settings that would break the start, such as
+# SET enable_external_access = false). It stays in the foreground until
+# SIGTERM, SIGINT or SIGHUP and then stops the server gracefully. Run it under
+# an init process that forwards signals (the image uses tini).
 #
 # The DuckDB CLI has no daemon mode: it serves only while it runs, and it exits
 # as soon as its stdin reaches EOF. Its stdin is therefore a FIFO in a private
 # directory that this script holds open read-write on fd 3, and all statements
-# are written to fd 3 instead of being passed as arguments. The init SQL is
-# handed over as private files that DuckDB reads with .read, so it is executed
-# byte for byte and can contain any quoting. The token is read inside DuckDB
-# with getenv('QUACK_TOKEN'); it never appears in a command line, a statement,
-# a result or a log line. Never enable xtrace (set -x) in this script.
+# are written to fd 3 instead of being passed as arguments. The init and
+# post-start SQL are handed over as private files that DuckDB reads with
+# .read, so they are executed byte for byte and can contain any quoting. The
+# token is read inside DuckDB with getenv('QUACK_TOKEN'); it never appears in
+# a command line, a statement, a result or a log line. Never enable xtrace
+# (set -x) in this script.
 #
 # Every connection can read the last result of the CLI's own connection
 # (FROM _, a replacement scan of the CLI) and the statements the CLI read from
@@ -42,7 +45,7 @@ force_kill=0     # set by a second signal: kill DuckDB without waiting
 workdir=       # private directory with the FIFO, removed once DuckDB serves
 duckdb_pid=    # PID of the DuckDB CLI
 duckdb_status= # exit status of the DuckDB CLI once collected
-serving=0      # 1 once quack_serve has succeeded
+serving=0      # 1 once the server runs and the post-start SQL is done
 
 log() {
 	printf '%s: %s\n' "$prog" "$*" >&2
@@ -123,6 +126,10 @@ read_settings() {
 	if [[ -n $init_sql_file && (! -f $init_sql_file || ! -r $init_sql_file) ]]; then
 		config_error "QUACKMUX_INIT_SQL_FILE '$(printable "$init_sql_file")' is not a readable file"
 	fi
+	post_start_sql_file=${QUACKMUX_POST_START_SQL_FILE:-}
+	if [[ -n $post_start_sql_file && (! -f $post_start_sql_file || ! -r $post_start_sql_file) ]]; then
+		config_error "QUACKMUX_POST_START_SQL_FILE '$(printable "$post_start_sql_file")' is not a readable file"
+	fi
 
 	max_connections=${QUACKMUX_MAX_CONNECTIONS:-}
 	if [[ -n $max_connections ]]; then
@@ -198,11 +205,32 @@ prepare_workdir() {
 	mkfifo -m 0600 "$workdir/stdin"
 }
 
+# read_sql_from_env NAME SQL appends a .read of a private copy of SQL (a
+# script from the environment) to $bootstrap, unless SQL is blank.
+read_sql_from_env() {
+	if [[ $2 =~ [^[:space:]] ]]; then
+		(umask 077 && printf '%s\n' "$2" >"$workdir/$1.sql")
+		bootstrap+=".read $workdir/$1.sql"$'\n'
+	fi
+}
+
+# read_sql_from_file NAME FILE VAR appends a .read of a private copy of FILE
+# (named by the variable VAR) to $bootstrap, unless FILE is empty.
+read_sql_from_file() {
+	if [[ -n $2 ]]; then
+		if ! (umask 077 && cat -- "$2" >"$workdir/$1.sql"); then
+			config_error "cannot read $3 '$(printable "$2")'"
+		fi
+		bootstrap+=".read $workdir/$1.sql"$'\n'
+	fi
+}
+
 # build_bootstrap sets $bootstrap: the commands that prepare DuckDB, run the
-# init SQL (from the environment, then from the file) and start the server.
-# After quack_serve has succeeded, DuckDB creates the marker file "started";
-# with -bail it never gets there if an earlier statement fails. The SELECT that
-# writes the marker replaces the last result (see FROM _ above).
+# init SQL (from the environment, then from the file), start the server and
+# run the post-start SQL (likewise). After the post-start SQL, DuckDB creates
+# the marker file "started"; with -bail it never gets there if an earlier
+# statement fails. The SELECT that writes the marker replaces the last result
+# of the post-start SQL (see FROM _ above).
 build_bootstrap() {
 	local nl=$'\n'
 	bootstrap="SET extension_directories = [$(sql_string "$extension_dir")];$nl"
@@ -217,20 +245,17 @@ build_bootstrap() {
 	if [[ -n $keep_alive_timeout ]]; then
 		bootstrap+="SET GLOBAL quack_server_keep_alive_timeout = $keep_alive_timeout;$nl"
 	fi
-	if [[ ${QUACKMUX_INIT_SQL:-} =~ [^[:space:]] ]]; then
-		(umask 077 && printf '%s\n' "$QUACKMUX_INIT_SQL" >"$workdir/init-env.sql")
-		bootstrap+=".read $workdir/init-env.sql$nl"
-	fi
-	if [[ -n $init_sql_file ]]; then
-		if ! (umask 077 && cat -- "$init_sql_file" >"$workdir/init-file.sql"); then
-			config_error "cannot read QUACKMUX_INIT_SQL_FILE '$(printable "$init_sql_file")'"
-		fi
-		bootstrap+=".read $workdir/init-file.sql$nl"
-	fi
+	read_sql_from_env init-env "${QUACKMUX_INIT_SQL:-}"
+	read_sql_from_file init-file "$init_sql_file" QUACKMUX_INIT_SQL_FILE
 	# quack_serve returns a row that includes the token. Selecting only the
 	# address keeps the token out of the output and out of FROM _.
 	bootstrap+=".output /dev/null$nl"
 	bootstrap+="SELECT listen_uri FROM quack_serve($(sql_string "$uri"), token = getenv('QUACK_TOKEN'), allow_other_hostname = true, disable_ssl = true);$nl"
+	bootstrap+=".output stdout$nl"
+	# The server accepts connections from here on. The post-start SQL runs
+	# right away, but clients may already send queries while it runs.
+	read_sql_from_env post-start-env "${QUACKMUX_POST_START_SQL:-}"
+	read_sql_from_file post-start-file "$post_start_sql_file" QUACKMUX_POST_START_SQL_FILE
 	bootstrap+=".output $workdir/started$nl"
 	bootstrap+="SELECT 'started' AS quackmux_engine;$nl"
 	bootstrap+=".output stdout$nl"
@@ -246,9 +271,10 @@ start_duckdb() {
 	# still opens it for reading below.
 	chmod 0400 "$workdir/stdin"
 	(
-		# The init SQL reaches DuckDB as a file; keep it out of DuckDB's
-		# environment, where SQL users could read it with getenv().
-		unset QUACKMUX_INIT_SQL
+		# The init and post-start SQL reach DuckDB as files; keep them out
+		# of DuckDB's environment, where SQL users could read them with
+		# getenv().
+		unset QUACKMUX_INIT_SQL QUACKMUX_POST_START_SQL
 		exec "$duckdb_bin" -init /dev/null -bail "$database"
 	) <"$workdir/stdin" 3>&- &
 	duckdb_pid=$!
@@ -380,7 +406,8 @@ main() {
 	if ((serving)); then
 		log "serving on $uri over plain HTTP ($(engine_details))"
 		# DuckDB has read everything up to here: drop the FIFO path, the copies
-		# of the init SQL and the marker. fd 3 keeps the FIFO itself open.
+		# of the init and post-start SQL and the marker. fd 3 keeps the FIFO
+		# itself open.
 		rm -rf -- "$workdir"
 		workdir=
 		wait_while_serving
@@ -391,7 +418,7 @@ main() {
 		if ((serving)); then
 			log "DuckDB exited unexpectedly with status $duckdb_status"
 		else
-			log "DuckDB exited with status $duckdb_status before the Quack server was started; see the DuckDB messages above (database, extensions, init SQL)"
+			log "DuckDB exited with status $duckdb_status before the engine was ready; see the DuckDB messages above (database, extensions, init SQL, Quack server, post-start SQL)"
 		fi
 		exit "$(failure_status "$duckdb_status")"
 	fi

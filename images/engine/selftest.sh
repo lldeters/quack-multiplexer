@@ -3,14 +3,15 @@
 # quackmux-engine-selftest - smoke test of the quackmux engine image.
 #
 # Runs the entrypoint in two scenarios: once with the image defaults, once
-# with a database file, init SQL from the environment and from a file, and
-# server settings. Each time it waits until the Quack server answers GET /,
+# with a database file, init and post-start SQL from the environment and from
+# a file, and server settings. Each time it waits until the Quack server
+# answers GET /,
 # checks that the token shows up neither in a process command line nor in the
 # output, stops the engine with SIGTERM and expects exit status 0. In the
 # second scenario a Quack client (the DuckDB CLI of the image) checks what a
 # session of the engine must not get: the token through FROM _ and the
 # standard input of the engine's CLI. Finally it opens the database file and
-# checks that both init scripts ran.
+# checks that all four scripts ran, the post-start SQL while the server ran.
 #
 # The image build runs it (build argument ENGINE_SELFTEST=true). It also works
 # in derived images:
@@ -91,7 +92,7 @@ EOF
 }
 
 # check_duckdb_env fails if a running DuckDB process has VAR in its
-# environment (the entrypoint keeps the init SQL out of it).
+# environment (the entrypoint keeps the init and post-start SQL out of it).
 check_duckdb_env() {
 	local var=$1 proc environ
 	for proc in /proc/[0-9]*; do
@@ -142,6 +143,7 @@ run_scenario() {
 		fail "scenario '$name': the token is visible in a process command line"
 	fi
 	check_duckdb_env QUACKMUX_INIT_SQL
+	check_duckdb_env QUACKMUX_POST_START_SQL
 	if [[ $check != - ]]; then
 		"$check" "$name" "$port" "$out"
 	fi
@@ -165,25 +167,37 @@ cat >"$dir/init.sql" <<'EOF'
 CREATE TABLE selftest_file AS
     SELECT 'it''s from the file' AS s;
 EOF
+cat >"$dir/post-start.sql" <<'EOF'
+-- runs after quack_serve: the server is listed
+CREATE TABLE selftest_post_start_file AS
+    SELECT 'it''s after the start: ' || count(*) AS s FROM quack_server_list();
+EOF
 run_scenario configured 19494 check_session \
 	QUACKMUX_PORT=19494 \
 	QUACKMUX_BIND=0.0.0.0 \
 	QUACKMUX_DATABASE="$dir/selftest.duckdb" \
 	QUACKMUX_INIT_SQL="CREATE TABLE selftest_env AS SELECT 'it''s from the environment' AS s;" \
 	QUACKMUX_INIT_SQL_FILE="$dir/init.sql" \
+	QUACKMUX_POST_START_SQL="CREATE TABLE selftest_post_start_env AS SELECT 'it''s after the start: ' || count(*) AS s FROM quack_server_list();" \
+	QUACKMUX_POST_START_SQL_FILE="$dir/post-start.sql" \
 	QUACKMUX_MAX_CONNECTIONS=64 \
 	QUACKMUX_KEEP_ALIVE_TIMEOUT=300 \
 	QUACKMUX_ENGINE_ID=quack-selftest \
 	QUACKMUX_SHARE_LEVEL=SERVER \
 	QUACKMUX_PROFILE=selftest
 
-# Both init scripts must have run, quotes intact, and the data must be on disk.
+# All four scripts must have run, quotes intact, the post-start SQL while
+# the server was listed, and the data must be on disk.
 if ! result=$("$duckdb_bin" -init /dev/null -bail "$dir/selftest.duckdb" \
-	-c "SELECT s FROM selftest_env UNION ALL SELECT s FROM selftest_file;" 2>&1); then
+	-c "SELECT s FROM selftest_env UNION ALL SELECT s FROM selftest_file UNION ALL SELECT s FROM selftest_post_start_env UNION ALL SELECT s FROM selftest_post_start_file;" 2>&1); then
 	fail "reading the database written by the engine failed: $result"
 fi
 if [[ $result != *"it's from the environment"* || $result != *"it's from the file"* ]]; then
 	fail "the init SQL did not run as expected: $result"
 fi
+if [[ $(grep -c "it's after the start: 1" <<<"$result") != 2 ]]; then
+	fail "the post-start SQL did not run as expected (after the start of the server): $result"
+fi
 say "init SQL from QUACKMUX_INIT_SQL and QUACKMUX_INIT_SQL_FILE ran"
+say "post-start SQL from QUACKMUX_POST_START_SQL and QUACKMUX_POST_START_SQL_FILE ran while the server was running"
 say "OK"

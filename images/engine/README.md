@@ -6,8 +6,9 @@ Veröffentlicht als `ghcr.io/lldeters/duckdb-engine:<duckdb>-<quackmux>` (amd64 
 Aus diesem Image startet quackmux seine Engines. Es enthält die DuckDB-CLI 2.0.0 mit vorinstallierten Extensions
 (`quack`, `httpfs`), `tini` als PID 1 und den Entrypoint `quackmux-engine`. Der Entrypoint setzt den
 Engine-Container-Vertrag aus [`internal/engine/initsql.go`](../../internal/engine/initsql.go) um: Er öffnet die
-Datenbank, führt das Init-SQL aus und startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP. Danach läuft er im
-Vordergrund, bis ein `SIGTERM` kommt. Das Image funktioniert auch ohne Gateway als einzelner Quack-Server.
+Datenbank, führt das Init-SQL aus, startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP und führt danach das
+Post-Start-SQL aus. Dann läuft er im Vordergrund, bis ein `SIGTERM` kommt. Das Image funktioniert auch ohne Gateway
+als einzelner Quack-Server.
 
 | Pfad | Inhalt |
 |---|---|
@@ -28,6 +29,8 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 | `QUACKMUX_DATABASE` | `:memory:` | Datenbank, die DuckDB öffnet: `:memory:` oder ein Dateipfad, z. B. `/data/engine.duckdb`. |
 | `QUACKMUX_INIT_SQL` | – | SQL, das vor dem Start des Servers läuft (`ATTACH`, `CREATE SECRET`, `SET` …). Das Gateway übergibt hier `settings` und `initSQL` des Profils. |
 | `QUACKMUX_INIT_SQL_FILE` | – | Datei mit weiterem Init-SQL. Sie läuft nach `QUACKMUX_INIT_SQL`, z. B. aus einer ConfigMap oder einem Secret. |
+| `QUACKMUX_POST_START_SQL` | – | SQL, das direkt nach dem Start des Servers läuft, etwa `SET enable_external_access = false;` (siehe „Hinweise zum Post-Start-SQL“). Das Gateway übergibt hier `postStartSQL` des Profils. |
+| `QUACKMUX_POST_START_SQL_FILE` | – | Datei mit weiterem Post-Start-SQL. Sie läuft nach `QUACKMUX_POST_START_SQL`. |
 | `QUACKMUX_PORT` | `9494` | Port des Quack-Servers. |
 | `QUACKMUX_BIND` | `0.0.0.0` | Adresse, an die der Server bindet. |
 | `QUACKMUX_EXTENSION_DIR` | `/opt/duckdb/extensions` | Verzeichnis, aus dem DuckDB Extensions lädt. |
@@ -43,8 +46,8 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 1. Der Entrypoint prüft die Variablen. Bei einem Fehler endet er mit Exit-Code 78.
 2. Er legt ein privates Verzeichnis (`mktemp -d`, Modus 0700) mit einer FIFO an, hält sie auf fd 3 read-write offen
    und setzt sie dann auf Modus 0400: Niemand kann sie danach noch zum Schreiben öffnen (siehe „Sicherheit“). Dann
-   startet er `duckdb -init /dev/null -bail <Datenbank>` mit der FIFO als stdin. Das Init-SQL kopiert er in private
-   Dateien (Modus 0600).
+   startet er `duckdb -init /dev/null -bail <Datenbank>` mit der FIFO als stdin. Init- und Post-Start-SQL kopiert er
+   in private Dateien (Modus 0600).
 3. Über die FIFO bekommt DuckDB:
 
    ```sql
@@ -59,17 +62,21 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
    .output /dev/null
    SELECT listen_uri FROM quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
                                       allow_other_hostname = true, disable_ssl = true);
+   .output stdout
+   .read <Kopie von QUACKMUX_POST_START_SQL>
+   .read <Kopie von QUACKMUX_POST_START_SQL_FILE>
    .output <Marker-Datei>
    SELECT 'started' AS quackmux_engine;
    .output stdout
    ```
 
-4. Legt DuckDB die Marker-Datei an, ist alles fehlerfrei gelaufen, denn `-bail` bricht beim ersten Fehler ab. Der
+4. Ab `quack_serve` beantwortet der Server `GET /` ohne Authentifizierung. Das nutzt die Readiness-Probe. Clients
+   können sich also schon verbinden, während das Post-Start-SQL läuft.
+5. Legt DuckDB die Marker-Datei an, ist alles fehlerfrei gelaufen, denn `-bail` bricht beim ersten Fehler ab. Der
    Entrypoint loggt dann `quackmux-engine: serving on quack:0.0.0.0:9494 over plain HTTP (…)` und löscht das
-   Verzeichnis. Die FIFO bleibt über fd 3 offen. Ab jetzt beantwortet der Server `GET /` ohne Authentifizierung. Das
-   nutzt die Readiness-Probe.
-5. Beendet sich DuckDB vorher, etwa wegen eines Fehlers im Init-SQL, meldet der Entrypoint das und endet mit dem
-   Exit-Code von DuckDB, mindestens aber mit 1.
+   Verzeichnis. Die FIFO bleibt über fd 3 offen.
+6. Beendet sich DuckDB vorher, etwa wegen eines Fehlers im Init- oder Post-Start-SQL, meldet der Entrypoint das und
+   endet mit dem Exit-Code von DuckDB, mindestens aber mit 1.
 
 Warum eine FIFO: Die DuckDB-CLI beendet sich beim EOF auf stdin, und Kubernetes liefert ohne `stdin: true` sofort EOF.
 `duckdb -serve` ist kein Daemon-Modus und kann nicht an `0.0.0.0` binden. Über die FIFO landen keine Statements in den
@@ -90,10 +97,32 @@ Prozessargumenten. Das Token liest DuckDB selbst per `getenv('QUACK_TOKEN')`. Vo
   aus. Vorinstallierte Extensions lädt `LOAD` oder Autoload. Weitere Extensions kommen ins Image (siehe unten).
 * `enable_external_access = false` darf nicht im Init-SQL stehen, sonst startet die Engine nicht. Das Token wird
   erst danach per `getenv()` gelesen, DuckDB sperrt `getenv()` ohne External Access, und `quack_serve` braucht
-  selbst Dateizugriff (`$HOME/.duckdb/stored_secrets`). Erst nach `quack_serve` gesetzt, würde es den Server nicht
-  stören. Dafür hat der Entrypoint noch keinen Haken.
+  selbst Dateizugriff (`$HOME/.duckdb/stored_secrets`). Es gehört ins Post-Start-SQL.
 * `SET lock_configuration = true` als letzte Anweisung des Init-SQL funktioniert: Clients verbinden sich und fragen
-  ab, nur ihre eigenen `SET`s schlagen fehl („the configuration has been locked“).
+  ab, nur ihre eigenen `SET`s schlagen fehl („the configuration has been locked“). Zusammen mit
+  `enable_external_access = false` gehört es ans Ende des Post-Start-SQL.
+
+### Hinweise zum Post-Start-SQL
+
+* Es läuft direkt nach `quack_serve` auf derselben Verbindung wie das Init-SQL, ebenfalls als Skript (`.read`). Die
+  Ausgabe landet im Log.
+* Wofür: Einstellungen, die vor `quack_serve` den Start verhindern würden. Für geteilte Engines:
+
+  ```sql
+  SET enable_external_access = false;   -- keine Dateien, kein Netz, kein getenv() für alle Sessions
+  SET lock_configuration = true;        -- danach kein SET und RESET mehr
+  ```
+
+  Der Server läuft damit weiter (Queries, Uploads, Fetches), und auch das Stoppen mit `quack_stop` und
+  `FORCE CHECKPOINT` funktioniert (mit DuckDB 2.0.0 geprüft). `enable_external_access` lässt sich danach nicht wieder
+  einschalten. Ausnahmen erlauben `allowed_paths` (Dateien) und `allowed_directories` (Präfixe von Pfaden und URLs,
+  etwa `['/data/import/', 'https://example.com/daten/']`), gesetzt vor `enable_external_access`. Was das für Clients
+  bedeutet und was es nicht verhindert:
+  [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Härtung geteilter Engines“.
+* Der Server nimmt schon Verbindungen an, während es läuft. Bis zu seinem Ende ist die Engine also nicht gehärtet.
+  Halten Sie es kurz.
+* Der erste Fehler beendet DuckDB und damit die Engine (Exit-Code mindestens 1). Weil `GET /` schon antwortet, kann
+  das Gateway die Engine kurz für bereit gehalten haben; ihre Sessions scheitern dann.
 
 ## Stoppen
 
@@ -255,9 +284,10 @@ Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
 
 ## Sicherheit
 
-* Token und Init-SQL stehen nie in Prozessargumenten oder Logs. Der Entrypoint kopiert das Init-SQL in private
-  Dateien, die er löscht, sobald der Server läuft, und hält `QUACKMUX_INIT_SQL` aus der Umgebung von DuckDB
-  heraus. Der Kubernetes-Provider liefert beide aus dem Secret der Engine, nicht als Klartext in der Pod-Spec.
+* Token, Init- und Post-Start-SQL stehen nie in Prozessargumenten oder Logs. Der Entrypoint kopiert das SQL in
+  private Dateien, die er löscht, sobald die Engine bereit ist, und hält `QUACKMUX_INIT_SQL` und
+  `QUACKMUX_POST_START_SQL` aus der Umgebung von DuckDB heraus. Der Kubernetes-Provider liefert alle drei aus dem
+  Secret der Engine, nicht als Klartext in der Pod-Spec.
 * Clients einer Engine führen beliebiges SQL als Engine-Benutzer aus. Mit External Access, dem DuckDB-Default,
   können sie Dateien und die Umgebung der Prozesse im Container lesen, also `QUACK_TOKEN` und auch das Init-SQL
   (die Umgebung von tini, etwa per `read_text('/proc/1/environ')`). Deshalb darf nur das Gateway Port 9494
