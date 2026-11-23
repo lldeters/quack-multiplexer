@@ -65,7 +65,7 @@ func helperCommand(name string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-var serveRE = regexp.MustCompile(`^CALL quack_serve\('quack:([^']+)', token = '([^']*)', disable_ssl = true, allow_other_hostname = (true|false)\);$`)
+var serveRE = regexp.MustCompile(`^SELECT listen_uri FROM quack_serve\('quack:([^']+)', token = getenv\('QUACK_TOKEN'\), disable_ssl = true, allow_other_hostname = (true|false)\);$`)
 
 type received struct {
 	Args   []string `json:"args"`
@@ -126,7 +126,7 @@ func fakeEngine() int {
 				return 1
 			case strings.Contains(line, "helper:ignore-eof"):
 				ignoreEOF = true
-			case strings.HasPrefix(line, "CALL quack_serve("):
+			case strings.Contains(line, "quack_serve("):
 				m := serveRE.FindStringSubmatch(line)
 				switch {
 				case m == nil:
@@ -134,9 +134,6 @@ func fakeEngine() int {
 					return 3
 				case prev != ".output "+os.DevNull:
 					fmt.Fprintf(os.Stderr, "fake engine: quack_serve not preceded by .output %s\n", os.DevNull)
-					return 3
-				case m[2] != token:
-					fmt.Fprintln(os.Stderr, "fake engine: quack_serve token differs from QUACK_TOKEN")
 					return 3
 				}
 				mu.Lock()
@@ -434,8 +431,8 @@ func TestEngineLifecycle(t *testing.T) {
 
 	rcv := fetchReceived(t, ready.Endpoint)
 	wantScript := "SET threads = '2';\nSELECT 42;\n.output " + os.DevNull + "\n" +
-		"CALL quack_serve('quack:127.0.0.1:" + port + "', token = '" + req.Token +
-		"', disable_ssl = true, allow_other_hostname = false);\n.output stdout\n"
+		"SELECT listen_uri FROM quack_serve('quack:127.0.0.1:" + port + "', token = getenv('QUACK_TOKEN')" +
+		", disable_ssl = true, allow_other_hostname = false);\n.output stdout\n"
 	if rcv.Script != wantScript {
 		t.Fatalf("script:\n%s\nwant:\n%s", rcv.Script, wantScript)
 	}
@@ -514,8 +511,8 @@ func TestTokenNeverOnCommandLine(t *testing.T) {
 	h := newHarness(t, 2, WithCommand(capture))
 	req := h.request(t, config.Profile{InitSQL: "SELECT 1"})
 	h.launch(t, req)
-	// The fake engine only serves if the token of the quack_serve statement
-	// (read from stdin) equals QUACK_TOKEN.
+	// The fake engine only serves if QUACK_TOKEN is set and the quack_serve
+	// statement reads the token from it.
 	h.rec.wait(t, req.ID, engine.PhaseReady)
 
 	mu.Lock()

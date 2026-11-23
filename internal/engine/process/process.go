@@ -407,7 +407,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 	inst := pr.inst
 	p.mu.Unlock()
 	p.log.Info("engine process started", "engine", req.ID, "pid", pid, "port", port, "dir", pr.scratch)
-	go p.supervise(pr, serveScript(req.Profile, p.bindHost, port, req.Token))
+	go p.supervise(pr, serveScript(req.Profile, p.bindHost, port))
 	return inst, nil
 }
 

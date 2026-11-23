@@ -12,23 +12,35 @@
 // in it, with the child's standard input connected to a pipe that the
 // provider keeps open for the whole lifetime of the engine. All SQL travels
 // through that pipe and never through the command line or the environment,
-// where other local users or processes could read it (the token and the
-// profile's init SQL may carry credentials):
+// where other local users or processes could read it (the profile's init
+// and post-start SQL may carry credentials):
 //
 //	<engine.RenderInitSQL(profile)>
 //	.output NUL                      (/dev/null outside Windows)
-//	CALL quack_serve('quack:<bindHost>:<port>', token = '<token>',
-//	                 disable_ssl = true, allow_other_hostname = <bool>);
+//	SELECT listen_uri FROM quack_serve('quack:<bindHost>:<port>',
+//	    token = getenv('QUACK_TOKEN'), disable_ssl = true,
+//	    allow_other_hostname = <bool>);
+//	.output stdout
+//	<engine.RenderPostStartSQL(profile)>   (only with post-start SQL:)
+//	.output NUL
+//	SELECT 'started' AS quackmux_engine;
 //	.output stdout
 //
-// The .output commands send the row that quack_serve returns (it contains the
-// token) nowhere. allow_other_hostname is false only for localhost, 127.0.0.1
-// and ::1, the addresses quack_serve accepts by default. quack_serve returns
-// at once and serves from a background thread, while the CLI waits for more
-// input. -bail makes the CLI exit on the first failing statement, so a broken
-// init SQL or an unavailable port ends the process instead of leaving a
-// half-initialized engine behind. Like every DuckDB CLI started without
-// -init, the engine also runs the user's ~/.duckdbrc first.
+// The token reaches the CLI through its environment (QUACK_TOKEN, see
+// below), not through the pipe: every connection of the engine can read the
+// lines that the CLI read from its standard input (shell_history()), and
+// with them the init and post-start SQL. For the same reason only the
+// address of the row that quack_serve returns is selected, with the output
+// going nowhere: every connection can read the CLI's last result (FROM _),
+// which the final SELECT also replaces after the post-start SQL.
+// allow_other_hostname is false only for localhost, 127.0.0.1 and ::1, the
+// addresses quack_serve accepts by default. quack_serve returns at once and
+// serves from a background thread, while the CLI runs the post-start SQL
+// and waits for more input. -bail makes the CLI exit on the first failing
+// statement, so a broken init or post-start SQL or an unavailable port ends
+// the process instead of leaving a half-initialized engine behind. Like
+// every DuckDB CLI started without -init, the engine also runs the user's
+// ~/.duckdbrc first.
 //
 // A relative database path is resolved against the scratch directory and is
 // therefore deleted together with the engine; use an absolute path for data
@@ -47,18 +59,19 @@
 // skipped with a warning), then the engine container contract of package
 // engine: QUACK_TOKEN, QUACKMUX_DATABASE, QUACKMUX_PORT, QUACKMUX_ENGINE_ID,
 // QUACKMUX_SHARE_LEVEL, QUACKMUX_OWNER, QUACKMUX_SUBDOMAIN and
-// QUACKMUX_PROFILE. QUACKMUX_INIT_SQL is deliberately not set: the init SQL
-// goes through standard input.
+// QUACKMUX_PROFILE. QUACKMUX_INIT_SQL and QUACKMUX_POST_START_SQL are
+// deliberately not set: the SQL goes through standard input.
 //
 // # Readiness and failure
 //
 // Every 200ms the provider sends GET / to the engine, which the Quack server
 // answers with its banner and HTTP 200 without authentication. The first
-// success reports PhaseReady with the endpoint. If the process exits first,
-// or later without being asked to, the provider reports PhaseFailed with the
-// exit status and the last 2 KiB of the engine's combined stdout and stderr
-// (the token redacted). A failed engine keeps its scratch directory for
-// inspection until the manager terminates it (engine.failedRetention).
+// success reports PhaseReady with the endpoint, possibly while the
+// post-start SQL still runs. If the process exits first, or later without
+// being asked to, the provider reports PhaseFailed with the exit status and
+// the last 2 KiB of the engine's combined stdout and stderr (the token
+// redacted). A failed engine keeps its scratch directory for inspection
+// until the manager terminates it (engine.failedRetention).
 //
 // # Termination
 //

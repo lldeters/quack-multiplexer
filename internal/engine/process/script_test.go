@@ -17,26 +17,34 @@ import (
 
 func TestServeScript(t *testing.T) {
 	prof := config.Profile{InitSQL: "ATTACH 'lake.db' AS lake;", Settings: map[string]string{"memory_limit": "1GB"}}
-	got := serveScript(prof, "127.0.0.1", 19500, "it's-a-token")
+	got := serveScript(prof, "127.0.0.1", 19500)
 	want := "SET memory_limit = '1GB';\nATTACH 'lake.db' AS lake;\n" +
 		".output " + os.DevNull + "\n" +
-		"CALL quack_serve('quack:127.0.0.1:19500', token = 'it''s-a-token', disable_ssl = true, allow_other_hostname = false);\n" +
+		"SELECT listen_uri FROM quack_serve('quack:127.0.0.1:19500', token = getenv('QUACK_TOKEN'), disable_ssl = true, allow_other_hostname = false);\n" +
 		".output stdout\n"
 	if got != want {
 		t.Fatalf("script:\n%s\nwant:\n%s", got, want)
 	}
+	// The post-start SQL follows the start of the server; a harmless SELECT
+	// replaces its last result, which every connection can read (FROM _).
+	prof.PostStartSQL = "SET enable_external_access = false;\nSET lock_configuration = true"
+	want += "SET enable_external_access = false;\nSET lock_configuration = true;\n" +
+		".output " + os.DevNull + "\nSELECT 'started' AS quackmux_engine;\n.output stdout\n"
+	if got := serveScript(prof, "127.0.0.1", 19500); got != want {
+		t.Fatalf("script with post-start SQL:\n%s\nwant:\n%s", got, want)
+	}
 	for host, other := range map[string]bool{
 		"localhost": false, "LOCALHOST": false, "::1": false, "0.0.0.0": true, "192.168.1.10": true, "::": true, "devbox": true,
 	} {
-		s := serveScript(config.Profile{}, host, 1, "t")
+		s := serveScript(config.Profile{}, host, 1)
 		if !strings.Contains(s, "allow_other_hostname = "+map[bool]string{true: "true", false: "false"}[other]) {
 			t.Errorf("%s: %s", host, s)
 		}
 	}
-	if s := serveScript(config.Profile{}, "::1", 19500, "t"); !strings.Contains(s, "'quack:[::1]:19500'") {
+	if s := serveScript(config.Profile{}, "::1", 19500); !strings.Contains(s, "'quack:[::1]:19500'") {
 		t.Errorf("IPv6 address must be bracketed: %s", s)
 	}
-	if s := serveScript(config.Profile{}, "localhost", 1, "t"); !strings.HasPrefix(s, ".output ") {
+	if s := serveScript(config.Profile{}, "localhost", 1); !strings.HasPrefix(s, ".output ") {
 		t.Errorf("without settings and init SQL the script starts with .output: %q", s)
 	}
 }
