@@ -131,3 +131,36 @@ docker compose and kind (Kubernetes v1.37). Recordings of the traffic are fixtur
   - `quack_stop(…)` stays callable by any session, with or without a locked configuration.
 - **Kubernetes.** From Kubernetes 1.35 on the kubelet refuses hosts with cgroup v1 (`failCgroupV1: true`); kind needs
   a KubeletConfiguration patch there (`test/e2e/README.md`).
+
+## Query lifecycle and CANCEL (checked against DuckDB v2.0.0, 2026-11-23)
+
+The facts behind the query time limit (`internal/proxy/querylimit.go`). Source: `quack_server.cpp`
+(`HandleMessageInternal`, `AbortStatement`), `quack_scan.cpp`, `quack_fetch_ahead.cpp`; probes with raw Quack
+messages against the engine image and runs of the DuckDB 2.0 CLI through the gateway.
+
+- **One statement per connection.** Every PREPARE replaces the connection's statement (`AbortStatement`, also with
+  `query_uuid {0,0}`), but only after `quack_authorization_function` allowed it; a PREPARE that is denied or cannot be
+  decoded leaves the running statement alone. The replaced PREPARE gets `INTERRUPT` "superseded by a new query",
+  later FETCHes of its uuid "Result has been closed".
+- **CANCEL.** `{0,0}` cancels whatever runs. Another uuid must be the uuid of the connection's statement, else the
+  answer is "Attempted to cancel a different query with id '…' instead of '…'" and nothing happens. The statement keeps
+  its uuid after it finished, so a CANCEL with the uuid of a finished query succeeds. A waiting PREPARE and every
+  waiting FETCH get `INTERRUPT` "Interrupted: query was cancelled" at once, later FETCHes of the uuid the same error;
+  the next PREPARE works. The upload streams of the statement are closed.
+- **Idle CANCEL is harmless.** A CANCEL (own uuid or `{0,0}`) on a connection whose query is over, also inside
+  `BEGIN … COMMIT`, does not affect the next statement or the commit. Cancelling a running query inside a transaction
+  aborts it ("Current transaction is aborted (please ROLLBACK)"); the transaction is rolled back.
+- **End of a result.** PREPARE answers once `quack_prepare_inline_rows` rows or the end are there; `needs_more_fetch`
+  (field 3) follows the result types (field 1, `vector<LogicalType>` with nested type infos and values), so a proxy
+  needs a full LogicalType decoder to read it. A FETCH beyond the last batch gets `FETCH_RESPONSE` without
+  `chunk_count` (body `02 00 <total> ff ff`); a data batch starts `01 00 <chunk_count> 03 00 <batch_index> ff ff`.
+  FETCH with batch index 0 gets "FETCH_REQUEST is missing its batch index".
+- **Client.** Each query has a random uuid. The fetcher sends read-ahead FETCHes (16 with 4 cores) and finishes a
+  scan only when every one is answered, so late read-aheads do not overlap the next query. A scan that stops early
+  sends CANCEL with its uuid (`~QuackScanBindData`), except catalog scans, whose bind data keeps uuid `{0,0}`.
+- **Where long queries meet the limit.** DuckDB 2.0 pushes `count(*)` and other expressions over `remote.query(…)`
+  into the engine, and results are cut into batches of up to 32 MiB (`quack_target_batch_bytes`), emitted in order:
+  a long query usually still waits in its PREPARE when the limit passes. A FETCH-phase timeout needs a result the
+  client must pull itself, e.g. a join of a remote scan with a local table.
+- **Engine-side alternative.** `SET max_execution_time = <ms>` makes the engine end a query with `INTERRUPT` "Query
+  exceeded maximum execution time"; a client can change it with `SET` unless the configuration is locked.

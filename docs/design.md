@@ -216,6 +216,62 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   `podTemplate`) entfernt das Gateway; startet der Container trotzdem neu (`restartCount > 0`, etwa durch einen
   Mutating Webhook), gilt die Engine als ausgefallen.
 
+### 5.3 Query-Zeitlimit
+
+`limits.queryTimeout` (Default `0s`, aus) begrenzt, wie lange eine Query laufen darf. `profiles.<name>.queryTimeout`
+und `overrides[].queryTimeout` ersetzen den Wert: Es gilt der erste passende Override, wenn er einen Wert setzt, sonst
+das Profil, sonst `limits.queryTimeout`; `0s` schaltet das Limit ab. Das Limit ist eine Policy, die der Betreiber
+einschaltet, kein Transport-Timeout: PREPARE, FETCH und SEND_DATA bleiben ohne eigene Deadline. Ohne Limit verfolgt
+das Gateway keine Queries.
+
+* **Was zählt:** von der Weiterleitung des `PREPARE_REQUEST` bis zum Ende der Query. Die Zeit, die der Client zwischen
+  FETCHes oder Uploads verbringt, zählt mit: So lange belegt die Query ihre Engine-Verbindung, ihre Transaktion und
+  ihren Ergebnispuffer. Auch Katalog-Queries (`query_uuid {0,0}`) zählen, die `query_uuid` wählt der Client.
+* **Ende einer Query:** Das Gateway verfolgt die Queries einer Session über ihre `query_uuid` und glaubt nur Antworten
+  der Engine. Eine Query endet, wenn
+  * ihr PREPARE mit einem Fehler beantwortet wird;
+  * ein späteres PREPARE der Session ein Ergebnis bekommt (die Engine ersetzt damit die Query davor);
+  * ein FETCH die abschließende `FETCH_RESPONSE` ohne Chunks bekommt (das Ergebnis ist vollständig) oder, wenn die
+    Engine den FETCH sicher dekodiert hat, einen Fehler;
+  * ein CANCEL des Clients für sie (oder für die laufende Query) gelingt;
+  * die Session schließt.
+
+  Ein Client kann die Uhr einer laufenden Query so nicht anhalten, auch nicht mit einem PREPARE, das die Engine
+  ablehnt, bevor es läuft.
+* **Ruhende Queries:** Ob eine `PREPARE_RESPONSE` das ganze Ergebnis enthält (`needs_more_fetch`), sieht das Gateway
+  nicht: Das Feld steht hinter den Spaltentypen, die es nicht dekodiert. Eine beantwortete Query, für die der Client
+  nichts mehr schickt, ruht deshalb. Läuft ihr Limit ab, passiert nichts; schickt der Client danach einen FETCH oder
+  Upload für sie, bricht das Gateway sie sofort ab. Fertige Queries, etwa kleine Ergebnisse (bis 24 576 Zeilen
+  inline), bekommen so nie ein CANCEL.
+* **Durchsetzung:** ein Timer pro Query. Läuft er ab, sendet das Gateway `CANCEL` mit der `query_uuid` (mit `{0,0}`
+  nur, wenn die Query die neueste der Session ist). Die Engine bricht die Query ab und beantwortet die Requests, die
+  auf sie warten (PREPARE, FETCH-Long-Polls), mit einem `INTERRUPT`-Fehler, Uploads mit einem Fehler. Das Gateway
+  ersetzt diese Fehler durch seinen eigenen, wie jeden Fehler mit HTTP 200 als `ERROR_RESPONSE`:
+  `quackmux: the query ran longer than its time limit of 30m0s (profiles.adhoc.queryTimeout) and was cancelled`
+  (Typ `INTERRUPT`, ohne `must_invalidate`). Bestätigt die Engine das CANCEL nicht, beantwortet das Gateway die
+  wartenden Requests selbst. Spätere FETCHes und Uploads der Query beantwortet es, ohne die Engine zu fragen.
+  Erfolgreiche Antworten ersetzt es nie: Eine Query, die gerade noch fertig wurde, liefert ihr Ergebnis, und bei DML
+  gilt, was die Engine meldet. Ein PREPARE der Session wartet, bis die Engine das CANCEL beantwortet hat; sonst könnte
+  es die nächste Query treffen. Hat die Engine das PREPARE noch nicht zur Anweisung der Verbindung gemacht (es wird
+  noch gelesen oder autorisiert), wiederholt das Gateway das CANCEL bis zu 5 s lang.
+* **Folgen für den Client:** Die Session bleibt nutzbar, die nächste Query läuft. In einer offenen Transaktion bricht
+  der Abbruch die Transaktion ab („Current transaction is aborted (please ROLLBACK)“), wie jeder Abbruch.
+* **Neustart und Failover:** Die Queries leben nur im Speicher des Gateways. Kommt ein FETCH für eine Query, die das
+  Gateway nicht kennt (begonnen vor dem Neustart), zählt ihr Limit ab da. Übernommene Sessions kennen ihre Gruppen
+  nicht, die versiegelte ID enthält sie nicht: Für sie gelten nur Overrides mit `users`.
+* **Herunterfahren:** `AbortQueries` beantwortet auch ein PREPARE, das noch auf ein CANCEL wartet („the gateway is
+  shutting down; the query did not run“).
+* **Speicher:** pro Session mit Limit ein Eintrag mit ihren offenen Queries (höchstens eine ruhende), ein Timer je
+  Query. Der Eintrag verschwindet, sobald die letzte Query endet oder die Session schließt.
+* **Beobachtung:** `quackmux_query_timeouts_total{profile,result}` (`cancelled`: die Engine hat bestätigt, oder die
+  Query hatte sie noch nicht erreicht; `failed`: das CANCEL ist gescheitert), Requests mit
+  `outcome="query_timeout"`, die Log-Zeile `query cancelled at its time limit` und mit `audit.enabled` die Audit-Zeile
+  `query timeout` (Benutzer, Session, Engine, `queryUuid`, `clientQueryId`, Limit, Quelle, Dauer, Ergebnis des
+  CANCEL).
+
+DuckDB 2.0 schiebt ganze Queries samt Aggregaten zur Engine, und viele lange Queries liefern ihr erstes Batch spät
+(Batches bis 32 MiB). Das Limit trifft sie deshalb meist schon während des PREPARE.
+
 ## 6. Neustart und Hochverfügbarkeit
 
 * **Engine-Discovery:** Beim Start listet das Gateway alle Pods mit `app.kubernetes.io/managed-by=quackmux,
@@ -378,6 +434,7 @@ Weitere Provider:
       haben, über alle Share-Levels. Sonst könnte jeder Benutzer SERVER- oder GROUP-Engines für beliebige
       Subdomains starten, bis `maxEngines` alle anderen aussperrt.
     * `maxStartingEngines`
+    * `queryTimeout`: Zeitlimit pro Query, auch je Profil und Override (Abschnitt 5.3)
 * Isolation: Bei `GROUP`/`SERVER` teilen sich Benutzer denselben Datenbankzustand und dieselben Rechte der
   Engine. Wer Mandantentrennung braucht, nutzt `USER` oder `CONNECTION`.
 
@@ -401,12 +458,14 @@ Weitere Provider:
     `quackmux_engine_start_seconds`
   * `quackmux_requests_total{type,outcome}`, `quackmux_request_seconds{type}`, `quackmux_bytes_total{direction}`
   * `quackmux_auth_failures_total{reason}`
+  * `quackmux_query_timeouts_total{profile,result}`: Queries, die das Zeitlimit abgebrochen hat (Abschnitt 5.3)
   * mit HA: `quackmux_is_leader`, `quackmux_leader_label`, `quackmux_leader_label_updates_total{action,result}`;
     Requests, die bei einem Follower ankommen, zählen mit `outcome="not_leader"`
 * **Audit-Log** (optional): jede Query (`PREPARE_REQUEST`) mit User, Session, Engine, `client_query_id` und
   gekürztem SQL als strukturierte Logzeile. Statements, die Zugangsdaten enthalten können (`CREATE SECRET`,
   `secret`, `passw`, `pwd`, `token`, `AccountKey`, `sig=` irgendwo im Text, URLs mit Benutzer und Passwort), loggt
-  das Gateway ohne ihren Text (`redacted=true`). Die Erkennung ist bewusst grob und schwärzt im Zweifel.
+  das Gateway ohne ihren Text (`redacted=true`). Die Erkennung ist bewusst grob und schwärzt im Zweifel. Bricht das
+  Query-Zeitlimit eine Query ab, folgt eine Zeile `query timeout` mit derselben `clientQueryId`.
 * **CORS**: wie der Stock-Server (`OPTIONS /quack`, `Access-Control-Allow-Origin`), für DuckDB-Wasm. Requests mit
   einem `Origin`-Header (Browser senden ihn bei jedem POST, die DuckDB-Clients nie) aus nicht erlaubten Origins
   lehnt das Gateway ab. Default ist `["*"]`, mit `auth.mode: none` aber keiner: Sonst könnte jede Webseite über
@@ -420,5 +479,11 @@ Weitere Provider:
   Extra-Header. Dort Token-Optionen nutzen.
 * Das Gateway prüft kein SQL. Autorisierung innerhalb geteilter Engines bleibt Sache der Engine (Init-SQL,
   Rechte der angehängten Daten) oder der Wahl des Share-Levels.
+* Query-Zeitlimit (Abschnitt 5.3): Eine beantwortete Query, für die der Client nichts mehr schickt, bricht das
+  Gateway erst beim nächsten Request für sie ab; ein Ergebnis, das nie abgeholt wird, belegt die Engine bis zur
+  nächsten Query der Session oder bis die Session endet. Scheitert das CANCEL, bekommt der Client trotzdem den Fehler,
+  die Query kann aber auf der Engine weiterlaufen. Uploads, die vor einem Gateway-Neustart begannen, zählen erst ab
+  dem FETCH ihres Ergebnisses. Für Sessions, die nach einem Neustart übernommen wurden, gelten keine Overrides nach
+  Gruppen.
 * Der Client verlangt eine exakte Protokollversion (3). Neue Quack-Versionen erfordern ein Gateway-Update. Das
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.

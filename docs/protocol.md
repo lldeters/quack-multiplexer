@@ -101,8 +101,21 @@ Beispiel `CONNECTION_REQUEST`-Header: `01 00 01 03 00 ff ff ff ff ff ff ff ff ff
 * **FETCH:** Blockiert serverseitig, bis der angeforderte Batch fertig ist. Wiederholt der Client einen Request
   (gleicher `batch_index`), bekommt er denselben Batch; bestätigte Batches (`ack_index`) gibt der Server frei.
   Batches sind standardmäßig bis zu 32 MiB groß (`quack_target_batch_bytes`).
-* **PREPARE** ersetzt die vorherige Query der Verbindung (Abbruch + neuer Treiber-Thread). Bis zu 24 576 Zeilen
-  kommen inline in der Antwort (`quack_prepare_inline_rows`).
+* **PREPARE** ersetzt die vorherige Query der Verbindung (Abbruch + neuer Treiber-Thread), auch eines mit
+  `query_uuid {0,0}`, aber erst, nachdem `quack_authorization_function` es zugelassen hat. Die ersetzte Query
+  bekommt `INTERRUPT` „superseded by a new query“, ihre späteren FETCHes „Result has been closed“. Bis zu 24 576
+  Zeilen kommen inline in der Antwort (`quack_prepare_inline_rows`); das PREPARE antwortet erst, wenn diese Zeilen
+  oder das Ende des Ergebnisses da sind.
+* **Ende eines Ergebnisses:** `PREPARE_RESPONSE` mit `needs_more_fetch = false` (das Feld steht hinter den
+  Spaltentypen) oder die abschließende `FETCH_RESPONSE` für einen Batch hinter dem letzten: ohne `chunk_count`, nur mit
+  `total_batches`. Der Client holt mit parallelen Read-Aheads (16 bei 4 Kernen) und beendet einen Scan erst, wenn alle
+  beantwortet sind. Bricht er einen Scan ab, schickt er `CANCEL` mit der `query_uuid` (nicht bei Katalog-Scans).
+* **CANCEL:** `query_uuid {0,0}` bricht ab, was gerade läuft; eine andere uuid nur die Query, die gerade die Anweisung
+  der Verbindung ist, sonst „Attempted to cancel a different query with id …“. Wartende PREPAREs und FETCHes der
+  Query bekommen `INTERRUPT` „Interrupted: query was cancelled“, spätere FETCHes derselben uuid ebenso; Uploads
+  scheitern, weil die Engine die Datenströme der Query schließt.
+  Ein CANCEL auf eine ruhende Verbindung schadet nicht, auch nicht in einer offenen Transaktion; eine abgebrochene
+  laufende Query bricht die Transaktion ab (gegen DuckDB v2.0.0 geprüft).
 * **Katalog-Traffic** beim `ATTACH` nutzt `query_uuid = {0,0}`.
 
 ## Was quackmux daraus macht
@@ -118,3 +131,4 @@ Beispiel `CONNECTION_REQUEST`-Header: `01 00 01 03 00 ff ff ff ff ff ff ff ff ff
 | Lease-Pflege | Das Gateway beobachtet `lastSeen` und schickt bei Ablauf ein `DISCONNECT`, damit die Engine aufräumt. |
 | Verbindungsabbrüche | Ein Request, der schon gelesen wurde, bekommt immer eine Antwort, notfalls einen Quack-Fehler. libcurl könnte den POST sonst wiederholen und eine Query doppelt ausführen. |
 | Puffern | Nachrichten bis 100 MiB (Request) bzw. 64 MiB (Response) werden vollständig gepuffert. Das Budget liegt bei 1 GiB. Ein langsamer Client bringt damit nie den 5-s-Timeout der Engine zum Auslösen. |
+| Query-Zeitlimit | Optional (`limits.queryTimeout`). Das Gateway liest die `query_uuid` aus PREPARE, FETCH und CANCEL und den Kopf der `FETCH_RESPONSE`, schickt nach Ablauf `CANCEL` mit der `query_uuid` und beantwortet die Requests der Query mit einem eigenen `ERROR_RESPONSE` (siehe [Design, 5.3](design.md#53-query-zeitlimit)). |
