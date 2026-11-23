@@ -427,3 +427,58 @@ func TestNoQueryTimeoutByDefault(t *testing.T) {
 		t.Fatalf("%d sessions, %d queries followed without a limit", s, q)
 	}
 }
+
+// Without buffering the uuid of a PREPARE passes the gateway while the body
+// streams to the engine, and the uuid of a FETCH is read from the start of
+// its body.
+func TestQueryTimeoutWithStreamedRequests(t *testing.T) {
+	h := newHarness(t, `
+limits: {queryTimeout: 300ms}
+server: {upstream: {maxBufferedRequestBytes: -1}}
+`, nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	mustTimeout(t, h.prepare(c, "SLEEP 30000", uuidA), "300ms", "limits.queryTimeout")
+	mustType(t, h.prepare(c, "STREAM 3 60000", uuidB), wire.TypePrepareResponse)
+	mustTimeout(t, h.fetch(c, uuidB, 1), "300ms", "limits.queryTimeout")
+	if got := cancels(srv); len(got) != 2 || got[0] != uuidA || got[1] != uuidB {
+		t.Fatalf("engine got CANCEL for %v, want [%v %v]", got, uuidA, uuidB)
+	}
+}
+
+// A query with the zero uuid (the client's catalog traffic) has a limit too;
+// the gateway cancels it with the wildcard, which is safe while it is the
+// newest query of the session.
+func TestQueryTimeoutForTheZeroUUID(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	mustTimeout(t, h.prepare(c, "SLEEP 30000", wire.Hugeint{}), "300ms", "limits.queryTimeout")
+	if got := cancels(srv); len(got) != 1 || !got[0].IsZero() {
+		t.Fatalf("engine got CANCEL for %v, want the zero uuid", got)
+	}
+}
+
+// Two PREPAREs of a session at once: the engine runs the later one and
+// interrupts the other, whose error passes unchanged; the limit applies to
+// the one that runs.
+func TestQueryTimeoutWithConcurrentPrepares(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 600ms}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	srv.Supersede = true
+	first := make(chan []byte, 1)
+	go func() { first <- h.prepare(c, "SLEEP 30000", uuidA) }()
+	eventually(t, "the first PREPARE at the engine", func() bool { return h.gw.InFlight() == 1 })
+	time.Sleep(100 * time.Millisecond)
+	second := make(chan []byte, 1)
+	go func() { second <- h.prepare(c, "SLEEP 30000", uuidB) }()
+	mustError(t, wait(t, "the superseded PREPARE", first), quacktest.MsgSuperseded)
+	mustTimeout(t, wait(t, "the second PREPARE", second), "600ms", "limits.queryTimeout")
+	if got := cancels(srv); len(got) != 1 || got[0] != uuidB {
+		t.Fatalf("engine got CANCEL for %v, want [%v]", got, uuidB)
+	}
+	if n := timeouts(t, h.met, "cancelled"); n != 1 {
+		t.Fatalf("quackmux_query_timeouts_total{result=cancelled} = %v, want 1", n)
+	}
+}

@@ -638,6 +638,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 	uc := g.cfg.Server.Upstream
 	upReq, err := upstream.NewRequest(upCtx, target.Endpoint, in, contentLength)
 	if err != nil {
+		qr.finish(evFailed)
 		writeError(w, "quackmux: "+err.Error(), wire.ExceptionConnection, false)
 		return "internal"
 	}
@@ -701,8 +702,10 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 	case wire.TypePrepareResponse:
 		ev = evResult
 	case wire.TypeFetchResponse:
-		if f, err := wire.DecodeFetchResponseHead(p); qr != nil && err == nil && f.Terminal() {
-			ev = evComplete
+		if qr != nil {
+			if f, err := wire.DecodeFetchResponseHead(p); err == nil && f.Terminal() {
+				ev = evComplete
+			}
 		}
 	}
 	if n := resp.ContentLength; respType == wire.TypeErrorResponse && n >= 0 && n <= maxInspectedErrorBytes && g.buffers.TryAcquire(n) {
