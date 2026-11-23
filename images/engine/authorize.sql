@@ -9,6 +9,10 @@
 --   postStartSQL: SET enable_external_access = false;
 --                 SET lock_configuration = true;
 --
+-- Read it before any USE in the init SQL: the server looks the function up
+-- on a new connection, in the default database. Created elsewhere, every
+-- query fails ("quackmux_authorize does not exist").
+--
 -- The Quack server calls the function for every query of a client (every
 -- PREPARE, also the catalog queries of ATTACH) with the connection id and the
 -- SQL text, on a connection of its own. The query runs only if the function

@@ -877,7 +877,9 @@ Die Teile brauchen einander:
    * `schema` mit später `system`.
 
    Bis das `postStartSQL` beide Einstellungen gesetzt hat, lehnt es jede Anfrage ab: Vorher ist die Engine nicht
-   gehärtet, und mit Dateizugriff ließe sich eine Textprüfung umgehen. Abgelehnte Anfragen scheitern beim Client
+   gehärtet, und mit Dateizugriff ließe sich eine Textprüfung umgehen. Das `.read` gehört vor ein `USE` im
+   `initSQL`: Der Quack-Server sucht die Funktion auf einer neuen Verbindung in der Default-Datenbank, sonst
+   scheitert jede Anfrage („quackmux_authorize does not exist“). Abgelehnte Anfragen scheitern beim Client
    mit `Authorization callback failed: … quackmux_authorize: not allowed on this engine: "quack_stop"` bzw.
    `… the engine is not hardened yet …; try again`.
 
