@@ -188,8 +188,9 @@ ATTACH 'quack:quackmux.quackmux.svc.cluster.local:9494' AS lake (DISABLE_SSL tru
 ### Von außen: L4-Load-Balancer
 
 `base/service.yaml` enthält auskommentiert den Service `quackmux-external` vom Typ `LoadBalancer` (nur Port
-9494, `externalTrafficPolicy: Local`). Übernehmen Sie ihn in Ihr Overlay. Mit Plain HTTP gehen die Tokens im
-Klartext über das Netz; außerhalb vertrauenswürdiger Netze gehört TLS davor:
+9494, `externalTrafficPolicy: Local`). Übernehmen Sie ihn in Ihr Overlay; mit `overlays/ha` gehört
+`quackmux.io/leader: "true"` in seinen Selektor, sonst erreicht er auch den Follower (siehe „Hochverfügbarkeit“).
+Mit Plain HTTP gehen die Tokens im Klartext über das Netz; außerhalb vertrauenswürdiger Netze gehört TLS davor:
 
 * **TLS am Load Balancer:** Ein L4-Load-Balancer (TCP), der TLS terminiert und auf Port 9494 der Pods
   weiterleitet. Die Clients verbinden sich dann ohne `DISABLE_SSL`.
@@ -227,8 +228,8 @@ Klartext über das Netz; außerhalb vertrauenswürdiger Netze gehört TLS davor:
   ```
 
   Das Zertifikat muss zum Hostnamen passen und für den Client vertrauenswürdig sein. Das Gateway lädt es beim
-  Start; nach einer Erneuerung `kubectl -n quackmux rollout restart deployment/quackmux` (im HA-Modus mit
-  kontrolliertem Failover, siehe unten).
+  Start; nach einer Erneuerung `kubectl -n quackmux rollout restart deployment/quackmux` (im HA-Modus übergibt
+  der Rollout selbst an einen neuen Pod, siehe unten).
 * **Idle-Timeout des Load Balancers:** Während die Engine rechnet, fließen in einem FETCH-Request keine Bytes.
   Das Idle-Timeout muss deutlich über der längsten erwarteten Rechenzeit liegen (anbieterspezifische
   Annotation, Beispiel in `service.yaml`).
@@ -345,6 +346,25 @@ spec:
 Läuft Prometheus in einem anderen Namespace, braucht die Policy `quackmux-gateway` in
 `base/networkpolicy.yaml` für Port 9495 zusätzlich einen `namespaceSelector` (Beispiel im Kommentar der Datei).
 
+Mit `overlays/ha` zeigt der Service nur auf den Leader; ein `ServiceMonitor` sammelt dann nur dessen Metriken.
+Für alle Replikas einen `PodMonitor` verwenden (die Annotationen `prometheus.io/*` wirken ohnehin pro Pod):
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: quackmux
+  namespace: quackmux
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quackmux
+      app.kubernetes.io/component: gateway
+  podMetricsEndpoints:
+    - port: admin
+      path: /metrics
+```
+
 | Metrik | Bedeutung |
 |---|---|
 | `quackmux_sessions{share_level,profile}` | offene Sessions |
@@ -357,6 +377,7 @@ Läuft Prometheus in einem anderen Namespace, braucht die Policy `quackmux-gatew
 | `quackmux_bytes_total{direction}` | durchgereichte Bytes (`in`: Client→Engine, `out`: Engine→Client) |
 | `quackmux_connect_failures_total{reason}`, `quackmux_auth_failures_total{method}` | gescheiterte Handshakes, fehlgeschlagene Authentifizierungen |
 | `quackmux_requests_in_flight`, `quackmux_is_leader` | laufende Requests; 1 auf der Replika, die bedient |
+| `quackmux_leader_label`, `quackmux_leader_label_updates_total{action,result}` | nur mit HA: 1, solange der eigene Pod das Label `quackmux.io/leader` trägt (von der API bestätigt); Patches des Labels (`set`, `remove`, `remove_stale`) nach Ergebnis. Alarm (über den `PodMonitor`), wenn `max(quackmux_leader_label)` länger als eine Minute 0 ist oder fehlt: Dann bedient keine Replika, und der Service hat keinen Endpunkt. Ist dabei `max(quackmux_is_leader)` 1, findet der Leader nicht in den Dienst (Label, Engine-Registry, siehe Fehlersuche); ist es 0, führt keine Replika (Lease nicht nutzbar). Quack-Requests, die bei einem Follower ankommen, zählt `quackmux_requests_total` mit `outcome="not_leader"`. |
 
 Das Audit-Log (`audit.enabled`, in der Base an) schreibt jede Query als JSON-Zeile mit Benutzer, Session,
 Engine und gekürztem SQL ins Gateway-Log. Statements, die Zugangsdaten enthalten können, stehen dort ohne ihren
@@ -368,64 +389,115 @@ mit Benutzer und Passwort. Das ist eine Heuristik: Behandeln Sie das Audit-Log t
 kubectl -n quackmux logs deployment/quackmux | grep '"component":"audit"'
 ```
 
+Mit `overlays/ha` schreibt jeder Pod, solange er Leader ist, seine eigenen Audit-Zeilen, und
+`logs deployment/quackmux` liest nur einen Pod, nicht unbedingt den Leader. Lesen Sie alle Gateway-Pods; die
+Zeilen früherer Leader gehen mit deren Pods verloren, dauerhaft hält sie nur eine Log-Sammlung:
+
+```sh
+kubectl -n quackmux logs -l app.kubernetes.io/component=gateway --prefix --tail=-1 | grep '"component":"audit"'
+```
+
 ## Hochverfügbarkeit (`overlays/ha`)
 
 ```sh
 kubectl apply -k deploy/kubernetes/overlays/ha     # bzw. Ihr Overlay auf dieser Basis
+kubectl -n quackmux rollout status deployment/quackmux
 ```
 
-* Zwei Replikas wählen über die Lease `quackmux-default` einen Leader. **Nur der Leader ist ready** und bekommt
-  über den Service Traffic. Der Follower zeigt `0/1 READY` und Readiness-Fehler (`not the leader`); das ist
-  gewollt. Deshalb meldet `kubectl rollout status` (wie auch der Health-Check von Argo CD) für dieses Overlay
-  nie Erfolg: Es wartet auf „1 of 2 updated replicas are available“. Den Zustand zeigt
-  `kubectl -n quackmux get deployment quackmux`: fertig bei `UP-TO-DATE 2`, `AVAILABLE 1`; die Bedingung
-  `Available` ist dann erfüllt (`kubectl -n quackmux wait --for=condition=Available deployment/quackmux`).
-* Leader anzeigen: `kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}'`
-  (oder die Metrik `quackmux_is_leader`).
-* **Geordnetes Herunterfahren** (Pod löschen, Rollout, Drain): Der Leader meldet sich sofort nicht mehr ready, gibt
-  die Lease frei und lässt danach seine laufenden Requests auslaufen. Der wartende Follower übernimmt innerhalb
-  von Sekunden (in kind gemessen: 1–4 s); ein frisch gestarteter Ersatz-Pod bewirbt sich erst nach
-  `3 × ha.retryPeriod` (6 s). Queries, die beim
-  Herunterfahren noch laufen, bekommen kurz vor `server.shutdownTimeout` einen Fehler und werden auf der Engine
-  abgebrochen, damit libcurl sie nicht unbemerkt ein zweites Mal sendet.
+* Zwei Replikas wählen über die Lease `quackmux-default` einen Leader. **Beide Replikas sind ready**, Quack-Traffic
+  bekommt nur der Leader: Sobald er bedienen kann (Lease frisch, Engine-Registry synchronisiert), setzt er an seinem
+  Pod das Label `quackmux.io/leader=true`, und der Service `quackmux` wählt zusätzlich dieses Label aus
+  (`overlays/ha/service-patch.yaml`). `kubectl rollout status`, `kubectl drain`, das PodDisruptionBudget und
+  Health-Checks wie der von Argo CD verhalten sich deshalb wie bei jedem anderen Deployment (`UP-TO-DATE 2`,
+  `AVAILABLE 2`).
+* Ein Follower meldet sich ready, sobald er übernehmen könnte: Er bewirbt sich um die Lease (`3 × ha.retryPeriod`,
+  also 6 s nach dem Start), eine Anfrage an die Lease ist gelungen (die letzte höchstens `2 × ha.leaseDuration`
+  her, also 30 s), und die API hat bestätigt, dass sein Pod das Label nicht trägt. Ein Label, das ein früherer
+  Container desselben Pods hinterlassen hat, entfernt er dabei. Ein Leader ist erst ready, wenn er bedient:
+  Solange er die Lease verlängert, kann kein anderer übernehmen. Bis dahin nennt `/readyz` den Grund.
+* **Voraussetzungen:** Das Gateway läuft als Pod und kennt dessen Namen und Namespace aus der Downward-API
+  (`POD_NAME`, `POD_NAMESPACE`, wie in `base/deployment.yaml`), und seine Role erlaubt `patch` auf Pods im eigenen
+  Namespace (`base/rbac.yaml`). Beim Start fragt es die API außerdem, ob es die Lease lesen und ändern (`get`,
+  `update` im Namespace der Lease: `ha.namespace`, sonst der Engine-Namespace), sie anlegen, solange es sie noch
+  nicht gibt (`create`; eine Role ohne `create` passt also zu einer vorher angelegten Lease), und die Engine-Pods
+  auflisten und beobachten darf (`list`, `watch` im Engine-Namespace). Ohne das könnte es nie bedienen. Verneint
+  die API etwas davon, startet das Gateway mit `ha.enabled` nicht und nennt den Grund; ein Rollout mit solchen
+  Pods bleibt stehen, die alten bedienen weiter. Kann die API die Frage nicht beantworten, startet es mit einer
+  Warnung im Log; ein Follower wird dann trotzdem erst ready, wenn er die Lease lesen konnte. Leader-Election
+  außerhalb des Clusters (per Kubeconfig) ist nicht möglich.
+* Leader anzeigen: `kubectl -n quackmux get pods -L quackmux.io/leader` oder
+  `kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}'` (Metriken
+  `quackmux_is_leader`, `quackmux_leader_label`).
+* **Logs:** `kubectl -n quackmux logs deployment/quackmux` liest einen beliebigen bereiten Pod, nicht unbedingt den
+  Leader. Den zeigt `kubectl -n quackmux logs -l app.kubernetes.io/component=gateway,quackmux.io/leader=true --tail=-1`,
+  alle Replikas `kubectl -n quackmux logs -l app.kubernetes.io/component=gateway --prefix --tail=-1`.
+* **Eigene Services:** Jeder Service, der Quack-Traffic zum Gateway leitet (etwa die LoadBalancer-Variante aus
+  `base/service.yaml`), braucht im HA-Betrieb ebenfalls `quackmux.io/leader: "true"` im Selektor. Sonst landen
+  Requests auch beim Follower. Der führt sie nicht aus, sondern antwortet mit dem Quack-Fehler
+  `quackmux: gateway is not ready: not the leader`, zählt sie als `quackmux_requests_total{outcome="not_leader"}`
+  und warnt im Log (höchstens einmal pro Minute).
+* **Geordnetes Herunterfahren** (Pod löschen, Rollout, Drain): Der Leader nimmt keine neuen Requests mehr an,
+  schließt ruhende Keep-Alive-Verbindungen, entfernt sein Label, gibt die Lease frei und lässt danach seine
+  laufenden Requests auslaufen. Der wartende Follower übernimmt innerhalb von Sekunden, synchronisiert die
+  Engine-Registry und setzt sein Label. In kind war der Service dabei 0,5–3,6 s ohne bereiten Endpunkt; meist
+  wartet der Follower auf seinen nächsten Versuch (alle `ha.retryPeriod` plus Jitter, bis 4,4 s). Ein frisch
+  gestarteter Pod bewirbt sich erst nach `3 × ha.retryPeriod`. Bis kube-proxy seine Regeln erneuert hat
+  (höchstens einmal pro Sekunde), schickt er neue Verbindungen noch zum alten Pod. Der alte Leader beantwortet sie
+  deshalb noch `ha.deregistrationDelay` (Default 3 s, bei kurzem `server.shutdownTimeout` dessen Hälfte; ein
+  gesetzter Wert muss kürzer sein als `server.shutdownTimeout`) nach dem
+  Entfernen des Labels mit einem Fehler; ein beendeter Pod ließe sie bis zu zwei Minuten im Verbindungsaufbau
+  hängen. Queries, die beim Herunterfahren noch laufen, bekommen kurz vor `server.shutdownTimeout` einen Fehler und
+  werden auf der Engine abgebrochen, damit libcurl sie nicht unbemerkt ein zweites Mal sendet.
 * **Ausfall des Leaders** (Node weg, Prozess hängt): Der Follower übernimmt, wenn die Lease abgelaufen ist
-  (`ha.leaseDuration`, 15 s, plus Retry und Readiness-Probe; in kind gemessen: etwa 20 s). Kann ein Leader die
-  Lease nicht verlängern, beendet sich sein Prozess und startet als Follower neu. Wacht ein eingefrorener Leader
-  wieder auf, tritt er zurück, ohne Sessions zu schließen oder die Lease des neuen Leaders anzutasten. Clients,
-  deren Verbindung noch zum eingefrorenen Pod führt, warten, bis er aufwacht oder neu gestartet wird.
-* In beiden Fällen findet der neue Leader die Engines wieder und übernimmt die Sessions mit deren nächstem
-  Heartbeat oder Request. Die Sessions überleben. In der kurzen Lücke ohne bereiten Endpunkt (ein bis drei
-  Sekunden, bis der Service den neuen Leader kennt) scheitern Requests mit „Could not connect to server“; sie
-  laufen nicht und können wiederholt werden.
-* Geprüft mit [test/e2e/kind/ha.sh](../../test/e2e/kind/ha.sh): Übergabe, eingefrorener Leader, Rollout und
-  PodDisruptionBudget mit angehängten DuckDB-2.0-Clients.
+  (`ha.leaseDuration`, 15 s, plus Retry; in kind gemessen: 16–20 s). Er entfernt das Label vom Pod des alten
+  Leaders, damit der Service diesen nicht weiter nennt, auch wenn dessen Node nicht mehr antwortet und der Pod
+  noch bis zu 50 s als ready gilt (`node-monitor-grace-period`). Kann ein Leader die Lease nicht verlängern,
+  beendet sich sein Prozess und startet als Follower neu. Wacht ein eingefrorener Leader wieder auf, tritt er
+  zurück, ohne Sessions zu schließen, die Lease des neuen Leaders anzutasten oder sein Label wieder zu setzen;
+  bis zum Neustart meldet er sich nicht ready, danach ist er ein bereiter Follower. Clients, deren Verbindung
+  noch zum eingefrorenen Pod führt, warten, bis er aufwacht oder neu gestartet wird.
+* In allen Fällen findet der neue Leader die Engines wieder und übernimmt die Sessions mit deren nächstem
+  Heartbeat oder Request. Die Sessions überleben. In der kurzen Lücke ohne bereiten Endpunkt scheitern Requests
+  mit „Could not connect to server“; sie laufen nicht und können wiederholt werden.
+* Geprüft mit [test/e2e/kind/ha.sh](../../test/e2e/kind/ha.sh): Übergabe, eingefrorener Leader, Rollout,
+  PodDisruptionBudget und ein Rollout von Pods, die die Lease nicht nutzen dürfen, mit angehängten
+  DuckDB-2.0-Clients.
 * Eine bevorzugte `podAntiAffinity` verteilt die Replikas auf verschiedene Nodes.
 * `overlays/ha/config.yaml` ersetzt `base/config.yaml` vollständig. Halten Sie beide Dateien bis auf den
   Abschnitt `ha` gleich.
 
-**Rollout (neues Image, neue Konfiguration):** Weil nur der Leader ready ist, zählt Kubernetes nur einen der
-beiden Pods als verfügbar. Mit `maxUnavailable: 1` und `maxSurge: 0` ersetzt der Rollout zuerst den Follower
-und wartet dann: Der neue Pod wird nicht ready, solange der alte Leader die Lease hält. Sobald der neue Pod
-läuft (`Running`, `0/1 READY`), schließen Sie den Rollout mit einem kontrollierten Failover ab:
+**Rollout (neues Image, neue Konfiguration):** `kubectl apply -k …` genügt, `kubectl rollout status` meldet Erfolg
+(in kind nach 13–17 s). Mit `maxSurge: 1` und `maxUnavailable: 0` startet Kubernetes zuerst einen neuen Pod
+und wartet, bis er als Follower ready ist. Dann entfernt es den alten Follower: Der Leader gibt seinem Pod höhere
+Löschkosten (`controller.kubernetes.io/pod-deletion-cost`; ein Wert aus dem Pod-Template wird überschrieben),
+deshalb geht er nicht zuerst. Ist auch der zweite neue Pod ready, endet der alte Leader und übergibt an einen der
+neuen Pods. Die Lease wechselt je Rollout genau einmal (solange der Rollout die Lease nicht selbst ändert, siehe
+unten); es sind immer mindestens zwei Replikas ready, kurzzeitig laufen drei Pods. Fehlt im Cluster der Platz für
+einen dritten Gateway-Pod, setzen Sie im eigenen Overlay `maxSurge: 0` und `maxUnavailable: 1`: Dann geht zuerst
+der Follower, und bis sein Ersatz ready ist, gibt es keinen Standby.
+
+`kubectl rollout status` meldet Erfolg, sobald der alte Leader zu enden beginnt, also vor der Übergabe: Erst dann
+entfernt er sein Label und gibt die Lease frei, und ein neuer Pod übernimmt (bis etwa 4,4 s ohne Endpunkt, in kind
+0,5–3,1 s). Seine laufenden Requests lässt der alte Leader danach noch auslaufen (höchstens
+`server.shutdownTimeout`). Wer gleich nach dem Rollout testet (Smoke-Test, PostSync-Hook von Argo CD), wartet
+zuerst auf einen bereiten Endpunkt:
 
 ```sh
-kubectl apply -k deploy/kubernetes/overlays/ha
-kubectl -n quackmux get pods -l app.kubernetes.io/component=gateway   # bis der neue Pod Running ist (0/1)
-LEADER=$(kubectl -n quackmux get lease quackmux-default -o jsonpath='{.spec.holderIdentity}')
-kubectl -n quackmux delete pod "$LEADER"      # gibt die Lease frei, der neue Pod übernimmt
-kubectl -n quackmux get deployment quackmux   # fertig bei UP-TO-DATE 2, AVAILABLE 1
+until kubectl -n quackmux get endpointslices -l kubernetes.io/service-name=quackmux \
+    -o go-template='{{range .items}}{{range .endpoints}}{{if .conditions.ready}}{{index .addresses 0}}{{"\n"}}{{end}}{{end}}{{end}}' |
+    grep -q .; do sleep 1; done
 ```
 
-Die alte ReplicaSet ersetzt den gelöschten Leader sofort durch einen Pod mit dem alten Template. Dieser Pod
-bewirbt sich erst nach `3 × ha.retryPeriod` (6 s) um die Lease, wie jeder frisch gestartete Prozess. Bis dahin
-hat der neue Pod sie längst übernommen, und Kubernetes räumt den alten Pod ab.
+**Lease nicht per Rollout ändern:** Die Lease ergibt sich aus `ha.namespace` (sonst dem Engine-Namespace, also
+`provider.kubernetes.namespace` oder dem Namespace des Gateways) und `ha.leaseName` (sonst `quackmux-` und
+`provider.kubernetes.instance`). Ändert ein Rollout eines davon, bewirbt sich der erste neue Pod um eine andere,
+freie Lease und führt nach `3 × ha.retryPeriod` neben dem alten Leader; beide setzen ihr Label und bedienen.
+Solche Änderungen nur wie beim Umstieg von der Base: erst auf 0 skalieren, dann anwenden.
 
-Wer vollautomatische Rollouts mit kurzer Unterbrechung vorzieht, setzt im eigenen Overlay
-`maxUnavailable: 100%`; dann ersetzt Kubernetes beide Pods auf einmal, wie bei `Recreate`.
-
-**Node-Wartung:** Das PodDisruptionBudget (`minAvailable: 1`) verhindert, dass `kubectl drain` den Leader
-verdrängt; der Follower darf jederzeit gehen. Vor dem Drain des Leader-Nodes den Leader wie oben löschen.
-Automatische Node-Upgrades mancher Anbieter warten auf die PDB oder verdrängen nach einer Frist trotzdem.
+**Node-Wartung:** `kubectl drain` braucht keine Vorbereitung. Das PodDisruptionBudget (`minAvailable: 1`) lässt
+die Räumung des Leaders zu, solange der Follower ready ist; der Leader übergibt dann wie beim Löschen. Die letzte
+bereite Replika räumt es nicht: `kubectl drain` wartet, bis der Ersatz-Pod ready ist. Nicht bereite Pods dürfen
+immer gehen.
 
 **Umstieg von der Base:** Zuerst das einzelne Gateway stoppen, damit nie ein Gateway ohne Leader-Election
 neben einem Leader läuft:
@@ -434,6 +506,18 @@ neben einem Leader läuft:
 kubectl -n quackmux scale deployment/quackmux --replicas=0
 kubectl apply -k deploy/kubernetes/overlays/ha
 ```
+
+**Umstieg von einem Stand ohne Leader-Label** (frühere Fassungen von `overlays/ha`, in denen nur der Leader ready
+ist): Ab dem `kubectl apply` wählt der Service nur noch Pods mit dem Label aus, und die alten Pods setzen es nie.
+Ein Rollout ließe den Service deshalb bis zu seinem Ende ohne Endpunkt (in kind 15–19 s). Gehen Sie wie beim
+Umstieg von der Base vor (erst auf 0 skalieren, dann anwenden): Dann fehlt der Endpunkt nur, bis ein neuer Pod
+führt (Start und `3 × ha.retryPeriod`). Ergänzen Sie im selben Schritt den Selektor eigener Services.
+
+**Zurückrollen auf einen Stand ohne Leader-Label:** das alte Overlay anwenden (`kubectl apply -k` mit dem alten
+Stand), wieder erst nach dem Skalieren auf 0. Das entfernt auch den Selektor `quackmux.io/leader` aus dem Service.
+`kubectl rollout undo` oder `kubectl set image` genügen nicht: Der Service behielte den Selektor, und sobald ein
+alter Pod führt, hätte er keinen Endpunkt mehr. Ein älteres Gateway lehnt außerdem `ha.deregistrationDelay` in der
+Konfiguration ab.
 
 ## Entwicklung mit kind (`overlays/dev`)
 
@@ -480,6 +564,9 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
 * `kubectl apply -k …` erzeugt eine neue ConfigMap (neuer Hash) und rollt das Gateway neu aus (Base: kurze
   Unterbrechung, Sessions bleiben; HA: siehe oben). Die alten ConfigMaps und Secrets mit Hash-Suffix bleiben
   liegen; `kubectl rollout undo` braucht sie. Löschen Sie sie erst, wenn Sie nicht mehr zurückrollen wollen.
+* Mit `overlays/ha` ändern `ha.namespace`, `ha.leaseName`, `provider.kubernetes.instance` und, ohne
+  `ha.namespace`, `provider.kubernetes.namespace` die Lease: nicht per Rollout, sondern wie beim Umstieg (siehe
+  „Hochverfügbarkeit“, „Lease nicht per Rollout ändern“).
 * Geänderte Profile: Engines mit der alten Spec gehen auf DRAINING (`engine.replaceOnSpecChange`). Neue
   Sessions bekommen neue Engines, bestehende laufen auf der alten weiter, höchstens `engine.drainTimeout`.
   Persistente Profile: Die alte Engine nimmt weiter Sessions an, bis sie keine mehr hat (spätestens
@@ -765,16 +852,24 @@ kubectl -n quackmux get events --sort-by=.lastTimestamp
 kubectl -n quackmux get pvc -l app.kubernetes.io/component=engine-data -L quackmux.io/share-level,quackmux.io/profile
 ```
 
+Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nicht unbedingt den Leader; den zeigt
+`kubectl -n quackmux logs -l app.kubernetes.io/component=gateway,quackmux.io/leader=true -f`.
+
 | Symptom | Ursache und Abhilfe |
 |---|---|
 | Engine-Pod bleibt `Pending`; Client: `quackmux: could not provide an engine: engine did not become ready in time (3m0s)` | Zu wenig CPU oder Speicher für die Requests des Profils, ResourceQuota, NodeSelector oder Taints passen nicht. `kubectl describe pod` zeigt den Grund in den Events. Requests verkleinern, Nodes ergänzen oder `startupTimeout` erhöhen (etwa wenn der Cluster-Autoscaler erst einen Node startet). |
 | `ImagePullBackOff` / `ErrImagePull` | Image-Name oder Tag falsch, Registry nicht erreichbar, private Registry ohne `imagePullSecrets`. Gateway: Deployment patchen; Engines: `profiles.<name>.image` und `imagePullSecrets`. kind: Images mit `kind load docker-image` laden. Fehlgeschlagene Engine-Pods bleiben `engine.failedRetention` (10 min) zur Analyse stehen. |
 | Gateway-Log: `launch failed: … violates PodSecurity "restricted…"` | Ein Pod-Template des Profils enthält einen Container ohne gehärteten Security-Context (z. B. einen Sidecar). Template anpassen oder den Namespace bewusst auf `enforce: baseline` stellen. |
-| Gateway-Pod in `CrashLoopBackOff` | `kubectl -n quackmux logs deployment/quackmux --previous`: Konfigurationsfehler (unbekanntes Feld), fehlende oder ungültige `users.yaml`, Session-Key kürzer als 16 Bytes. |
+| Gateway-Pod in `CrashLoopBackOff` | `kubectl -n quackmux logs deployment/quackmux --previous` (mit `overlays/ha`: `kubectl -n quackmux logs <pod> --previous`, sonst wählt kubectl einen bereiten Pod): Konfigurationsfehler (unbekanntes Feld), fehlende oder ungültige `users.yaml`, Session-Key kürzer als 16 Bytes. |
 | `Authentication failed` | Token unbekannt (in `users.yaml` gehört das sha256 des Tokens ohne `?…`), abgelaufen (`expires`) oder der Benutzer ist `disabled`. Passt der `SCOPE` des Secrets nicht zum Ziel des `ATTACH` (anderer Host oder Port, `localhost` statt `127.0.0.1`), verwendet der Client das Secret nicht. Gateway-Log: `authentication failed` mit Grund; Metrik `quackmux_auth_failures_total`. |
 | `quackmux: session closed: idle timeout (6h0m0s). DETACH and ATTACH again to reconnect.` | Die Session hat länger als `session.idleTimeout` keine Query geschickt; Heartbeats zählen nicht. `DETACH` und erneut `ATTACH`, oder `session.idleTimeout` erhöhen (`0s` schaltet ab). Verwandte Gründe: `heartbeat lease expired` (der Client war länger als Lease plus `heartbeatGrace` stumm), `max lifetime`, `engine …` (Engine beendet oder ausgefallen). |
 | `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
-| `quackmux: gateway is not ready: not the leader` | Die Verbindung landet direkt beim Follower, etwa durch einen Port-Forward auf einen bestimmten Pod. `svc/quackmux` verwenden. |
+| `quackmux: gateway is not ready: not the leader` | Der Request landet bei einem Follower: ein Port-Forward auf einen bestimmten Pod oder, mit `overlays/ha`, ein Service ohne `quackmux.io/leader: "true"` im Selektor. `svc/quackmux` verwenden bzw. den Selektor ergänzen; `quackmux_requests_total{outcome="not_leader"}` zählt solche Requests. Der Request lief nicht. |
+| HA: Gateway-Pod bleibt `0/1 READY`, `/readyz` meldet `label quackmux.io/leader of pod … not yet removed: …` | Der Pod kann sein Leader-Label nicht entfernen, meist weil die API nicht erreichbar ist; bis dahin bekommt er keinen Traffic. `waiting to campaign for leadership` ist in den ersten `3 × ha.retryPeriod` nach dem Start normal, `stepping down: the lease is no longer fresh` bei einem Leader, der seine Lease verloren hat, bis zu seinem Neustart als Follower. |
+| HA: Follower bleibt `0/1 READY`, `/readyz` meldet `no request for lease … has succeeded …`, Log: `Error retrieving lease lock … forbidden` | Der Follower darf die Lease nicht nutzen oder erreicht die API nicht und könnte nie übernehmen: Im Namespace der Lease (`ha.namespace`, sonst der Engine-Namespace) fehlen Role und RoleBinding aus `base/rbac.yaml`. |
+| HA: Leader bleibt `0/1 READY` mit `starting up`, Service ohne Endpunkt, Log: `not allowed to list/watch engine pods …` | Der Leader kann seine Engine-Registry nicht synchronisieren, und solange er die Lease verlängert, übernimmt niemand. Rechte im Engine-Namespace ergänzen (`base/rbac.yaml`); danach bedient er ohne Neustart. |
+| HA: Gateway startet nicht, Log: `ha: leader election needs the gateway to run as a Kubernetes pod …`, `ha: the gateway pod … does not exist`, `ha: the gateway may not label its pod …` oder `ha: this replica could never lead …` | `POD_NAME` und `POD_NAMESPACE` fehlen oder nennen nicht diesen Pod (Downward-API wie in `base/deployment.yaml`), der Role fehlt `patch` auf Pods im Namespace des Gateways, oder im Namespace der Lease oder der Engines fehlen Role und RoleBinding (`base/rbac.yaml`; die Meldung nennt die fehlenden Rechte). |
+| `quackmux: gateway is not ready: stepping down: the lease is no longer fresh` | Die Verbindung des Clients führte noch zu einem Leader, der seine Lease verloren hat (etwa nach einem Einfrieren); er startet als Follower neu. Der Request lief nicht und kann wiederholt werden. |
 | `quackmux: could not provide an engine: engine limit reached …` | `limits.maxEngines`, `maxEnginesPerUser` oder `maxStartingEngines` erreicht; `GET /api/v1/engines` zeigt, wer sie belegt. |
 | `quackmux: not permitted: …` | Share-Level, Profil, Subdomain oder Gruppe sind für den Benutzer nicht erlaubt (`allowedShareLevels`, `allowedUsers`, `allowedGroups`, `allowedSubdomains`, `overrides`). |
 | `quackmux: could not provide an engine: … the previous engine of this key still holds its data volume …` | Persistentes Profil: Die vorige Engine des Schlüssels läuft noch aus (Drain) oder ihr Pod hängt in `Terminating` (Node ausgefallen, siehe [Persistente Daten](#persistente-daten)); `GET /api/v1/engines` zeigt sie. Mit `(engine pod … exists …)` gibt es einen Pod des Schlüssels, den das Gateway nicht kennt: `kubectl get pods -l quackmux.io/key-hash=<hash>`. Ist sein Token-Secret lesbar, übernimmt das Gateway ihn nach wenigen Sekunden. |

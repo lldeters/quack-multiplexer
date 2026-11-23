@@ -227,9 +227,32 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   Engines nicht als idle beendet. Findet das Gateway mehrere READY-Engines für denselben Key (eine Engine, die
   ihren Startup-Timeout verpasst hat, neben ihrem Ersatz), nimmt es für neue Sessions immer die älteste und
   drained die anderen.
-* **HA (optional, `ha.enabled`):** Mehrere Replikas machen Leader-Election über eine Kubernetes-`Lease`. Nur der
-  Leader ist `ready` und bekommt über den Service Traffic. Verliert er die Lease, beendet sich der Prozess und
-  startet als Follower neu. Der neue Leader übernimmt per Discovery und Adoption. Die Sessions überleben.
+* **HA (optional, `ha.enabled`):** Mehrere Replikas machen Leader-Election über eine Kubernetes-`Lease`. Alle
+  gesunden Replikas sind `ready`, Quack-Traffic bekommt nur der Leader:
+  * Sobald er bedienen kann (frische Lease, Engine-Registry synchronisiert), setzt er an seinem Pod das Label
+    `quackmux.io/leader=true` und die Löschkosten `controller.kubernetes.io/pod-deletion-cost: "100"`. Der
+    Service des HA-Overlays wählt das Label zusätzlich aus; beim Herunterskalieren (Rollout) entfernt Kubernetes
+    wegen der Löschkosten zuerst die Follower.
+  * Ein Follower ist ready, sobald er sofort übernehmen könnte: Er bewirbt sich um die Lease, eine Anfrage an die
+    Lease ist gelungen (die letzte höchstens `2 × ha.leaseDuration` her), und die API hat bestätigt, dass sein Pod
+    das Label nicht trägt (ein Label eines früheren Containers entfernt er beim Start). Ein Leader ist erst ready,
+    wenn er bedient: Solange er die Lease verlängert, kann niemand sonst übernehmen; ein Leader, der nicht in den
+    Dienst findet (etwa ohne Rechte auf die Engine-Pods), fällt so auf. Ein Pod, der das Label trägt, aber nicht
+    bedient, ist nie ready, und der Service routet nur auf bereite Pods: Das Label lenkt, die Readiness sichert
+    ab. Die Readiness des Leaders hängt nie an Label-Patches.
+  * Requests, die trotzdem bei einem Follower ankommen, beantwortet er mit HTTP 200 und `ERROR_RESPONSE`
+    „quackmux: gateway is not ready: not the leader“, ohne den Body zu lesen oder etwas auszuführen.
+  * Übernimmt ein Leader eine abgelaufene Lease, entfernt er das Label vom Pod des vorigen Halters
+    (`Elector.Displaced`): Dessen Node kann weg sein, und der Pod gilt dann noch bis zu 50 s als ready
+    (`node-monitor-grace-period` des Node-Controllers).
+  * Das Gateway muss dafür als Pod laufen und dessen Namen und Namespace kennen (`POD_NAME`, `POD_NAMESPACE` aus
+    der Downward-API); sonst, oder wenn es seinen Pod nicht patchen darf, startet es mit `ha.enabled` nicht.
+    Ebenso wenig, wenn die API (per SelfSubjectAccessReview) verneint, dass es die Lease lesen und ändern, sie
+    anlegen (nur solange es sie nicht gibt) und die Engine-Pods auflisten und beobachten darf: Ohne das könnte es
+    nie bedienen. Ein Rollout mit fehlenden Rechten oder falschem Namespace bleibt so stehen, statt die alten
+    Pods zu ersetzen. Kann die API nicht antworten, startet es mit einer Warnung.
+  * Verliert der Leader die Lease, beendet sich der Prozess und startet als Follower neu. Der neue Leader
+    übernimmt per Discovery und Adoption. Die Sessions überleben.
 * **Veralteter Leader:** Friert der Leader ein (gestoppter Container oder VM, hängender Node), verlängert er die
   Lease nicht mehr, und der Follower übernimmt nach `ha.leaseDuration`. Wacht der alte Prozess wieder auf, hält
   er sich bis zur nächsten Prüfung seines Watchdogs (jede Sekunde) noch für den Leader. Seine Sessions sehen für
@@ -242,11 +265,20 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   `test/e2e/kind/ha.sh`, Szenario h3. Ein aufgeweckter Leader gibt außerdem keine Lease frei, die er nicht mehr
   hält: client-go (v0.37) entscheidet beim Freigeben nach dem zuletzt beobachteten Stand und hätte die Lease
   des neuen Leaders geleert. Der Lock-Wrapper schreibt eine Freigabe nur, wenn die gerade gelesene Lease uns
-  gehört.
-* **Geordnete Übergabe:** Beim Herunterfahren meldet sich der Leader sofort nicht mehr ready und gibt die
-  Lease frei. Er wartet auf die Freigabe und lässt erst danach seine laufenden Requests auslaufen. Ein frisch
-  gestarteter Prozess bewirbt sich erst nach `3 × ha.retryPeriod`. So übernimmt der wartende Follower und nicht
-  der Ersatz-Pod; im Rollout hätte der Ersatz-Pod das alte Template und hielte den Rollout wieder an.
+  gehört. Dieselbe Frische gilt für den Proxy und das Label: Ohne frische Lease nimmt ein Leader keine Requests
+  an und setzt sein Label nicht (wieder); geprüft wird direkt vor jedem Patch. Ready meldet er sich erst wieder
+  nach dem Neustart als Follower (`Elector.SteppingDown`), damit ihn das PodDisruptionBudget nicht als Standby
+  zählt.
+* **Geordnete Übergabe:** Beim Herunterfahren meldet sich der Leader sofort nicht mehr ready, schließt ruhende
+  Keep-Alive-Verbindungen, entfernt sein Label (höchstens 2 s) und gibt die Lease frei. Er wartet auf die
+  Freigabe und lässt erst danach seine laufenden Requests auslaufen. Ein frisch gestarteter Prozess bewirbt sich
+  erst nach `3 × ha.retryPeriod` und ist erst dann ready. So übernimmt ein Follower, der schon wartet; ein
+  Rollout entfernt den alten Leader erst, wenn seine Ersatz-Pods bereit sind. Bis kube-proxy die Regeln erneuert
+  hat (`minSyncPeriod` 1 s), leitet er neue Verbindungen noch zum alten Pod. Der hält seinen Listener deshalb
+  noch `ha.deregistrationDelay` (Default 3 s, bei kurzem `server.shutdownTimeout` dessen Hälfte) nach dem
+  Entfernen des Labels offen und beantwortet sie mit einem Fehler; ein beendeter Pod ließe sie bis zum Timeout des
+  Verbindungsaufbaus hängen (in kind gemessen; ein hängender Heartbeat blockiert das `DETACH` des Clients).
+  `test/e2e/kind/ha.sh` prüft die Verzögerung am Log des alten Leaders (h2, h4).
 * **Laufende Requests beim Shutdown:** Das Gateway wartet bis zu `server.shutdownTimeout` auf laufende Requests.
   Kurz vor Ablauf (spätestens 5 s davor) beantwortet es Queries, die noch auf ihre Engine warten, mit einem
   Fehler („the gateway is shutting down“) und bricht sie auf der Engine per CANCEL ab. Ein Request, der beim
@@ -295,7 +327,7 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   setzt `QUACKMUX_STOP_TIMEOUT` der Engine auf 5 s weniger (mindestens 1 s), damit der Entrypoint DuckDB samt
   Checkpoint stoppt, bevor das Kubelet den Container tötet.
 * RBAC (Namespace-scoped):
-  * pods: get, list, watch, create, delete, patch
+  * pods: get, list, watch, create, delete, patch (mit HA auch das Leader-Label der Gateway-Pods)
   * secrets: get, list, create, delete, patch
   * persistentvolumeclaims: get, list, create, patch, delete (persistente Profile)
   * events: create
@@ -369,6 +401,8 @@ Weitere Provider:
     `quackmux_engine_start_seconds`
   * `quackmux_requests_total{type,outcome}`, `quackmux_request_seconds{type}`, `quackmux_bytes_total{direction}`
   * `quackmux_auth_failures_total{reason}`
+  * mit HA: `quackmux_is_leader`, `quackmux_leader_label`, `quackmux_leader_label_updates_total{action,result}`;
+    Requests, die bei einem Follower ankommen, zählen mit `outcome="not_leader"`
 * **Audit-Log** (optional): jede Query (`PREPARE_REQUEST`) mit User, Session, Engine, `client_query_id` und
   gekürztem SQL als strukturierte Logzeile. Statements, die Zugangsdaten enthalten können (`CREATE SECRET`,
   `secret`, `passw`, `pwd`, `token`, `AccountKey`, `sig=` irgendwo im Text, URLs mit Benutzer und Passwort), loggt

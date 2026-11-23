@@ -112,9 +112,15 @@ ha:
   # process exits and restarts as a follower) when it could not renew it
   # for renewDeadline. A follower takes over at the latest leaseDuration
   # after the last renewal - at once when the leader shuts down orderly.
+  # Both replicas are ready; the leader labels its pod quackmux.io/leader,
+  # and the Service routes to that label (service-patch.yaml).
   leaseDuration: 15s
   renewDeadline: 10s
   retryPeriod: 2s
+  # A leader that shuts down answers new connections this long after it
+  # removed its label, until kube-proxy has caught up (part of
+  # server.shutdownTimeout).
+  deregistrationDelay: 3s
 
 log:
   level: info

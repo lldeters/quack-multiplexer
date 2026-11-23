@@ -1,6 +1,8 @@
 // Package ha elects a leader among gateway replicas on a Kubernetes Lease
 // (coordination.k8s.io/v1). Only the leader serves Quack traffic and manages
-// engines; the other replicas stay unready until they acquire the lease.
+// engines. Every healthy replica is ready; the leader labels its pod
+// (LeaderLabel, see Labeler), and the Service selects that label, so that
+// Quack traffic reaches the leader alone.
 //
 // A leader that loses the lease steps down: the context handed to its
 // onStartedLeading callback is cancelled and Run returns ErrLeadershipLost.
@@ -23,6 +25,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
@@ -86,6 +89,9 @@ type Elector struct {
 	watchInterval time.Duration
 	// campaignDelay is how long the first Run waits before it campaigns.
 	campaignDelay time.Duration
+	// standbyWindow is how long a follower counts as able to take over
+	// after its last successful request for the lease (see leaseUsable).
+	standbyWindow time.Duration
 	log           *slog.Logger
 	// clientLog receives client-go's leader election messages.
 	clientLog logr.Logger
@@ -93,7 +99,10 @@ type Elector struct {
 
 	running   atomic.Bool
 	campaigns atomic.Bool // set by the first Run
-	elector   atomic.Pointer[leaderelection.LeaderElector]
+	// campaigning is set while Run competes for the lease or leads (after
+	// the campaign delay).
+	campaigning atomic.Bool
+	elector     atomic.Pointer[leaderelection.LeaderElector]
 	// renew tracks the renewals of the current Run (see Fresh).
 	renew atomic.Pointer[renewTracker]
 
@@ -186,6 +195,11 @@ func New(o Options) (*Elector, error) {
 		retryPeriod:   retry,
 		watchInterval: watchInterval(lease, renew, retry),
 		campaignDelay: 3 * retry,
+		// A follower asks every retryPeriod (with jitter up to 2.2 times
+		// that, less than 1.9 x leaseDuration by validateTimings): two lease
+		// durations span more than one attempt even then, and several with
+		// the defaults, so that a single failed request does not count.
+		standbyWindow: 2 * lease,
 		log:           log,
 		// client-go's own messages are chatty; demote its info messages one
 		// level below Info (errors stay errors).
@@ -275,6 +289,62 @@ func (e *Elector) Fresh() bool {
 	}
 	since, ok := t.sinceRenew()
 	return ok && since <= e.renewDeadline
+}
+
+// Campaigning reports whether Run competes for the lease or leads: the
+// campaign delay of a fresh process is over, and Run has not returned. A
+// follower reports ready only then, so that a ready follower can take over
+// at once (a rollout removes the old leader only once its replacements are
+// ready).
+func (e *Elector) Campaigning() bool { return e.campaigning.Load() }
+
+// SteppingDown reports whether this replica led during the current Run and
+// its lease is no longer fresh: its term ended, or its watchdog is about to
+// end it (a leader that resumed after a freeze). Run then returns without
+// campaigning again, and the gateway restarts. Such a replica cannot take
+// over, so it does not report ready (StandbyReady), even while Campaigning
+// still holds.
+func (e *Elector) SteppingDown() bool {
+	t := e.renew.Load()
+	return t != nil && t.led.Load() && !e.Fresh()
+}
+
+// leaseUsable reports whether a request of the current Run for the lease
+// succeeded within standbyWindow: a read that found it, its creation or an
+// update. A follower that campaigns but cannot use the lease (no Role in
+// the namespace of the lease, an API server it cannot reach) could never
+// take over. why describes the last failure otherwise.
+func (e *Elector) leaseUsable() (ok bool, why string) {
+	t := e.renew.Load()
+	if t == nil {
+		return false, "not campaigning for lease " + e.Lease()
+	}
+	if at := t.answered.Load(); at >= 0 {
+		since := time.Since(t.base) - time.Duration(at)
+		if since <= e.standbyWindow {
+			return true, ""
+		}
+		why = fmt.Sprintf("no request for lease %s has succeeded for %s", e.Lease(), since.Round(time.Second))
+	} else {
+		why = "no request for lease " + e.Lease() + " has succeeded yet"
+	}
+	if f := t.failure.Load(); f != nil {
+		why += ": " + *f
+	}
+	return false, why
+}
+
+// Displaced returns the holder whose expired lease this replica took over at
+// the start of its current term, or "" if the lease was free (released by its
+// holder, or never held) or held by this replica itself. The pod of that
+// holder may still carry LeaderLabel (Labeler.RemoveStale).
+func (e *Elector) Displaced() string {
+	if t := e.renew.Load(); t != nil {
+		if p := t.displaced.Load(); p != nil {
+			return *p
+		}
+	}
+	return ""
 }
 
 // Leader returns the identity of the last observed lease holder ("" if none
@@ -397,7 +467,11 @@ func (e *Elector) Run(ctx context.Context, onStartedLeading func(ctx context.Con
 	}
 	e.log.Info("campaigning for leadership", "leaseDuration", e.leaseDuration, "renewDeadline", e.renewDeadline,
 		"retryPeriod", e.retryPeriod)
+	if electCtx.Err() == nil {
+		e.campaigning.Store(true)
+	}
 	le.Run(klog.NewContext(electCtx, e.clientLog))
+	e.campaigning.Store(false)
 
 	mu.Lock()
 	closed = true
@@ -427,6 +501,7 @@ func (e *Elector) lead(leCtx context.Context, lock *renewTracker, stepDown conte
 	defer cancel()
 
 	e.setLeader(true)
+	lock.led.Store(true) // after setLeader: a term that starts is fresh
 	e.log.Info("became leader")
 	watchdog := make(chan struct{})
 	go func() {
@@ -487,6 +562,18 @@ type renewTracker struct {
 	last atomic.Int64
 	// holder is the holder in the record read last ("" before any read).
 	holder atomic.Pointer[string]
+	// displaced is the holder of an expired lease that this candidate took
+	// over (see Elector.Displaced); nil if there was none.
+	displaced atomic.Pointer[string]
+	// led is set when this candidate's term starts (see Elector.SteppingDown).
+	led atomic.Bool
+	// answered is the offset from base of the end of the last successful
+	// request for the lease (a read that found it, its creation, an
+	// update), or -1 if there was none; failure is the error of the last
+	// request that failed, nil once one succeeded again (see
+	// Elector.leaseUsable).
+	answered atomic.Int64
+	failure  atomic.Pointer[string]
 }
 
 // errNotHolder refuses the release of a lease that another candidate holds.
@@ -499,12 +586,18 @@ func (t *renewTracker) Get(ctx context.Context) (*resourcelock.LeaderElectionRec
 		h := r.HolderIdentity
 		t.holder.Store(&h)
 	}
+	if !apierrors.IsNotFound(err) {
+		// A missing lease is neither a success nor a failure: client-go
+		// creates it next.
+		t.answer(err)
+	}
 	return r, raw, err
 }
 
 func newRenewTracker(l resourcelock.Interface) *renewTracker {
 	t := &renewTracker{Interface: l, base: time.Now()}
 	t.last.Store(-1)
+	t.answered.Store(-1)
 	return t
 }
 
@@ -513,7 +606,25 @@ func (t *renewTracker) Create(ctx context.Context, r resourcelock.LeaderElection
 	start := time.Since(t.base)
 	err := t.Interface.Create(ctx, r)
 	t.observe(start, r, err)
+	t.answer(err)
 	return err
+}
+
+// answer records the outcome of a request for the lease.
+func (t *renewTracker) answer(err error) {
+	if err != nil {
+		s := err.Error()
+		t.failure.Store(&s)
+		return
+	}
+	t.failure.Store(nil)
+	now := int64(time.Since(t.base))
+	for {
+		old := t.answered.Load()
+		if now <= old || t.answered.CompareAndSwap(old, now) {
+			return
+		}
+	}
 }
 
 // Update implements resourcelock.Interface.
@@ -524,9 +635,22 @@ func (t *renewTracker) Update(ctx context.Context, r resourcelock.LeaderElection
 			return errNotHolder
 		}
 	}
+	// Before client-go takes the lease over, it reads the record: its holder
+	// is the candidate this one displaces. A released lease names nobody.
+	// Renewals do not overwrite the value (the CompareAndSwap below): a
+	// renewal either read the record (holder: this candidate) or skipped
+	// the read (prev is the one of the takeover).
+	var prev string
+	if h := t.holder.Load(); h != nil {
+		prev = *h
+	}
 	start := time.Since(t.base)
 	err := t.Interface.Update(ctx, r)
 	t.observe(start, r, err)
+	t.answer(err)
+	if err == nil && r.HolderIdentity == t.Identity() && prev != "" && prev != t.Identity() {
+		t.displaced.CompareAndSwap(nil, &prev)
+	}
 	return err
 }
 

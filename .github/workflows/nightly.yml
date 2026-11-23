@@ -1,5 +1,5 @@
 # Slow checks that do not run for every pull request: the high availability
-# scenarios in kind (test/e2e/kind/ha.sh, about 15 minutes) and the tests with
+# scenarios in kind (test/e2e/kind/ha.sh, about 5 minutes) and the tests with
 # the race detector repeated, to find flaky tests. Scheduled runs use the
 # default branch; start a run for another branch with "Run workflow".
 name: Nightly

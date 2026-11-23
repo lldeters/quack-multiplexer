@@ -12,7 +12,10 @@ metadata:
     app.kubernetes.io/component: gateway
 rules:
   # Engine pods: launch, watch (informer), re-label warm-pool engines when a
-  # session claims them, delete.
+  # session claims them, delete. With ha.enabled also the gateway's own pods
+  # (patch): the leader labels its pod quackmux.io/leader and removes the
+  # label from the pod of a previous leader. Keep this rule in the gateway's
+  # namespace even when engines run elsewhere.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, create, delete, patch]
@@ -31,7 +34,9 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
-  # Leader election (ha.enabled).
+  # Leader election (ha.enabled). With it the gateway checks at start-up that
+  # it may get, create and update its lease and list and watch the engine
+  # pods, and does not start otherwise.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update]

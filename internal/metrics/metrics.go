@@ -2,6 +2,8 @@
 package metrics
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
@@ -25,9 +27,17 @@ type Metrics struct {
 	Bytes            *prometheus.CounterVec
 	InFlight         prometheus.Gauge
 	IsLeader         prometheus.Gauge
+
+	// LeaderLabel and LeaderLabelUpdates follow the label quackmux.io/leader
+	// on the gateway's own pod. Only leader election (ha.enabled) uses them:
+	// they are registered by RegisterLeaderLabel.
+	LeaderLabel        prometheus.Gauge
+	LeaderLabelUpdates *prometheus.CounterVec
+	leaderLabelOnce    sync.Once
 }
 
-// New creates and registers all collectors on a fresh registry.
+// New creates all collectors and registers them on a fresh registry (those
+// of RegisterLeaderLabel only when that is called).
 func New() *Metrics {
 	r := prometheus.NewRegistry()
 	r.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -77,9 +87,22 @@ func New() *Metrics {
 		IsLeader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "quackmux_is_leader", Help: "1 if this replica serves traffic.",
 		}),
+		LeaderLabel: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "quackmux_leader_label", Help: "1 if this replica's pod carries the label quackmux.io/leader (as confirmed by the API server).",
+		}),
+		LeaderLabelUpdates: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "quackmux_leader_label_updates_total", Help: "Patches of the label quackmux.io/leader, by action (set, remove, remove_stale) and result.",
+		}, []string{"action", "result"}),
 	}
 	r.MustRegister(m.SessionsOpen, m.SessionsOpened, m.SessionsClosed, m.ConnectFailures, m.AuthFailures,
 		m.Engines, m.EngineStarts, m.EngineStartTime, m.EngineTerminated, m.Requests, m.RequestSeconds,
 		m.Bytes, m.InFlight, m.IsLeader)
 	return m
+}
+
+// RegisterLeaderLabel registers LeaderLabel and LeaderLabelUpdates, so that
+// gateways without leader election do not export them. It may be called
+// more than once.
+func (m *Metrics) RegisterLeaderLabel() {
+	m.leaderLabelOnce.Do(func() { m.Registry.MustRegister(m.LeaderLabel, m.LeaderLabelUpdates) })
 }

@@ -1,8 +1,10 @@
 # High availability: two gateway replicas with leader election on a
-# Kubernetes Lease. Only the leader is ready and receives traffic; the
-# follower takes over when the leader goes away (sessions survive, running
-# requests fail). Read README.md, "Hochverfügbarkeit", before the first
-# rollout: a rollout needs a controlled failover to complete.
+# Kubernetes Lease. Both replicas are ready; the leader labels its pod
+# quackmux.io/leader=true, and the Service routes to that label alone
+# (service-patch.yaml). The follower takes over when the leader goes away
+# (sessions survive, running requests fail). Rollouts, "kubectl rollout
+# status", "kubectl drain" and health checks work as usual (README.md,
+# "Hochverfügbarkeit").
 #
 #   kubectl apply -k deploy/kubernetes/overlays/ha
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -28,3 +30,4 @@ configMapGenerator:
 
 patches:
   - path: deployment-patch.yaml
+  - path: service-patch.yaml
