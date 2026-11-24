@@ -358,13 +358,15 @@ profiles:
     # initSQL: |
     #   ATTACH 'https://data.example.com/lake.duckdb' AS lake (READ_ONLY);
     #   CREATE VIEW trips AS FROM lake.main.trips;
-    # SQL that runs right after the Quack server has started, on the same
-    # connection: settings that would break the start. Clients may already
-    # connect while it runs; a failing statement fails the engine. Shared
-    # engines (GROUP, SERVER) are hardened with the authorization macro of
-    # the engine image in initSQL and these two settings
-    # (deploy/kubernetes/README.md, "Gehärtete geteilte Engines"):
-    postStartSQL: ""
+    # postStartSQL (default empty): SQL that runs right after the Quack
+    # server has started, on the same connection: settings that would break
+    # the start. Clients may already connect while it runs; a failing
+    # statement fails the engine. It needs the engine image of the same
+    # quackmux version (older images ignore it), and older gateways reject
+    # the field: remove it before rolling the gateway back. Shared engines
+    # (GROUP, SERVER) are hardened with the authorization macro of the engine
+    # image in initSQL and these two settings (deploy/kubernetes/README.md,
+    # "Gehärtete geteilte Engines"):
     # initSQL: .read /usr/local/share/quackmux/authorize.sql
     # postStartSQL: |
     #   SET enable_external_access = false;
