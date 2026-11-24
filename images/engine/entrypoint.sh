@@ -46,6 +46,7 @@ workdir=       # private directory with the FIFO, removed once DuckDB serves
 duckdb_pid=    # PID of the DuckDB CLI
 duckdb_status= # exit status of the DuckDB CLI once collected
 serving=0      # 1 once the server runs and the post-start SQL is done
+post_start=0   # 1 if there is post-start SQL
 
 log() {
 	printf '%s: %s\n' "$prog" "$*" >&2
@@ -192,6 +193,25 @@ engine_details() {
 	printf '%s' "$details"
 }
 
+# warn_dac_override warns if DuckDB will run with CAP_DAC_OVERRIDE (root with
+# the default capabilities of a container): it may open any file regardless
+# of its mode, and so may every session with file access, also the FIFO.
+warn_dac_override() {
+	local key value
+	if [[ ! -r /proc/self/status ]]; then
+		return 0
+	fi
+	while read -r key value; do
+		if [[ $key == CapEff: && $value =~ ^[0-9a-fA-F]{1,16}$ ]]; then
+			# CAP_DAC_OVERRIDE is capability 1.
+			if (((16#$value >> 1) & 1)); then
+				log "warning: running with CAP_DAC_OVERRIDE (root with the default capabilities): a session with file access can write commands to the standard input of the DuckDB CLI despite its mode 0400; run the engine as a non-root user (the image's default) or without this capability, or harden it (post-start SQL)"
+			fi
+			return 0
+		fi
+	done </proc/self/status
+}
+
 prepare_workdir() {
 	local base=${TMPDIR:-/tmp}
 	if ! workdir=$(mktemp -d "$base/$prog.XXXXXXXXXX"); then
@@ -254,8 +274,12 @@ build_bootstrap() {
 	bootstrap+=".output stdout$nl"
 	# The server accepts connections from here on. The post-start SQL runs
 	# right away, but clients may already send queries while it runs.
+	local before=${#bootstrap}
 	read_sql_from_env post-start-env "${QUACKMUX_POST_START_SQL:-}"
 	read_sql_from_file post-start-file "$post_start_sql_file" QUACKMUX_POST_START_SQL_FILE
+	if ((${#bootstrap} > before)); then
+		post_start=1
+	fi
 	bootstrap+=".output $workdir/started$nl"
 	bootstrap+="SELECT 'started' AS quackmux_engine;$nl"
 	bootstrap+=".output stdout$nl"
@@ -392,6 +416,7 @@ main() {
 	trap cleanup EXIT
 
 	read_settings
+	warn_dac_override
 	prepare_workdir
 	build_bootstrap
 
@@ -404,6 +429,9 @@ main() {
 	wait_until_serving
 
 	if ((serving)); then
+		if ((post_start)); then
+			log "ran the post-start SQL"
+		fi
 		log "serving on $uri over plain HTTP ($(engine_details))"
 		# DuckDB has read everything up to here: drop the FIFO path, the copies
 		# of the init and post-start SQL and the marker. fd 3 keeps the FIFO
