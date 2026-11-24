@@ -444,7 +444,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 		Name: req.ID, Key: req.Key, Warm: req.Warm, User: req.User,
 		ProfileName: req.ProfileName, Profile: req.Profile, SpecHash: hash,
 	})
-	secret := p.secret(req.ID, req.Token, engine.RenderInitSQL(req.Profile))
+	secret := p.secret(req.ID, req.Token, req.Profile)
 	secrets := p.client.CoreV1().Secrets(p.namespace)
 	if req.Profile.Persistence != nil {
 		// The claim before the pod, which would otherwise wait for it.

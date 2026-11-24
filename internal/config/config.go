@@ -342,6 +342,11 @@ type Profile struct {
 	Database string `json:"database,omitempty"`
 	// InitSQL runs before the Quack server starts (ATTACH, SET, secrets...).
 	InitSQL string `json:"initSQL,omitempty"`
+	// PostStartSQL runs right after the Quack server has started, on the
+	// same connection: settings that would break the start, such as
+	// SET enable_external_access = false and SET lock_configuration = true.
+	// Clients may already connect while it runs.
+	PostStartSQL string `json:"postStartSQL,omitempty"`
 	// Settings are applied with SET before the server starts.
 	Settings map[string]string `json:"settings,omitempty"`
 	// Pool spreads sessions of one key over several engines.

@@ -500,7 +500,7 @@ func TestCollectOrphans(t *testing.T) {
 	e := newTestEnv(t, testConfig(t, ""))
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	mk := func(name, engineName, instance string, age time.Duration) *corev1.Secret {
-		s := e.p.secret(engineName, "t", "")
+		s := e.p.secret(engineName, "t", config.Profile{})
 		s.Name = name
 		s.Labels[LabelInstance] = instance
 		s.CreationTimestamp = metav1.NewTime(now.Add(-age))

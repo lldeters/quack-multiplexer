@@ -407,7 +407,7 @@ func (p *Provider) Launch(ctx context.Context, req engine.LaunchRequest) (engine
 	inst := pr.inst
 	p.mu.Unlock()
 	p.log.Info("engine process started", "engine", req.ID, "pid", pid, "port", port, "dir", pr.scratch)
-	go p.supervise(pr, serveScript(req.Profile, p.bindHost, port, req.Token))
+	go p.supervise(pr, serveScript(req.Profile, p.bindHost, port))
 	return inst, nil
 }
 
@@ -441,17 +441,29 @@ func (p *Provider) start(pr *proc, req engine.LaunchRequest) error {
 	cmd.Stderr = pr.output
 	cmd.WaitDelay = waitDelay
 	setProcAttr(cmd)
-	stdin, err := cmd.StdinPipe()
+	// What cmd.StdinPipe does, with a pipe that nobody can open again for
+	// writing (readOnlyPipe): whatever the CLI reads there runs on its own
+	// connection, dot commands such as .shell included.
+	stdinR, stdin, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	if err := cmd.Start(); err != nil {
+	if err := readOnlyPipe(stdin); err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		return fmt.Errorf("make the standard input of the engine read-only: %w", err)
+	}
+	cmd.Stdin = stdinR
+	err = cmd.Start()
+	_ = stdinR.Close() // the child has its own copy
+	if err != nil {
 		_ = stdin.Close()
 		return err
 	}
 	pr.cmd, pr.stdin = cmd, stdin
 	go func() {
 		pr.waitErr = cmd.Wait()
+		_ = stdin.Close() // nobody reads it any more
 		close(pr.exited)
 	}()
 	return nil

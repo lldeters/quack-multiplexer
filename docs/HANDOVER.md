@@ -158,9 +158,12 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    der Lücke scheitern mit „Could not connect to server“ und laufen nicht. Eigene Services, die Quack-Traffic
    routen, brauchen denselben Selector. Ein Upgrade von einer Version ohne Label lässt den Service während des
    Rollouts ohne Endpunkt. Alles in `deploy/kubernetes/README.md`, „Hochverfügbarkeit“.
-4. **Innerhalb einer Engine sieht jede Session das Init-SQL** (`/proc/1/environ`) und das Engine-Token
-   (`getenv`). Für Zugangsdaten `PROVIDER credential_chain` mit Workload Identity verwenden. `quack_stop(…)`
-   bleibt für jede Session aufrufbar, dagegen hilft nur eine `quack_authorization_function`.
+4. **Härtung geteilter Engines** (`postStartSQL` mit `enable_external_access = false` und
+   `lock_configuration = true`, dazu das Makro `images/engine/authorize.sql`): Das Makro ist eine Textprüfung
+   (Deny-Liste) und trennt keine Daten. Sessions einer Engine teilen Datenbanken und Spill-Dateien, Zugangsdaten
+   in ATTACH-URLs oder View-Definitionen aus dem Init-SQL sind über den Katalog lesbar, und eine gehärtete Engine
+   lädt keine Extensions mehr nach. Ohne Härtung kann jede Session `quack_stop(…)` aufrufen und das Engine-Token
+   lesen. Alles in `deploy/kubernetes/README.md`, „Härtung geteilter Engines“.
 5. **Die Schwärzung im Audit-Log ist eine Heuristik** (Schlüsselwörter wie `secret`, `passw`, `token`, URLs mit
    Passwort). Das Audit-Log bleibt vertraulich.
 6. **Spill-Platz** begrenzt nur die Konfiguration (`settings.max_temp_directory_size` plus
@@ -169,14 +172,15 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
 ## Nächste Schritte (priorisiert)
 
 Erledigt seit dem 2026-11-21: CI und Release mit GitHub Actions (`.github/workflows`, [docs/releasing.md](releasing.md)),
-der HA-Test nächtlich in CI, PVCs pro Engine-Schlüssel (`persistence`, kind-Szenarien k5–k8 und h6) und HA mit
-allen Replikas ready (Leader-Label, `ha.deregistrationDelay`, kind-Szenarien h1–h5 und h4b).
+der HA-Test nächtlich in CI, PVCs pro Engine-Schlüssel (`persistence`, kind-Szenarien k5–k8 und h6), HA mit
+allen Replikas ready (Leader-Label, `ha.deregistrationDelay`, kind-Szenarien h1–h5 und h4b) und die Härtung
+geteilter Engines (`postStartSQL`, Autorisierungs-Makro mit 199 Testfällen im Selbsttest des Images; dabei
+zwei Lecks im Engine-Image geschlossen: das Engine-Token über `FROM _` und Befehle über `/proc/self/fd/0`).
 
 1. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
-   Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`.
-2. **Engine-Image:** ein Haken für SQL nach dem Serverstart (etwa `SET enable_external_access = false`) und eine
-   Vorlage für `quack_authorization_function` gegen `quack_stop` und Co.
-3. Optional:
+   Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`, und auf gehärteten Engines eine Ausnahme im Makro
+   für genau diesen Text (`docs/design.md`, Abschnitt 10).
+2. Optional:
    * Query-/Request-Timeout (CANCEL nach X)
    * Helm-Chart
    * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)

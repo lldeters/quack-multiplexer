@@ -1,0 +1,244 @@
+# Cases for quackmux-authorize-test (authorize-test.sh): what the
+# authorization macro (authorize.sql) on a hardened engine must reject and
+# what it must let through, with DuckDB 2.0.0 and the extensions of the image.
+#
+# One case per line, four fields separated by a tab: ID, OUTCOME, KIND, SQL.
+# OUTCOME is BLOCK (rejected by the macro), PERM (refused by DuckDB: no file
+# or network access), LOCK (refused by DuckDB: configuration locked), ERR (any
+# error) or OK (no error). KIND Q sends the SQL to the engine as the text of
+# one query, the way a client pushes a query down (FROM r.query('...')); KIND
+# C runs it in the client on the attached database "r", so the client sends
+# its own queries (catalog, uploads). The cases run in this order in one
+# session. The SQL is ASCII; placeholders stand for other characters: {nl}
+# line feed, {tab}, {vt} vertical tab, {nbsp} U+00A0, {zwsp} U+200B, {idsp}
+# U+3000, {kelvin} U+212A KELVIN SIGN, {longs} U+017F LONG S, {cyr_a} U+0430
+# and {cyr_u} U+0443 (Cyrillic look-alikes of a and u). Lines starting with #
+# are comments.
+#
+# Tables and other objects that the cases create are named authz_* and
+# dropped at the end.
+
+# A table for the cases below.
+s01	OK	C	CREATE OR REPLACE TABLE r.authz_t AS SELECT range AS i, 'row ' || range AS s FROM range(1000)
+
+# The Quack server: quack_* in any spelling DuckDB accepts.
+a01	BLOCK	Q	SELECT * FROM quack_stop('quack:0.0.0.0:9494')
+a02	BLOCK	Q	CALL quack_stop('quack:0.0.0.0:9494')
+a03	BLOCK	Q	CALL QUACK_STOP('quack:0.0.0.0:9494')
+a04	BLOCK	Q	CALL "quack_stop"('quack:0.0.0.0:9494')
+a05	BLOCK	Q	CALL `Quack_Stop`('quack:0.0.0.0:9494')
+a06	BLOCK	Q	CALL system.main.quack_stop('quack:0.0.0.0:9494')
+a07	BLOCK	Q	CALL "system"."main"."quack_stop"('quack:0.0.0.0:9494')
+a08	BLOCK	Q	SELECT * FROM quack_stop/* x */('quack:0.0.0.0:9494')
+a09	BLOCK	Q	WITH s AS (SELECT * FROM quack_stop('quack:0.0.0.0:9494')) SELECT * FROM s
+a10	BLOCK	Q	/* hello */ CALL quack_stop('quack:0.0.0.0:9494')
+a11	BLOCK	Q	SELECT 1; CALL quack_stop('quack:0.0.0.0:9494')
+a12	BLOCK	Q	PREPARE authz_p1 AS SELECT * FROM quack_stop('quack:0.0.0.0:9494')
+a13	BLOCK	Q	EXPLAIN ANALYZE SELECT * FROM quack_stop('quack:0.0.0.0:9494')
+a14	BLOCK	Q	CALL quack_serve('quack:0.0.0.0:9999', token = 'attacker-token-0123456789', allow_other_hostname = true, disable_ssl = true)
+a15	BLOCK	Q	SELECT * FROM quack_active_connections()
+a16	BLOCK	Q	SELECT * FROM quack_server_list()
+a17	BLOCK	Q	CALL quack_identify(name := 'x')
+a18	BLOCK	Q	CALL quack_generate_keys(directory := '/tmp/k')
+a19	BLOCK	Q	CALL quack_clear_cache()
+a20	BLOCK	Q	SELECT * FROM quack_query('quack:localhost:9494', 'SELECT 1')
+a21	BLOCK	Q	CALL quack_stop{nbsp}('quack:0.0.0.0:9494')
+a22	BLOCK	Q	SELECT 'x' AS a, * FROM quack_stop('quack:0.0.0.0:9494') -- trailing
+a23	BLOCK	Q	SELECT 1{nl}UNION ALL SELECT count(*) FROM quack_stop('quack:0.0.0.0:9494'::VARCHAR)
+a24	ERR	Q	CALL quac{kelvin}_stop('quack:0.0.0.0:9494')
+a25	ERR	Q	CALL qu{cyr_a}ck_stop('quack:0.0.0.0:9494')
+a26	BLOCK	Q	CALL quack_cancel('x')
+a27	BLOCK	Q	SELECT 1 FROM quack_stop  {tab}{nl} ('quack:0.0.0.0:9494')
+a28	BLOCK	Q	SELECT quack_connection_id()
+
+# SQL that is not in the text of the query: built at run time, read from
+# files or called by name.
+b01	BLOCK	Q	SELECT * FROM query('SELECT * FROM quac' || 'k_stop(''quack:0.0.0.0:9494'')')
+b02	BLOCK	Q	SELECT * FROM "query"('SELECT 1')
+b03	BLOCK	Q	SELECT * FROM QUERY ('SELECT 1')
+b04	BLOCK	Q	SELECT * FROM query{vt}('SELECT 1')
+b05	BLOCK	Q	SELECT * FROM query{nbsp}('SELECT 1')
+b06	BLOCK	Q	SELECT * FROM query/* a /* b */ c */('SELECT 1')
+b07	BLOCK	Q	SELECT * FROM query--x{nl}('SELECT 1')
+b08	BLOCK	Q	SELECT * FROM system.main.query('SELECT 1')
+b09	BLOCK	Q	SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))
+b10	BLOCK	Q	PRAGMA json_execute_serialized_sql('x')
+b11	BLOCK	Q	SELECT json_serialize_plan('SELECT 1')
+b12	OK	Q	SELECT count(*) FROM query_table('authz_t')
+b13	ERR	Q	SELECT * FROM query_table('quac' || 'k_server_list')
+b14	BLOCK	Q	SELECT * FROM `query`('SELECT 1')
+b15	BLOCK	Q	SELECT * FROM query{zwsp}('SELECT 1')
+b16	BLOCK	Q	SELECT * FROM query{idsp}('SELECT 1')
+b17	ERR	Q	SELECT * FROM quer{cyr_u}('SELECT 1')
+b18	BLOCK	Q	SELECT * FROM "query" /*x*/ ('SELECT 1')
+b19	BLOCK	Q	SELECT json_serialize_sql('SELECT * FROM quack_server_list()')
+b20	BLOCK	Q	IMPORT DATABASE '/tmp/.tmp'
+b21	BLOCK	Q	import/**/database '/tmp/.tmp'
+b22	BLOCK	Q	PRAGMA import_database('/tmp/.tmp')
+b23	BLOCK	Q	PRAGMA import_database(current_setting('temp_directory'))
+b24	BLOCK	Q	FROM register_external_resource_type('authz_squat', kind := 'x', create_function := concat('duckdb_', 'settings'), status_function := 'unnest')
+b25	BLOCK	Q	FROM create_external_resource('authz_squat')
+b26	BLOCK	Q	CREATE EXTERNAL RESOURCE 'authz_squat' AS authz_res1
+b27	BLOCK	Q	REGISTER EXTERNAL RESOURCE 'authz_squat' AS authz_res2 FROM MAP {}
+b28	BLOCK	Q	DESTROY EXTERNAL /* x */ RESOURCE authz_res1
+b29	BLOCK	Q	SHOW ALL EXTERNAL RESOURCES
+b30	BLOCK	Q	SELECT * FROM duckdb_external_resource_types()
+b31	BLOCK	Q	CALL deregister_external_resource('authz_res2')
+
+# The environment, files, the network and the state of the engine's CLI.
+c01	BLOCK	Q	SELECT getenv('QUACK_TOKEN')
+c02	PERM	Q	SELECT * FROM read_text('/proc/1/environ')
+c03	PERM	Q	SELECT * FROM read_blob('/proc/self/environ')
+c04	PERM	Q	SELECT * FROM read_text('/pr' || 'oc/1/environ')
+c05	PERM	Q	SELECT * FROM read_csv('/proc/1/environ')
+c06	ERR	Q	SELECT * FROM '/proc/1/environ'
+c07	PERM	Q	SELECT * FROM glob('/*')
+c08	PERM	Q	SELECT * FROM read_csv('http://example.com/x.csv')
+c09	ERR	Q	INSTALL json
+c10	OK	Q	LOAD httpfs
+c11	BLOCK	Q	SELECT * FROM shell_history()
+c12	OK	Q	SELECT name, secret_string FROM duckdb_secrets()
+c13	ERR	Q	SELECT name, secret_string FROM duckdb_secrets(redact := false)
+c14	OK	Q	SELECT current_setting('home_directory'), current_setting('temp_directory')
+c15	PERM	Q	SELECT * FROM read_text('/usr/local/share/quackmux/authorize.sql')
+c16	OK	Q	FROM _
+c17	ERR	Q	LOAD '/tmp/evil.duckdb_extension'
+c18	PERM	Q	SELECT * FROM read_text('/tmp/quackmux-engine*/init-env.sql')
+c19	PERM	Q	SELECT * FROM read_text('/proc/self/fd/0')
+c20	OK	Q	SELECT * FROM which_secret('s3://bucket/x', 's3')
+c21	BLOCK	Q	SELECT write_log('forged entry')
+c22	BLOCK	Q	CALL truncate_duckdb_logs()
+
+# Settings: lock_configuration leaves only search_path, schema and variables.
+d01	BLOCK	Q	SET GLOBAL quack_authorization_function = 'quack_nop_authorization'
+d02	LOCK	Q	SET enable_external_access = true
+d03	LOCK	Q	SET lock_configuration = false
+d04	LOCK	Q	RESET lock_configuration
+d05	LOCK	Q	SET threads = 1
+d06	LOCK	Q	SET GLOBAL memory_limit = '1GB'
+d07	LOCK	Q	PRAGMA threads = 1
+d08	LOCK	Q	RESET threads
+d09	LOCK	Q	CALL enable_logging('QueryLog')
+d10	LOCK	Q	SET allowed_directories = ['/']
+d11	LOCK	Q	SET temp_directory = '/tmp/other'
+d12	OK	Q	SET VARIABLE authz_x = 42
+d13	OK	Q	SET search_path = 'main'
+d14	ERR	Q	SET GLOBAL search_path = 'main'
+d15	LOCK	Q	SET allow_unredacted_secrets = true
+d16	ERR	Q	RESET ALL
+d17	LOCK	Q	PRAGMA enable_profiling
+d18	LOCK	Q	SET allowed_configs = ['threads']
+d19	LOCK	Q	CALL disable_logging()
+
+# What all sessions share: macros, functions, secrets, databases, checkpoints.
+e01	BLOCK	Q	CREATE OR REPLACE MACRO quackmux_authorize(c, s) AS true
+e02	BLOCK	Q	DROP MACRO quackmux_authorize
+e03	BLOCK	Q	CREATE MACRO regexp_matches(a, b, c) AS false
+e04	BLOCK	Q	CREATE FUNCTION authz_f(x) AS x + 1
+e05	BLOCK	Q	CREATE TEMP MACRO authz_tm(x) AS x * 2
+e06	BLOCK	Q	CREATE SCHEMA system
+e07	BLOCK	Q	CREATE SCHEMA /* x */ "System"
+e08	BLOCK	Q	CREATE SECRET authz_evil (TYPE s3, KEY_ID 'x', SECRET 'y', SCOPE 's3://bucket/')
+e09	BLOCK	Q	DROP SECRET authz_s3x
+e10	BLOCK	Q	DETACH memory
+e11	BLOCK	Q	ATTACH ':memory:' AS authz_scratch
+e12	BLOCK	Q	ATTACH OR REPLACE ':memory:' AS memory
+e13	BLOCK	Q	CHECKPOINT
+e14	BLOCK	Q	FORCE CHECKPOINT
+e15	BLOCK	Q	CALL force_checkpoint()
+e16	ERR	Q	DROP SCHEMA main CASCADE
+e17	OK	Q	CREATE OR REPLACE TABLE system (main INTEGER)
+e18	BLOCK	Q	CREATE MACRO "||"(a, b) AS 'shadowed'
+e19	BLOCK	Q	CREATE /* ; */ OR REPLACE PERSISTENT SECRET authz_p2 (TYPE s3)
+e20	BLOCK	Q	CREATE {longs}ECRET authz_evil (TYPE s3, KEY_ID 'x', SECRET 'y')
+e21	ERR	Q	FORCE CHEC{kelvin}POINT
+e22	OK	Q	CREATE TYPE authz_mood AS ENUM ('ok', 'sad')
+e23	BLOCK	Q	CREATE OR REPLACE MACRO sum(x) AS 0
+e24	BLOCK	Q	PRAGMA add_parquet_key('authz_key', '0123456789112345')
+e25	BLOCK	Q	CREATE TRIGGER authz_trg AFTER INSERT ON authz_t FOR EACH ROW EXECUTE SELECT 1
+e26	BLOCK	Q	DROP TRIGGER IF EXISTS authz_trg
+e27	BLOCK	Q	ALTER DATABASE memory SET ALIAS TO authz_alias
+
+# Writing files: with external access off, DuckDB still allows its temp
+# directory and the files of the attached databases (the database file and
+# its WAL). IMPORT DATABASE would run what lands there.
+h01	BLOCK	Q	EXPORT DATABASE '/tmp/.tmp'
+h02	BLOCK	Q	EXPORT DATABASE memory TO '/tmp/.tmp/exp' (FORMAT parquet)
+h03	BLOCK	Q	export/* x */database '/tmp/.tmp'
+h04	BLOCK	Q	COPY (SELECT 1 AS x) TO '/tmp/.tmp/schema.sql' (FORMAT csv, HEADER false, QUOTE '')
+h05	BLOCK	Q	COPY (SELECT 1 AS x) TO (current_setting('temp_directory') || '/schema.sql') (FORMAT csv, HEADER false, QUOTE '')
+h06	BLOCK	Q	COPY (SELECT 'garbage' AS x) TO '/data/engine.duckdb' (FORMAT csv, HEADER false, USE_TMP_FILE false)
+h07	BLOCK	Q	COPY (SELECT 1 AS x) TO '/data/engine.duckdb.wal' (FORMAT csv, USE_TMP_FILE false)
+h08	BLOCK	Q	COPY (SELECT '.print injected') TO '/proc/self/fd/0' (FORMAT csv, HEADER false, QUOTE '')
+h09	BLOCK	Q	COPY authz_t TO '/tmp/.tmp/t.parquet' (FORMAT parquet)
+h10	BLOCK	Q	COPY authz_t FROM '/tmp/.tmp/t.parquet'
+h11	BLOCK	Q	COPY FROM DATABASE memory TO memory
+h12	BLOCK	Q	PRAGMA copy_database('memory', 'memory')
+h13	BLOCK	Q	/* x */COPY(SELECT 1)TO'/tmp/.tmp/a.csv'
+h14	BLOCK	Q	EXPLAIN COPY (SELECT 1) TO '/tmp/.tmp/a.csv'
+h15	BLOCK	Q	PREPARE authz_p2 AS COPY (SELECT 1) TO '/tmp/.tmp/a.csv'
+h16	BLOCK	Q	COPY (SELECT 1) TO '/tmp/x.csv'
+h17	BLOCK	Q	EXPORT DATABASE '/tmp/exp'
+h18	BLOCK	Q	CONNECT ':memory:'
+h19	BLOCK	Q	CONNECT '/tmp/.tmp/x.duckdb'
+h20	BLOCK	Q	ATTACH TO NEW TEMPORARY EXTERNAL RESOURCE 'authz_squat' AS authz_res3
+h21	BLOCK	Q	CONNECT TO EXTERNAL RESOURCE authz_res1
+
+# Known false positives: a word in a string or comment is enough.
+g01	BLOCK	Q	SELECT 'quack_stop' AS s
+g02	BLOCK	Q	SELECT 1 -- getenv
+g03	BLOCK	Q	CREATE TABLE authz_notes AS SELECT 'a secret' AS s
+g04	BLOCK	Q	SELECT 'attach' AS s
+g05	BLOCK	Q	SELECT 'copy' AS s FROM range(1)
+g06	BLOCK	Q	SELECT 'connect' AS s
+g07	BLOCK	Q	SELECT 'export to the database' AS s
+g08	BLOCK	Q	SELECT 'external' AS a, 'resource' AS b
+
+# Words that are not rejected on their own.
+k01	OK	Q	SELECT 'export' AS direction, 'import' AS kind
+k02	OK	Q	SELECT 1 AS copy_count, 2 AS exported, 3 AS importer, 4 AS reconnect
+k03	OK	Q	SELECT count(*) FROM range(3) WHERE 'copy' <> ''
+k04	OK	Q	SELECT 'disconnect' AS s, current_database() AS db
+k05	OK	Q	SELECT database_name FROM duckdb_databases() WHERE 'import' <> '' AND NOT internal
+k06	OK	Q	SELECT 'a query' AS q, 'query_count' AS c
+
+# Ordinary work, also through the client's own queries (catalog, uploads,
+# transactions) and the client's own files.
+f01	OK	C	SELECT count(*), sum(i) FROM r.authz_t
+f02	OK	C	CREATE TABLE r.authz_up AS SELECT range AS id FROM range(20000); INSERT INTO r.authz_up SELECT range FROM range(5); UPDATE r.authz_up SET id = id + 1 WHERE id < 3; DELETE FROM r.authz_up WHERE id > 9000; SELECT count(*) FROM r.authz_up; DROP TABLE r.authz_up
+f03	OK	C	CREATE OR REPLACE TABLE authz_local AS SELECT range AS id FROM range(50000); CREATE TABLE r.authz_up2 AS SELECT id FROM authz_local; SELECT count(*), sum(id) FROM r.authz_up2; DROP TABLE r.authz_up2
+f04	OK	C	CREATE VIEW r.authz_v1 AS SELECT 1 AS x; SELECT * FROM r.authz_v1; DROP VIEW r.authz_v1
+f05	OK	C	BEGIN; SELECT count(*) FROM r.authz_t; COMMIT
+f06	OK	C	DESCRIBE r.authz_t; SHOW ALL TABLES
+f07	OK	Q	SELECT query FROM (SELECT 1 AS query)
+f08	OK	Q	SELECT 'slow query' AS s, 1 AS query_count
+f09	OK	C	SELECT s FROM r.authz_t WHERE s LIKE 'row 1%' ORDER BY i LIMIT 3
+f10	OK	C	SELECT count(*) FROM (SELECT * FROM r.authz_t)
+f11	OK	Q	SELECT count(*) > 0 FROM duckdb_tables()
+f12	OK	Q	SELECT current_setting('threads') > 0
+f13	OK	Q	SELECT count(*) > 0 FROM duckdb_functions() WHERE function_name = 'sum'
+f14	OK	Q	CREATE TEMP TABLE authz_scratch AS SELECT 21 AS half
+f15	OK	C	CREATE SCHEMA r.authz_reports; CREATE TABLE r.authz_reports.x AS SELECT 1 AS a; SELECT * FROM r.authz_reports.x; DROP TABLE r.authz_reports.x; DROP SCHEMA r.authz_reports
+f16	OK	Q	SELECT count(*) FROM duckdb_secrets()
+f17	OK	Q	SELECT sum(range) FROM range(10000000)
+f18	OK	Q	CREATE OR REPLACE TABLE authz_sort AS SELECT range AS a, md5(range::VARCHAR) AS b FROM range(300000); SELECT count(DISTINCT b) FROM (SELECT b FROM authz_sort ORDER BY b); DROP TABLE authz_sort
+f19	OK	C	SELECT i, s FROM r.authz_t ORDER BY i DESC LIMIT 2
+f20	OK	C	SELECT count(*) FROM r.authz_t a JOIN r.authz_t b USING (i)
+f21	OK	Q	SELECT 'secret' AS word, 'function' AS other
+f22	OK	Q	SELECT count(*) FROM information_schema.tables WHERE table_schema = 'main'
+f23	OK	Q	SELECT * FROM duckdb_schemas() WHERE database_name NOT IN ('system', 'temp')
+f24	OK	C	USE r; SELECT count(*) FROM authz_t; USE memory
+f25	OK	Q	SELECT list_transform([1, 2], lambda x: x * 2), regexp_matches('a', 'a'), 'a' || 'b'
+f26	OK	Q	SELECT * FROM duckdb_views() LIMIT 1
+f27	OK	Q	CREATE SEQUENCE authz_seq1; SELECT nextval('authz_seq1'); DROP SEQUENCE authz_seq1
+f28	OK	Q	SELECT count(*) FROM duckdb_temporary_files()
+f29	OK	Q	SELECT half * 2 FROM authz_scratch
+f30	OK	Q	SELECT database_name, path FROM duckdb_databases()
+f31	OK	C	COPY (SELECT * FROM r.authz_t) TO '/tmp/authz-client.csv' (HEADER true)
+f32	OK	C	CREATE OR REPLACE TABLE r.authz_copy AS SELECT * FROM r.authz_t LIMIT 0; COPY r.authz_copy FROM '/tmp/authz-client.csv' (HEADER true); SELECT count(*) FROM r.authz_copy; DROP TABLE r.authz_copy
+f33	OK	Q	SELECT 'trigger' AS word, 'database' AS first, 'alter' AS second
+
+# Clean up; the engine still serves.
+z01	OK	Q	DROP TABLE IF EXISTS system; DROP TYPE IF EXISTS authz_mood
+z02	OK	C	DROP TABLE IF EXISTS r.authz_t
+z03	OK	Q	SELECT 'alive' AS s

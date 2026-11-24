@@ -7,12 +7,22 @@
 #   bin/quackmux.exe serve -config examples/config.static.yaml
 #
 # Each engine serves Quack over plain HTTP on an address the gateway can
-# reach, with the token configured below, e.g. in the DuckDB 2.0 CLI (with
-# QUACK_TOKEN in its environment; the CLI must keep running):
-#   CALL quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
-#                    allow_other_hostname = true, disable_ssl = true);
-# The engine image (images/engine) does exactly this. Shield the engines so
-# that only the gateway can reach them.
+# reach, with the token configured below. The engine image (images/engine)
+# does that; by hand, in a DuckDB 2.0 CLI that keeps running, with
+# QUACK_TOKEN in its environment:
+#   SELECT listen_uri FROM quack_serve('quack:0.0.0.0:9494',
+#       token = getenv('QUACK_TOKEN'), allow_other_hostname = true,
+#       disable_ssl = true);
+#   SELECT 'started';
+# Every session of the engine can read the last result of this CLI
+# (FROM _): the row of quack_serve holds the token, so select only
+# listen_uri and end with a harmless SELECT. Also keep the CLI's standard
+# input out of the sessions' reach (images/engine/README.md, "Sicherheit").
+# Shield the engines so that only the gateway can reach them. Shared
+# engines are hardened on the engines themselves, not in the profiles below
+# (images/engine/README.md):
+#   QUACKMUX_INIT_SQL=".read /usr/local/share/quackmux/authorize.sql"
+#   QUACKMUX_POST_START_SQL="SET enable_external_access = false; SET lock_configuration = true;"
 
 server:
   listen: ":9494"

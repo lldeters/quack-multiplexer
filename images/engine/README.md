@@ -6,8 +6,9 @@ Veröffentlicht als `ghcr.io/lldeters/duckdb-engine:<duckdb>-<quackmux>` (amd64 
 Aus diesem Image startet quackmux seine Engines. Es enthält die DuckDB-CLI 2.0.0 mit vorinstallierten Extensions
 (`quack`, `httpfs`), `tini` als PID 1 und den Entrypoint `quackmux-engine`. Der Entrypoint setzt den
 Engine-Container-Vertrag aus [`internal/engine/initsql.go`](../../internal/engine/initsql.go) um: Er öffnet die
-Datenbank, führt das Init-SQL aus und startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP. Danach läuft er im
-Vordergrund, bis ein `SIGTERM` kommt. Das Image funktioniert auch ohne Gateway als einzelner Quack-Server.
+Datenbank, führt das Init-SQL aus, startet `quack_serve` auf `0.0.0.0:9494` über Plain HTTP und führt danach das
+Post-Start-SQL aus. Dann läuft er im Vordergrund, bis ein `SIGTERM` kommt. Das Image funktioniert auch ohne Gateway
+als einzelner Quack-Server.
 
 | Pfad | Inhalt |
 |---|---|
@@ -15,6 +16,9 @@ Vordergrund, bis ein `SIGTERM` kommt. Das Image funktioniert auch ohne Gateway a
 | `/opt/duckdb/extensions` | vorinstallierte Extensions, gehört `root` und ist für die Engine nur lesbar |
 | `/usr/local/bin/quackmux-engine` | Entrypoint ([`entrypoint.sh`](entrypoint.sh)) |
 | `/usr/local/bin/quackmux-engine-selftest` | Smoke-Test des Images ([`selftest.sh`](selftest.sh)) |
+| `/usr/local/share/quackmux/authorize.sql` | Autorisierungs-Makro für geteilte Engines ([`authorize.sql`](authorize.sql), siehe „Sicherheit“) |
+| `/usr/local/share/quackmux/authorize-cases.tsv` | Fälle, die das Makro ablehnen oder durchlassen muss ([`authorize-cases.tsv`](authorize-cases.tsv)) |
+| `/usr/local/bin/quackmux-authorize-test` | Prüft eine gehärtete Engine oder ein Gateway davor mit diesen Fällen ([`authorize-test.sh`](authorize-test.sh)) |
 | `/data` | leerer Mountpoint für Datenbankdateien, gehört dem Engine-Benutzer |
 
 Der Prozess läuft als Benutzer `duckdb` (UID/GID 1000) mit `HOME=/tmp` und Arbeitsverzeichnis `/tmp`. Port: 9494.
@@ -28,6 +32,8 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 | `QUACKMUX_DATABASE` | `:memory:` | Datenbank, die DuckDB öffnet: `:memory:` oder ein Dateipfad, z. B. `/data/engine.duckdb`. |
 | `QUACKMUX_INIT_SQL` | – | SQL, das vor dem Start des Servers läuft (`ATTACH`, `CREATE SECRET`, `SET` …). Das Gateway übergibt hier `settings` und `initSQL` des Profils. |
 | `QUACKMUX_INIT_SQL_FILE` | – | Datei mit weiterem Init-SQL. Sie läuft nach `QUACKMUX_INIT_SQL`, z. B. aus einer ConfigMap oder einem Secret. |
+| `QUACKMUX_POST_START_SQL` | – | SQL, das direkt nach dem Start des Servers läuft, etwa `SET enable_external_access = false;` (siehe „Hinweise zum Post-Start-SQL“). Das Gateway übergibt hier `postStartSQL` des Profils. |
+| `QUACKMUX_POST_START_SQL_FILE` | – | Datei mit weiterem Post-Start-SQL. Sie läuft nach `QUACKMUX_POST_START_SQL`. |
 | `QUACKMUX_PORT` | `9494` | Port des Quack-Servers. |
 | `QUACKMUX_BIND` | `0.0.0.0` | Adresse, an die der Server bindet. |
 | `QUACKMUX_EXTENSION_DIR` | `/opt/duckdb/extensions` | Verzeichnis, aus dem DuckDB Extensions lädt. |
@@ -41,8 +47,9 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
 ## Start
 
 1. Der Entrypoint prüft die Variablen. Bei einem Fehler endet er mit Exit-Code 78.
-2. Er legt ein privates Verzeichnis (`mktemp -d`, Modus 0700) mit einer FIFO an und hält sie auf fd 3 read-write
-   offen. Dann startet er `duckdb -init /dev/null -bail <Datenbank>` mit der FIFO als stdin. Das Init-SQL kopiert er
+2. Er legt ein privates Verzeichnis (`mktemp -d`, Modus 0700) mit einer FIFO an, hält sie auf fd 3 read-write offen
+   und setzt sie dann auf Modus 0400: Niemand kann sie danach noch zum Schreiben öffnen (siehe „Sicherheit“). Dann
+   startet er `duckdb -init /dev/null -bail <Datenbank>` mit der FIFO als stdin. Init- und Post-Start-SQL kopiert er
    in private Dateien (Modus 0600).
 3. Über die FIFO bekommt DuckDB:
 
@@ -56,22 +63,28 @@ Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distr
    .read <Kopie von QUACKMUX_INIT_SQL>
    .read <Kopie von QUACKMUX_INIT_SQL_FILE>
    .output /dev/null
-   CALL quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
-                    allow_other_hostname = true, disable_ssl = true);
+   SELECT listen_uri FROM quack_serve('quack:0.0.0.0:9494', token = getenv('QUACK_TOKEN'),
+                                      allow_other_hostname = true, disable_ssl = true);
+   .output stdout
+   .read <Kopie von QUACKMUX_POST_START_SQL>
+   .read <Kopie von QUACKMUX_POST_START_SQL_FILE>
    .output <Marker-Datei>
+   SELECT 'started' AS quackmux_engine;
+   .output stdout
    ```
 
-4. Legt DuckDB die Marker-Datei an, ist alles fehlerfrei gelaufen, denn `-bail` bricht beim ersten Fehler ab. Der
-   Entrypoint loggt dann `quackmux-engine: serving on quack:0.0.0.0:9494 over plain HTTP (…)` und löscht das
-   Verzeichnis. Die FIFO bleibt über fd 3 offen. Ab jetzt beantwortet der Server `GET /` ohne Authentifizierung. Das
-   nutzt die Readiness-Probe.
-5. Beendet sich DuckDB vorher, etwa wegen eines Fehlers im Init-SQL, meldet der Entrypoint das und endet mit dem
-   Exit-Code von DuckDB, mindestens aber mit 1.
+4. Ab `quack_serve` beantwortet der Server `GET /` ohne Authentifizierung. Das nutzt die Readiness-Probe. Clients
+   können sich also schon verbinden, während das Post-Start-SQL läuft.
+5. Legt DuckDB die Marker-Datei an, ist alles fehlerfrei gelaufen, denn `-bail` bricht beim ersten Fehler ab. Der
+   Entrypoint loggt dann `quackmux-engine: serving on quack:0.0.0.0:9494 over plain HTTP (…)`, mit Post-Start-SQL
+   davor `quackmux-engine: ran the post-start SQL`, und löscht das Verzeichnis. Die FIFO bleibt über fd 3 offen.
+6. Beendet sich DuckDB vorher, etwa wegen eines Fehlers im Init- oder Post-Start-SQL, meldet der Entrypoint das und
+   endet mit dem Exit-Code von DuckDB, mindestens aber mit 1.
 
 Warum eine FIFO: Die DuckDB-CLI beendet sich beim EOF auf stdin, und Kubernetes liefert ohne `stdin: true` sofort EOF.
 `duckdb -serve` ist kein Daemon-Modus und kann nicht an `0.0.0.0` binden. Über die FIFO landen keine Statements in den
-Prozessargumenten. Das Token liest DuckDB selbst per `getenv('QUACK_TOKEN')`. Die Ergebniszeile von `quack_serve`,
-die das Token enthält, geht nach `/dev/null`.
+Prozessargumenten. Das Token liest DuckDB selbst per `getenv('QUACK_TOKEN')`. Von der Ergebniszeile von
+`quack_serve`, die das Token enthält, wählt der Entrypoint nur die Adresse aus, und sie geht nach `/dev/null`.
 
 ### Hinweise zum Init-SQL
 
@@ -85,12 +98,46 @@ die das Token enthält, geht nach `/dev/null`.
   `SET GLOBAL …` im Init-SQL. YAML-Werte in `settings` müssen Strings sein (`threads: "4"`).
 * Extensions lassen sich zur Laufzeit nicht installieren: Das Verzeichnis ist schreibgeschützt und Autoinstall ist
   aus. Vorinstallierte Extensions lädt `LOAD` oder Autoload. Weitere Extensions kommen ins Image (siehe unten).
+  Nach `SET enable_external_access = false` im Post-Start-SQL lädt DuckDB keine Extension mehr, auch nicht per
+  Autoload: Was Sessions brauchen, lädt dann das Init-SQL (`LOAD spatial;`). `quack` und `httpfs` sind bis dahin
+  geladen.
 * `enable_external_access = false` darf nicht im Init-SQL stehen, sonst startet die Engine nicht. Das Token wird
   erst danach per `getenv()` gelesen, DuckDB sperrt `getenv()` ohne External Access, und `quack_serve` braucht
-  selbst Dateizugriff (`$HOME/.duckdb/stored_secrets`). Erst nach `quack_serve` gesetzt, würde es den Server nicht
-  stören. Dafür hat der Entrypoint noch keinen Haken.
+  selbst Dateizugriff (`$HOME/.duckdb/stored_secrets`). Es gehört ins Post-Start-SQL.
 * `SET lock_configuration = true` als letzte Anweisung des Init-SQL funktioniert: Clients verbinden sich und fragen
-  ab, nur ihre eigenen `SET`s schlagen fehl („the configuration has been locked“).
+  ab, nur ihre eigenen `SET`s schlagen fehl („the configuration has been locked“). Zusammen mit
+  `enable_external_access = false` gehört es ans Ende des Post-Start-SQL.
+
+### Hinweise zum Post-Start-SQL
+
+* Es läuft direkt nach `quack_serve` auf derselben Verbindung wie das Init-SQL, ebenfalls als Skript (`.read`). Die
+  Ausgabe landet im Log.
+* Wofür: Einstellungen, die vor `quack_serve` den Start verhindern würden. Für geteilte Engines:
+
+  ```sql
+  SET enable_external_access = false;   -- keine Dateien, kein Netz, kein getenv() für alle Sessions
+  SET lock_configuration = true;        -- danach kein SET und RESET mehr
+  ```
+
+  Der Server läuft damit weiter (Queries, Uploads, Fetches), und auch das Stoppen mit `quack_stop` und
+  `FORCE CHECKPOINT` funktioniert (mit DuckDB 2.0.0 geprüft). `enable_external_access` lässt sich danach nicht wieder
+  einschalten. DuckDB selbst erlaubt dann weiter sein Temp-Verzeichnis und die Dateien der angehängten Datenbanken,
+  die Datenbankdatei samt WAL: Jede Session kann sie lesen und schreiben, wenn das Makro aus
+  [`authorize.sql`](authorize.sql) `COPY` und `EXPORT DATABASE` nicht sperrt. Weitere Ausnahmen erlauben
+  `allowed_paths` (Dateien) und `allowed_directories` (Präfixe von Pfaden und URLs), gesetzt vor
+  `enable_external_access`; HTTPS und S3 brauchen zusätzlich das CA-Bundle:
+
+  ```sql
+  SET allowed_directories = ['/data/import/', 'https://example.com/daten/'];
+  SET allowed_paths = ['/etc/ssl/certs/ca-certificates.crt'];
+  ```
+
+  Was das für Clients bedeutet und was es nicht verhindert:
+  [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Gehärtete geteilte Engines“.
+* Der Server nimmt schon Verbindungen an, während es läuft. Bis zu seinem Ende ist die Engine also nicht gehärtet.
+  Halten Sie es kurz; das Makro aus [`authorize.sql`](authorize.sql) lehnt bis dahin jede Anfrage ab.
+* Der erste Fehler beendet DuckDB und damit die Engine (Exit-Code mindestens 1). Weil `GET /` schon antwortet, kann
+  das Gateway die Engine kurz für bereit gehalten haben; ihre Sessions scheitern dann.
 
 ## Stoppen
 
@@ -126,8 +173,9 @@ make docker-engine        # mit geprüftem Download (DUCKDB_SHA256_* im Makefile
 
 Der Build-Kontext ist `images/engine`. Beim Bauen lädt Docker das Release von GitHub und die Extensions von
 `extensions.duckdb.org`. Am Ende startet der Build `quackmux-engine-selftest` im fertigen Image als UID 1000: Start,
-`GET /`, kein Token in Ausgabe und Prozessargumenten, `SIGTERM`, Exit-Code 0 und ein Init-SQL-Ergebnis in einer
-Datenbankdatei. Schlägt der Test fehl, bricht der Build mit dem Log der Engine ab.
+`GET /`, kein Token in Ausgabe und Prozessargumenten, `SIGTERM`, Exit-Code 0, ein Init-SQL-Ergebnis in einer
+Datenbankdatei und eine gehärtete Engine mit den Fällen des Autorisierungs-Makros. Schlägt der Test fehl, bricht der
+Build mit dem Log der Engine ab.
 
 | Build-Argument | Default | Bedeutung |
 |---|---|---|
@@ -252,14 +300,37 @@ Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
 
 ## Sicherheit
 
-* Token und Init-SQL stehen nie in Prozessargumenten oder Logs. Der Entrypoint kopiert das Init-SQL in private
-  Dateien, die er löscht, sobald der Server läuft, und hält `QUACKMUX_INIT_SQL` aus der Umgebung von DuckDB
-  heraus. Der Kubernetes-Provider liefert beide aus dem Secret der Engine, nicht als Klartext in der Pod-Spec.
+* Token, Init- und Post-Start-SQL stehen nie in Prozessargumenten oder Logs. Der Entrypoint kopiert das SQL in
+  private Dateien, die er löscht, sobald die Engine bereit ist, und hält `QUACKMUX_INIT_SQL` und
+  `QUACKMUX_POST_START_SQL` aus der Umgebung von DuckDB heraus. Der Kubernetes-Provider liefert alle drei aus dem
+  Secret der Engine, nicht als Klartext in der Pod-Spec.
 * Clients einer Engine führen beliebiges SQL als Engine-Benutzer aus. Mit External Access, dem DuckDB-Default,
   können sie Dateien und die Umgebung der Prozesse im Container lesen, also `QUACK_TOKEN` und auch das Init-SQL
   (die Umgebung von tini, etwa per `read_text('/proc/1/environ')`). Deshalb darf nur das Gateway Port 9494
   erreichen (NetworkPolicy). Zugangsdaten im Init-SQL kann jeder Benutzer der Engine auslesen: In geteilten
   Engines (`GROUP`, `SERVER`) gehören dorthin nur Secrets, die alle Benutzer verwenden dürfen. Besser sind
   Provider ohne Schlüssel im SQL, etwa `CREATE SECRET (TYPE s3, PROVIDER credential_chain)` mit Workload Identity.
+* Jede Session kann zwei Dinge der CLI lesen, auf deren Verbindung der Entrypoint arbeitet: das letzte Ergebnis
+  (`FROM _`) und die Zeilen, die die CLI von stdin gelesen hat (`shell_history()`). Das letzte Ergebnis ist deshalb
+  immer harmlos (`SELECT 'started'`), und über stdin kommen nur die Anweisungen aus „Start“, nie Init-SQL oder Token.
+* Was die CLI auf stdin liest, führt sie auf ihrer eigenen Verbindung aus, auch Dot-Commands wie `.shell`. Mit
+  External Access könnte eine Session die FIFO über `/proc/<pid>/fd/0` zum Schreiben öffnen (`COPY … TO`). Weil der
+  Entrypoint sie nach dem Öffnen auf Modus 0400 setzt, scheitert das mit „Permission denied“. Das gilt nur ohne
+  `CAP_DAC_OVERRIDE`: als UID 1000 wie im Image oder als Root ohne Capabilities (`--cap-drop ALL`). Als Root mit den
+  Default-Capabilities eines Containers gilt der Modus nicht; der Entrypoint warnt dann beim Start. Der
+  Selbsttest prüft beides mit einem Quack-Client.
+* Für geteilte Engines bringt das Image ein Makro für `quack_authorization_function` mit, das `quack_stop`,
+  `quack_serve`, `getenv` und andere gefährliche Aufrufe der Clients ablehnt. Es wirkt nur zusammen mit dem
+  Post-Start-SQL oben:
+
+  ```sh
+  -e QUACKMUX_INIT_SQL=".read /usr/local/share/quackmux/authorize.sql"
+  -e QUACKMUX_POST_START_SQL="SET enable_external_access = false; SET lock_configuration = true;"
+  ```
+
+  Was es abdeckt und was nicht: [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Gehärtete
+  geteilte Engines“. Der Selbsttest prüft diese Kombination mit den Fällen aus
+  [`authorize-cases.tsv`](authorize-cases.tsv); eine laufende Engine oder ein Gateway davor prüft
+  `QUACK_TOKEN=<token> quackmux-authorize-test <host>:<port>` aus dem Image.
 * Das Extension-Verzeichnis ist schreibgeschützt und Autoinstall ist aus. Engines brauchen deshalb keinen
   Internetzugang.

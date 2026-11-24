@@ -2,7 +2,9 @@
 #
 #   engine-shared      DuckDB 2.0 Quack server (image from images/engine) for the
 #                      SERVER share level; its table "whoami" says 'shared'
-#   engine-analytics   the same for the GROUP share level of group "analytics"
+#   engine-analytics   the same for the GROUP share level of group "analytics",
+#                      hardened like a shared engine (authorization macro and
+#                      post-start settings, images/engine/README.md)
 #   gateway            quackmux in front of both (provider static, auth static)
 #   gateway-idle       the same with session.idleTimeout 15s
 #   client             DuckDB 2.0 CLI from the engine image (profile "client",
@@ -48,7 +50,10 @@ services:
       QUACK_TOKEN: "${E2E_ENGINE_ANALYTICS_TOKEN:?run run.sh or pass --env-file e2e.env}"
       QUACKMUX_DATABASE: ":memory:"
       QUACKMUX_PORT: "9494"
-      QUACKMUX_INIT_SQL: "CREATE TABLE whoami AS SELECT 'analytics' AS engine;"
+      QUACKMUX_INIT_SQL: |
+        CREATE TABLE whoami AS SELECT 'analytics' AS engine;
+        .read /usr/local/share/quackmux/authorize.sql
+      QUACKMUX_POST_START_SQL: "SET enable_external_access = false; SET lock_configuration = true;"
       QUACKMUX_ENGINE_ID: "engine-analytics"
       QUACKMUX_SHARE_LEVEL: "GROUP"
       QUACKMUX_OWNER: "analytics"

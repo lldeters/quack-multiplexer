@@ -36,7 +36,34 @@ func (c *Config) Warnings() []string {
 				name, p.Database, ps.MountPath, path.Join(ps.MountPath, DefaultPersistentDatabase)))
 		}
 	}
+	if c.Provider.Type == "static" {
+		for _, name := range names {
+			warnings = append(warnings, staticProfileWarnings(name, c.Profiles[name])...)
+		}
+	}
 	return warnings
+}
+
+// staticProfileWarnings warns about the fields of a profile that only take
+// effect when the gateway starts the engines itself. Static engines are
+// started elsewhere and run their own init and post-start SQL; a hardening
+// in postStartSQL would silently be missing.
+func staticProfileWarnings(name string, p Profile) []string {
+	var out []string
+	add := func(field, variable string) {
+		out = append(out, fmt.Sprintf("profiles.%s.%s has no effect with provider.type static: the gateway does not "+
+			"start these engines; set %s on the engines instead", name, field, variable))
+	}
+	if len(p.Settings) > 0 {
+		add("settings", "QUACKMUX_INIT_SQL")
+	}
+	if strings.TrimSpace(p.InitSQL) != "" {
+		add("initSQL", "QUACKMUX_INIT_SQL")
+	}
+	if strings.TrimSpace(p.PostStartSQL) != "" {
+		add("postStartSQL", "QUACKMUX_POST_START_SQL")
+	}
+	return out
 }
 
 // defaultsContext is the routing that a session without options gets: the
