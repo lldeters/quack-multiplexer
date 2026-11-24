@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -72,6 +73,29 @@ type received struct {
 	Env    []string `json:"env"`
 	Dir    string   `json:"dir"`
 	Script string   `json:"script"`
+	// StdinMode holds the permission bits of the standard input, StdinReopen
+	// what opening it again for writing through /proc/self/fd/0 gave on
+	// Linux ("opened" or the error).
+	StdinMode   os.FileMode `json:"stdinMode"`
+	StdinReopen string      `json:"stdinReopen"`
+}
+
+// stdinState reports the permission bits of the standard input and, on
+// Linux, what opening it again for writing through /proc/self/fd/0 gives.
+func stdinState() (os.FileMode, string) {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return 0, err.Error()
+	}
+	if runtime.GOOS != "linux" {
+		return fi.Mode().Perm(), ""
+	}
+	f, err := os.OpenFile("/proc/self/fd/0", os.O_WRONLY, 0)
+	if err != nil {
+		return fi.Mode().Perm(), err.Error()
+	}
+	_ = f.Close()
+	return fi.Mode().Perm(), "opened"
 }
 
 func fakeEngine() int {
@@ -94,11 +118,13 @@ func fakeEngine() int {
 
 	var mu sync.Mutex
 	var script strings.Builder
+	stdinMode, stdinReopen := stdinState()
 	snapshot := func() received {
 		mu.Lock()
 		defer mu.Unlock()
 		dir, _ := os.Getwd()
-		return received{Args: os.Args, Env: os.Environ(), Dir: dir, Script: script.String()}
+		return received{Args: os.Args, Env: os.Environ(), Dir: dir, Script: script.String(),
+			StdinMode: stdinMode, StdinReopen: stdinReopen}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
@@ -496,6 +522,33 @@ func TestEngineLifecycle(t *testing.T) {
 	}
 	// Terminating again is fine.
 	h.terminate(t, req.ID, "again")
+}
+
+// Whatever the CLI reads on its standard input runs on its own connection,
+// dot commands such as .shell included. On Linux a session with file access
+// could open the pipe again through /proc/self/fd/0, so it is read-only:
+// only a process with CAP_DAC_OVERRIDE (root) can still open it for writing.
+func TestEngineStdinIsReadOnly(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("only Linux opens a pipe again through /proc")
+	}
+	h := newHarness(t, 2)
+	req := h.request(t, config.Profile{InitSQL: "SELECT 1"})
+	h.launch(t, req)
+	ready := h.rec.wait(t, req.ID, engine.PhaseReady)
+	rcv := fetchReceived(t, ready.Endpoint)
+	if rcv.StdinMode != 0o400 {
+		t.Fatalf("standard input of the engine has mode %v, want -r--------", rcv.StdinMode)
+	}
+	if os.Geteuid() != 0 && rcv.StdinReopen == "opened" {
+		t.Fatal("the engine could open its standard input again for writing")
+	}
+	// The provider still writes to it: the script arrived, and the engine
+	// stops at end of input.
+	if !strings.Contains(rcv.Script, "quack_serve(") {
+		t.Fatalf("script %q", rcv.Script)
+	}
+	h.terminate(t, req.ID, "test")
 }
 
 func TestTokenNeverOnCommandLine(t *testing.T) {

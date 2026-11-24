@@ -10,10 +10,14 @@
 //	<duckdbPath> -bail <database>
 //
 // in it, with the child's standard input connected to a pipe that the
-// provider keeps open for the whole lifetime of the engine. All SQL travels
-// through that pipe and never through the command line or the environment,
-// where other local users or processes could read it (the profile's init
-// and post-start SQL may carry credentials):
+// provider keeps open for the whole lifetime of the engine. On Linux the
+// pipe is read-only (mode 0400): the CLI runs whatever it reads there on its
+// own connection, dot commands such as .shell included, and a session with
+// file access could otherwise open it again for writing through
+// /proc/self/fd/0. All SQL travels through that pipe and never through the
+// command line or the environment, where other local users or processes
+// could read it (the profile's init and post-start SQL may carry
+// credentials):
 //
 //	<engine.RenderInitSQL(profile)>
 //	.output NUL                      (/dev/null outside Windows)
@@ -41,6 +45,17 @@
 // the process instead of leaving a half-initialized engine behind. Like
 // every DuckDB CLI started without -init, the engine also runs the user's
 // ~/.duckdbrc first.
+//
+// # Trust
+//
+// An engine runs as the gateway's operating system user. Without hardening
+// (the authorization macro of images/engine and the post-start settings,
+// deploy/kubernetes/README.md) DuckDB's file access lets every session read
+// and write whatever that user may: the gateway's configuration and
+// secrets, the environment of the other engines with their tokens, and
+// ~/.duckdbrc, which the next engine runs (dot commands such as .shell
+// included). So a session can run commands as that user. Without hardening,
+// serve only trusted clients with this provider.
 //
 // A relative database path is resolved against the scratch directory and is
 // therefore deleted together with the engine; use an absolute path for data
