@@ -20,10 +20,10 @@
 #
 # Neither the token nor QUACKMUX_TEST_SECRET (for example the engine token
 # behind a gateway) may appear in the output of the client (checked for
-# values of at least 16 characters). The script prints
-# the cases that fail and a summary, and exits with status 0 only if every
-# case passes. QUACKMUX_TEST_VERBOSE=1 prints every case,
-# QUACKMUX_TEST_OUT=DIR keeps the client's script and output in DIR.
+# values of at least 16 characters). The script prints the cases that fail
+# and a summary, and exits with status 0 only if every case passes.
+# QUACKMUX_TEST_VERBOSE=1 prints every case, QUACKMUX_TEST_OUT=DIR keeps the
+# client's script and output in DIR.
 #
 # It needs only bash, coreutils, grep and the DuckDB CLI with the quack
 # extension (QUACKMUX_DUCKDB_BIN; QUACKMUX_EXTENSION_DIR, default
