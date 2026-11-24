@@ -2,12 +2,21 @@
 #
 # quackmux-engine-selftest - smoke test of the quackmux engine image.
 #
-# Runs the entrypoint in two scenarios: once with the image defaults, once
-# with a database file, init SQL from the environment and from a file, and
-# server settings. Each time it waits until the Quack server answers GET /,
+# Runs the entrypoint in three scenarios: once with the image defaults, once
+# with a database file, init and post-start SQL from the environment and from
+# a file, and server settings, once hardened like a shared engine (the
+# authorization macro of the image and the post-start settings of its README).
+# Each time it waits until the Quack server answers GET /,
 # checks that the token shows up neither in a process command line nor in the
-# output, stops the engine with SIGTERM and expects exit status 0. Finally it
-# opens the database file and checks that both init scripts ran.
+# output, stops the engine with SIGTERM and expects exit status 0. In the
+# second scenario a Quack client (the DuckDB CLI of the image) checks what a
+# session of the engine must not get: the token through FROM _ and the
+# standard input of the engine's CLI. In the third one the cases of the macro
+# run (quackmux-authorize-test), and a session tries to overwrite the
+# engine's database file and to plant SQL for IMPORT DATABASE in its temp
+# directory, the paths that DuckDB keeps writable. Finally it opens the
+# database files and checks that all four scripts ran, the post-start SQL
+# while the server ran, and that the hardened engine's data is intact.
 #
 # The image build runs it (build argument ENGINE_SELFTEST=true). It also works
 # in derived images:
@@ -21,6 +30,8 @@
 set -euo pipefail
 
 entrypoint=${1:-/usr/local/bin/quackmux-engine}
+authorize_sql=/usr/local/share/quackmux/authorize.sql
+authorize_test=/usr/local/bin/quackmux-authorize-test
 duckdb_bin=${QUACKMUX_DUCKDB_BIN:-duckdb}
 timeout=${SELFTEST_TIMEOUT:-120}
 
@@ -55,8 +66,68 @@ show_log() {
 	sed 's/^/  | /' "$1"
 }
 
+# check_session NAME PORT LOG runs a Quack client against the engine on PORT
+# (whose output goes to LOG). The CLI of the engine answers FROM _ with its
+# last result, which must not be the row of quack_serve with the token, and
+# its standard input must not be writable through /proc.
+check_session() {
+	local name=$1 port=$2 log=$3 out=$dir/$1-client.log
+	(
+		umask 077
+		cat >"$dir/client.sql" <<EOF
+SET extension_directories = ['${QUACKMUX_EXTENSION_DIR:-/opt/duckdb/extensions}'];
+LOAD quack;
+CREATE SECRET (TYPE quack, TOKEN '$QUACK_TOKEN', SCOPE 'quack:127.0.0.1:$port');
+ATTACH 'quack:127.0.0.1:$port' AS engine (DISABLE_SSL true);
+SELECT 'session: ' || quackmux_engine FROM engine.query('FROM _');
+FROM engine.query('COPY (SELECT ''.print selftest-injected'') TO ''/proc/self/fd/0'' (FORMAT csv, HEADER false, QUOTE '''')');
+EOF
+	)
+	timeout 60 "$duckdb_bin" -init /dev/null -noheader -list <"$dir/client.sql" >"$out" 2>&1 || true
+	if ! grep -q '^session: started$' "$out"; then
+		show_log "$out" >&2
+		fail "scenario '$name': a session of the engine did not get the harmless last result through FROM _"
+	fi
+	if grep -qF -f "$dir/token" "$out"; then
+		fail "scenario '$name': a session of the engine read the token"
+	fi
+	sleep 0.5
+	if grep -q selftest-injected "$log"; then
+		fail "scenario '$name': a session of the engine wrote to the standard input of its CLI"
+	fi
+	say "scenario '$name': a session gets neither the token nor the CLI's standard input"
+}
+
+# check_hardened NAME PORT LOG checks an engine with the authorization macro
+# and the post-start settings: first the cases of the macro, then the same
+# attacks on the real paths of this engine (database file $dir/NAME.duckdb):
+# overwriting the database file and writing SQL for IMPORT DATABASE into the
+# temp directory.
+check_hardened() {
+	local name=$1 port=$2 db=$dir/$1.duckdb report
+	report=$dir/$name-authorize.log
+	if ! QUACKMUX_TEST_OUT=$dir/$name-authorize "$authorize_test" "127.0.0.1:$port" >"$report" 2>&1; then
+		show_log "$report" >&2
+		fail "scenario '$name': the authorization macro did not behave as expected"
+	fi
+	say "scenario '$name': $(tail -n 1 "$report")"
+	printf '%s\t%s\t%s\t%s\n' \
+		x01 BLOCK Q "COPY (SELECT 'garbage' AS x) TO '$db' (FORMAT csv, HEADER false, USE_TMP_FILE false)" \
+		x02 BLOCK Q "COPY (SELECT 'garbage' AS x) TO '$db.wal' (FORMAT csv, HEADER false, USE_TMP_FILE false)" \
+		x03 BLOCK Q "EXPORT DATABASE '$db.tmp'" \
+		x04 BLOCK Q "COPY (SELECT concat('CREATE OR REPLACE MAC', 'RO quack', 'mux_authorize(c, s) AS true;') AS l) TO (current_setting('temp_directory') || '/schema.sql') (FORMAT csv, HEADER false, QUOTE '')" \
+		x05 BLOCK Q "IMPORT DATABASE '$db.tmp'" \
+		x06 BLOCK Q "SELECT 'quack_stop' AS s" \
+		x07 OK Q "SELECT answer FROM selftest_hardened" >"$dir/$name-cases.tsv"
+	if ! "$authorize_test" "127.0.0.1:$port" "$dir/$name-cases.tsv" >"$report" 2>&1; then
+		show_log "$report" >&2
+		fail "scenario '$name': a session could write to the database file or the temp directory"
+	fi
+	say "scenario '$name': the database file and the temp directory are out of reach"
+}
+
 # check_duckdb_env fails if a running DuckDB process has VAR in its
-# environment (the entrypoint keeps the init SQL out of it).
+# environment (the entrypoint keeps the init and post-start SQL out of it).
 check_duckdb_env() {
 	local var=$1 proc environ
 	for proc in /proc/[0-9]*; do
@@ -70,11 +141,12 @@ check_duckdb_env() {
 	done
 }
 
-# run_scenario NAME PORT [VAR=VALUE...] starts the engine with the given
-# environment, probes it on PORT and stops it again.
+# run_scenario NAME PORT CHECK [VAR=VALUE...] starts the engine with the given
+# environment, probes it on PORT, runs the function CHECK (unless it is "-")
+# with NAME, PORT and the engine's log and stops the engine again.
 run_scenario() {
-	local name=$1 port=$2 out pid response rc=0 deadline
-	shift 2
+	local name=$1 port=$2 check=$3 out pid response rc=0 deadline
+	shift 3
 	out=$dir/$name.log
 	say "scenario '$name': starting the engine"
 	env "$@" "$entrypoint" >"$out" 2>&1 &
@@ -106,6 +178,10 @@ run_scenario() {
 		fail "scenario '$name': the token is visible in a process command line"
 	fi
 	check_duckdb_env QUACKMUX_INIT_SQL
+	check_duckdb_env QUACKMUX_POST_START_SQL
+	if [[ $check != - ]]; then
+		"$check" "$name" "$port" "$out"
+	fi
 
 	kill -TERM "$pid"
 	wait "$pid" || rc=$?
@@ -119,32 +195,59 @@ run_scenario() {
 	say "scenario '$name': stopped cleanly"
 }
 
-run_scenario defaults "${QUACKMUX_PORT:-9494}"
+run_scenario defaults "${QUACKMUX_PORT:-9494}" -
 
 cat >"$dir/init.sql" <<'EOF'
 -- quackmux engine self-test: a comment with a 'quote
 CREATE TABLE selftest_file AS
     SELECT 'it''s from the file' AS s;
 EOF
-run_scenario configured 19494 \
+cat >"$dir/post-start.sql" <<'EOF'
+-- runs after quack_serve: the server is listed
+CREATE TABLE selftest_post_start_file AS
+    SELECT 'it''s after the start: ' || count(*) AS s FROM quack_server_list();
+EOF
+run_scenario configured 19494 check_session \
 	QUACKMUX_PORT=19494 \
 	QUACKMUX_BIND=0.0.0.0 \
 	QUACKMUX_DATABASE="$dir/selftest.duckdb" \
 	QUACKMUX_INIT_SQL="CREATE TABLE selftest_env AS SELECT 'it''s from the environment' AS s;" \
 	QUACKMUX_INIT_SQL_FILE="$dir/init.sql" \
+	QUACKMUX_POST_START_SQL="CREATE TABLE selftest_post_start_env AS SELECT 'it''s after the start: ' || count(*) AS s FROM quack_server_list();" \
+	QUACKMUX_POST_START_SQL_FILE="$dir/post-start.sql" \
 	QUACKMUX_MAX_CONNECTIONS=64 \
 	QUACKMUX_KEEP_ALIVE_TIMEOUT=300 \
 	QUACKMUX_ENGINE_ID=quack-selftest \
 	QUACKMUX_SHARE_LEVEL=SERVER \
 	QUACKMUX_PROFILE=selftest
 
-# Both init scripts must have run, quotes intact, and the data must be on disk.
+run_scenario hardened 19495 check_hardened \
+	QUACKMUX_PORT=19495 \
+	QUACKMUX_DATABASE="$dir/hardened.duckdb" \
+	QUACKMUX_INIT_SQL="CREATE OR REPLACE TABLE selftest_hardened AS SELECT 42 AS answer;
+.read $authorize_sql" \
+	QUACKMUX_POST_START_SQL="SET enable_external_access = false;
+SET lock_configuration = true;"
+# The engine stopped cleanly with the configuration locked; the database file
+# is intact and the table is on disk.
+if ! result=$("$duckdb_bin" -init /dev/null -bail "$dir/hardened.duckdb" -c "SELECT answer FROM selftest_hardened;" 2>&1) ||
+	[[ $result != *42* ]]; then
+	fail "reading the database of the hardened engine failed: $result"
+fi
+say "the database of the hardened engine is intact"
+
+# All four scripts must have run, quotes intact, the post-start SQL while
+# the server was listed, and the data must be on disk.
 if ! result=$("$duckdb_bin" -init /dev/null -bail "$dir/selftest.duckdb" \
-	-c "SELECT s FROM selftest_env UNION ALL SELECT s FROM selftest_file;" 2>&1); then
+	-c "SELECT s FROM selftest_env UNION ALL SELECT s FROM selftest_file UNION ALL SELECT s FROM selftest_post_start_env UNION ALL SELECT s FROM selftest_post_start_file;" 2>&1); then
 	fail "reading the database written by the engine failed: $result"
 fi
 if [[ $result != *"it's from the environment"* || $result != *"it's from the file"* ]]; then
 	fail "the init SQL did not run as expected: $result"
 fi
+if [[ $(grep -c "it's after the start: 1" <<<"$result") != 2 ]]; then
+	fail "the post-start SQL did not run as expected (after the start of the server): $result"
+fi
 say "init SQL from QUACKMUX_INIT_SQL and QUACKMUX_INIT_SQL_FILE ran"
+say "post-start SQL from QUACKMUX_POST_START_SQL and QUACKMUX_POST_START_SQL_FILE ran while the server was running"
 say "OK"

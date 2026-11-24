@@ -13,8 +13,9 @@ import (
 // The engine container contract. Every provider starts engines with these
 // environment variables, and the engine image (images/engine) implements
 // them: it opens QUACKMUX_DATABASE, runs QUACKMUX_INIT_SQL, then serves Quack
-// over plain HTTP on 0.0.0.0:QUACKMUX_PORT with token QUACK_TOKEN and stays in
-// the foreground until SIGTERM. GET / answers once the server listens.
+// over plain HTTP on 0.0.0.0:QUACKMUX_PORT with token QUACK_TOKEN, runs
+// QUACKMUX_POST_START_SQL and stays in the foreground until SIGTERM. GET /
+// answers once the server listens, while the post-start SQL may still run.
 const (
 	EnvToken      = "QUACK_TOKEN"
 	EnvDatabase   = "QUACKMUX_DATABASE"
@@ -25,6 +26,10 @@ const (
 	EnvOwner      = "QUACKMUX_OWNER"
 	EnvSubdomain  = "QUACKMUX_SUBDOMAIN"
 	EnvProfile    = "QUACKMUX_PROFILE"
+
+	// EnvPostStartSQL holds the script that the engine runs right after the
+	// Quack server has started (see RenderPostStartSQL).
+	EnvPostStartSQL = "QUACKMUX_POST_START_SQL"
 
 	// EnvStopTimeout is how many seconds the engine waits for DuckDB to
 	// stop after SIGTERM before it kills it (images/engine: default 20).
@@ -54,14 +59,43 @@ func RenderInitSQL(p config.Profile) string {
 		b.WriteString(QuoteSQLString(p.Settings[k]))
 		b.WriteString(";\n")
 	}
-	if s := strings.TrimSpace(p.InitSQL); s != "" {
-		b.WriteString(s)
-		if !strings.HasSuffix(s, ";") {
-			b.WriteString(";")
-		}
-		b.WriteString("\n")
-	}
+	writeScript(&b, p.InitSQL)
 	return b.String()
+}
+
+// RenderPostStartSQL returns the script the engine runs right after the
+// Quack server has started, on the connection of the init SQL: settings
+// that would break the start, such as SET enable_external_access = false.
+func RenderPostStartSQL(p config.Profile) string {
+	var b strings.Builder
+	writeScript(&b, p.PostStartSQL)
+	return b.String()
+}
+
+// writeScript writes the script s, trimmed, with its last statement
+// terminated, so that more statements may follow. Blank scripts write
+// nothing. A ";" at the end of the last line does not always end a
+// statement: after a dot command of the DuckDB CLI it becomes part of the
+// argument (".read file;" reads the file "file;"), and after "--" it is part
+// of the comment. Such a line gets the ";" on a line of its own, which ends
+// a pending statement and is an empty statement otherwise. A line that
+// starts with "." may also continue a pending statement (".5"); the ";"
+// ends it too.
+func writeScript(b *strings.Builder, s string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return
+	}
+	b.WriteString(s)
+	last := s[strings.LastIndexByte(s, '\n')+1:]
+	switch {
+	case strings.HasSuffix(s, ";"):
+	case strings.HasPrefix(last, ".") || strings.Contains(last, "--"):
+		b.WriteString("\n;")
+	default:
+		b.WriteString(";")
+	}
+	b.WriteString("\n")
 }
 
 // QuoteSQLString renders s as a single-quoted SQL string literal.

@@ -27,6 +27,8 @@ const (
 	// AnnotationInitSQLHash is the SHA-256 of the init SQL, which lives in
 	// the engine's secret: a changed init SQL changes the spec hash.
 	AnnotationInitSQLHash = "quackmux.io/init-sql-sha256"
+	// AnnotationPostStartSQLHash does the same for the post-start SQL.
+	AnnotationPostStartSQLHash = "quackmux.io/post-start-sql-sha256"
 	// AnnotationLastLaunch on a data volume claim records the last launch
 	// of an engine with that volume (RFC 3339).
 	AnnotationLastLaunch = "quackmux.io/last-launch"
@@ -70,6 +72,8 @@ const (
 	// carry credentials (CREATE SECRET), which must not show up in the pod
 	// spec for everybody allowed to read pods.
 	initSQLDataKey = "init.sql"
+	// postStartSQLDataKey holds the rendered post-start SQL, likewise.
+	postStartSQLDataKey = "post-start.sql"
 
 	// eventComponent is the source of the Kubernetes events we record and
 	// the field manager of the objects we write.

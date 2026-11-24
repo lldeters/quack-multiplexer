@@ -383,7 +383,7 @@ profiles:
 
 func TestRenderSecret(t *testing.T) {
 	e := newTestEnv(t, testConfig(t, ""))
-	s := e.p.secret("quack-user-alice-abcde", "s3cret", "")
+	s := e.p.secret("quack-user-alice-abcde", "s3cret", config.Profile{})
 	if s.Name != "quack-user-alice-abcde-token" || s.Namespace != testNamespace || s.Type != corev1.SecretTypeOpaque ||
 		string(s.Data["token"]) != "s3cret" || s.Immutable == nil || !*s.Immutable {
 		t.Fatalf("secret %+v", s)
@@ -419,6 +419,7 @@ func TestSpecHash(t *testing.T) {
 		"imagePullPolicy":  func(p *config.Profile) { p.ImagePullPolicy = corev1.PullNever },
 		"database":         func(p *config.Profile) { p.Database = ":memory:" },
 		"initSQL":          func(p *config.Profile) { p.InitSQL = "SELECT 1" },
+		"postStartSQL":     func(p *config.Profile) { p.PostStartSQL = "SET lock_configuration = true" },
 		"settings":         func(p *config.Profile) { p.Settings = map[string]string{"threads": "8"} },
 		"env":              func(p *config.Profile) { p.Env = append(p.Env, corev1.EnvVar{Name: "X", Value: "1"}) },
 		"resources":        func(p *config.Profile) { p.Resources.Limits = corev1.ResourceList{"memory": resource.MustParse("8Gi")} },

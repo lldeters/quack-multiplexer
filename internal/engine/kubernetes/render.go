@@ -162,6 +162,10 @@ func (r *renderer) podAnnotations(in podInput) map[string]string {
 		sum := sha256.Sum256([]byte(sql))
 		a[AnnotationInitSQLHash] = hex.EncodeToString(sum[:])
 	}
+	if sql := engine.RenderPostStartSQL(in.Profile); sql != "" {
+		sum := sha256.Sum256([]byte(sql))
+		a[AnnotationPostStartSQLHash] = hex.EncodeToString(sum[:])
+	}
 	return a
 }
 
@@ -299,7 +303,7 @@ func hasResources(rr corev1.ResourceRequirements) bool {
 var contractEnvNames = map[string]bool{
 	engine.EnvToken: true, engine.EnvDatabase: true, engine.EnvInitSQL: true, engine.EnvPort: true,
 	engine.EnvEngineID: true, engine.EnvShareLevel: true, engine.EnvOwner: true, engine.EnvSubdomain: true,
-	engine.EnvProfile: true, engine.EnvStopTimeout: true, homeEnv: true,
+	engine.EnvProfile: true, engine.EnvStopTimeout: true, engine.EnvPostStartSQL: true, homeEnv: true,
 }
 
 // stopGraceReserve is the part of the pod's grace period left to the
@@ -349,6 +353,12 @@ func (r *renderer) env(base []corev1.EnvVar, in podInput) []corev1.EnvVar {
 		out = append(out, corev1.EnvVar{Name: engine.EnvInitSQL, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: tokenSecretName(in.Name)},
 			Key:                  initSQLDataKey,
+		}}})
+	}
+	if engine.RenderPostStartSQL(in.Profile) != "" {
+		out = append(out, corev1.EnvVar{Name: engine.EnvPostStartSQL, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: tokenSecretName(in.Name)},
+			Key:                  postStartSQLDataKey,
 		}}})
 	}
 	for _, e := range mergeEnv(base, in.Profile.Env) {
@@ -624,12 +634,16 @@ func mergeAffinity(base, prof *corev1.Affinity) *corev1.Affinity {
 	return out
 }
 
-// secret renders the token secret of an engine pod. It is immutable: the
-// token of an engine never changes.
-func (r *renderer) secret(podName, token, initSQL string) *corev1.Secret {
+// secret renders the token secret of an engine pod, with the init and
+// post-start SQL of its profile. It is immutable: the token of an engine
+// never changes.
+func (r *renderer) secret(podName, token string, prof config.Profile) *corev1.Secret {
 	data := map[string][]byte{tokenDataKey: []byte(token)}
-	if initSQL != "" {
-		data[initSQLDataKey] = []byte(initSQL)
+	if sql := engine.RenderInitSQL(prof); sql != "" {
+		data[initSQLDataKey] = []byte(sql)
+	}
+	if sql := engine.RenderPostStartSQL(prof); sql != "" {
+		data[postStartSQLDataKey] = []byte(sql)
 	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

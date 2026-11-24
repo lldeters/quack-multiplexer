@@ -264,6 +264,59 @@ SQL
 	expect_ge "$after" $((before + 1)) "SEND_DATA_REQUEST messages went through the gateway ($before -> $after)" || return 1
 }
 
+# (j) engine-analytics is hardened like a shared engine (the authorization
+# macro of the image and the post-start settings). Through the gateway a
+# session attaches (catalog queries), queries, uploads and keeps a temporary
+# table as usual, and FROM _ only shows the harmless last result of the
+# engine's CLI. Then the cases of the macro run through the gateway
+# (quackmux-authorize-test of the client image, images/engine/authorize-
+# cases.tsv): what the macro and DuckDB must refuse, also in other spellings,
+# and the client's ordinary traffic. The engine token appears nowhere, and
+# the engine keeps serving.
+scenario_hardened_engine() {
+	local log=$E2E_WORK/j.log cases=$E2E_WORK/j_cases.log
+	client j <<SQL
+$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?share_level=group&group=analytics" gateway)
+SELECT 'whoami=' || engine AS result FROM remote.whoami;
+SHOW ALL TABLES;
+CREATE TABLE e2e_local AS SELECT range AS id FROM range(1000);
+CREATE TABLE remote.e2e_hardened AS SELECT id FROM e2e_local;
+SELECT 'upload=' || CAST(count(*) AS VARCHAR) AS result FROM remote.e2e_hardened;
+DROP TABLE remote.e2e_hardened;
+FROM remote.query('CREATE TEMP TABLE e2e_scratch AS SELECT 21 AS half');
+SELECT 'temp=' || CAST(half * 2 AS VARCHAR) AS result FROM remote.query('SELECT half FROM e2e_scratch');
+SELECT 'last=' || quackmux_engine AS result FROM remote.query('FROM _');
+DETACH remote;
+SQL
+	expect_status "$CLIENT_RC" 0 "the client ran all statements" || return 1
+	expect_output "$log" 'whoami=analytics' "ATTACH (catalog queries) and a query pass the authorization macro" || return 1
+	expect_output "$log" 'upload=1000' "an upload with SEND_DATA passes the macro" || return 1
+	expect_output "$log" 'temp=42' "a temporary table works on the hardened engine" || return 1
+	expect_output "$log" 'last=started' "FROM _ shows the harmless last result of the engine's CLI" || return 1
+
+	# The tokens reach the container through its environment, not through
+	# a command line.
+	CLIENT_RC=0
+	QUACK_TOKEN="${E2E_ALICE_TOKEN}?share_level=group&group=analytics" QUACKMUX_TEST_SECRET=$E2E_ENGINE_ANALYTICS_TOKEN \
+		QUACKMUX_EXTENSION_DIR=$E2E_EXTENSION_DIR "${COMPOSE[@]}" run --rm -T --no-deps \
+		-e QUACK_TOKEN -e QUACKMUX_TEST_SECRET -e QUACKMUX_EXTENSION_DIR \
+		--entrypoint /usr/local/bin/quackmux-authorize-test client gateway:9494 >"$cases" 2>&1 || CLIENT_RC=$?
+	if ! expect_status "$CLIENT_RC" 0 "the cases of the authorization macro pass through the gateway: $(tail -n 1 "$cases")"; then
+		indent "$cases"
+		return 1
+	fi
+	expect_no_output "$cases" "$E2E_ENGINE_ANALYTICS_TOKEN" "the engine token appears nowhere" || return 1
+
+	client j_after <<SQL
+$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?share_level=group&group=analytics" gateway)
+SELECT 'still=' || engine AS result FROM remote.whoami;
+DETACH remote;
+SQL
+	expect_output "$E2E_WORK/j_after.log" 'still=analytics' "the engine keeps serving" || return 1
+}
+
 # (h) Nothing above may have crashed a request handler.
 scenario_no_panics() {
 	local log=$E2E_WORK/h_gateways.log
@@ -297,6 +350,7 @@ run_scenario d "a wrong token is rejected" scenario_wrong_token
 run_scenario e "the admin API lists an open attachment" scenario_admin_sessions
 run_scenario f "the idle timeout closes a quiet session" scenario_idle_timeout
 run_scenario g "CREATE TABLE AS uploads rows with SEND_DATA" scenario_send_data
+run_scenario j "a hardened engine serves, but not quack_stop, the token or files" scenario_hardened_engine
 run_scenario h "no panics in the gateway logs" scenario_no_panics
 
 summary "compose e2e" || exit 1

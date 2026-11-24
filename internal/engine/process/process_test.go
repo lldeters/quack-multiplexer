@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -65,13 +66,36 @@ func helperCommand(name string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-var serveRE = regexp.MustCompile(`^CALL quack_serve\('quack:([^']+)', token = '([^']*)', disable_ssl = true, allow_other_hostname = (true|false)\);$`)
+var serveRE = regexp.MustCompile(`^SELECT listen_uri FROM quack_serve\('quack:([^']+)', token = getenv\('QUACK_TOKEN'\), disable_ssl = true, allow_other_hostname = (true|false)\);$`)
 
 type received struct {
 	Args   []string `json:"args"`
 	Env    []string `json:"env"`
 	Dir    string   `json:"dir"`
 	Script string   `json:"script"`
+	// StdinMode holds the permission bits of the standard input, StdinReopen
+	// what opening it again for writing through /proc/self/fd/0 gave on
+	// Linux ("opened" or the error).
+	StdinMode   os.FileMode `json:"stdinMode"`
+	StdinReopen string      `json:"stdinReopen"`
+}
+
+// stdinState reports the permission bits of the standard input and, on
+// Linux, what opening it again for writing through /proc/self/fd/0 gives.
+func stdinState() (os.FileMode, string) {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return 0, err.Error()
+	}
+	if runtime.GOOS != "linux" {
+		return fi.Mode().Perm(), ""
+	}
+	f, err := os.OpenFile("/proc/self/fd/0", os.O_WRONLY, 0)
+	if err != nil {
+		return fi.Mode().Perm(), err.Error()
+	}
+	_ = f.Close()
+	return fi.Mode().Perm(), "opened"
 }
 
 func fakeEngine() int {
@@ -94,11 +118,13 @@ func fakeEngine() int {
 
 	var mu sync.Mutex
 	var script strings.Builder
+	stdinMode, stdinReopen := stdinState()
 	snapshot := func() received {
 		mu.Lock()
 		defer mu.Unlock()
 		dir, _ := os.Getwd()
-		return received{Args: os.Args, Env: os.Environ(), Dir: dir, Script: script.String()}
+		return received{Args: os.Args, Env: os.Environ(), Dir: dir, Script: script.String(),
+			StdinMode: stdinMode, StdinReopen: stdinReopen}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
@@ -126,7 +152,7 @@ func fakeEngine() int {
 				return 1
 			case strings.Contains(line, "helper:ignore-eof"):
 				ignoreEOF = true
-			case strings.HasPrefix(line, "CALL quack_serve("):
+			case strings.Contains(line, "quack_serve("):
 				m := serveRE.FindStringSubmatch(line)
 				switch {
 				case m == nil:
@@ -134,9 +160,6 @@ func fakeEngine() int {
 					return 3
 				case prev != ".output "+os.DevNull:
 					fmt.Fprintf(os.Stderr, "fake engine: quack_serve not preceded by .output %s\n", os.DevNull)
-					return 3
-				case m[2] != token:
-					fmt.Fprintln(os.Stderr, "fake engine: quack_serve token differs from QUACK_TOKEN")
 					return 3
 				}
 				mu.Lock()
@@ -434,8 +457,8 @@ func TestEngineLifecycle(t *testing.T) {
 
 	rcv := fetchReceived(t, ready.Endpoint)
 	wantScript := "SET threads = '2';\nSELECT 42;\n.output " + os.DevNull + "\n" +
-		"CALL quack_serve('quack:127.0.0.1:" + port + "', token = '" + req.Token +
-		"', disable_ssl = true, allow_other_hostname = false);\n.output stdout\n"
+		"SELECT listen_uri FROM quack_serve('quack:127.0.0.1:" + port + "', token = getenv('QUACK_TOKEN')" +
+		", disable_ssl = true, allow_other_hostname = false);\n.output stdout\n"
 	if rcv.Script != wantScript {
 		t.Fatalf("script:\n%s\nwant:\n%s", rcv.Script, wantScript)
 	}
@@ -501,6 +524,33 @@ func TestEngineLifecycle(t *testing.T) {
 	h.terminate(t, req.ID, "again")
 }
 
+// Whatever the CLI reads on its standard input runs on its own connection,
+// dot commands such as .shell included. On Linux a session with file access
+// could open the pipe again through /proc/self/fd/0, so it is read-only:
+// only a process with CAP_DAC_OVERRIDE (root) can still open it for writing.
+func TestEngineStdinIsReadOnly(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("only Linux opens a pipe again through /proc")
+	}
+	h := newHarness(t, 2)
+	req := h.request(t, config.Profile{InitSQL: "SELECT 1"})
+	h.launch(t, req)
+	ready := h.rec.wait(t, req.ID, engine.PhaseReady)
+	rcv := fetchReceived(t, ready.Endpoint)
+	if rcv.StdinMode != 0o400 {
+		t.Fatalf("standard input of the engine has mode %v, want -r--------", rcv.StdinMode)
+	}
+	if os.Geteuid() != 0 && rcv.StdinReopen == "opened" {
+		t.Fatal("the engine could open its standard input again for writing")
+	}
+	// The provider still writes to it: the script arrived, and the engine
+	// stops at end of input.
+	if !strings.Contains(rcv.Script, "quack_serve(") {
+		t.Fatalf("script %q", rcv.Script)
+	}
+	h.terminate(t, req.ID, "test")
+}
+
 func TestTokenNeverOnCommandLine(t *testing.T) {
 	var mu sync.Mutex
 	var cmds []*exec.Cmd
@@ -514,8 +564,8 @@ func TestTokenNeverOnCommandLine(t *testing.T) {
 	h := newHarness(t, 2, WithCommand(capture))
 	req := h.request(t, config.Profile{InitSQL: "SELECT 1"})
 	h.launch(t, req)
-	// The fake engine only serves if the token of the quack_serve statement
-	// (read from stdin) equals QUACK_TOKEN.
+	// The fake engine only serves if QUACK_TOKEN is set and the quack_serve
+	// statement reads the token from it.
 	h.rec.wait(t, req.ID, engine.PhaseReady)
 
 	mu.Lock()

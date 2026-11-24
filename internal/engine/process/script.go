@@ -15,16 +15,26 @@ import (
 )
 
 // serveScript renders what the provider writes to the CLI's standard input:
-// the profile's settings and init SQL, then the Quack server start. The row
-// quack_serve returns contains the token, so the CLI's output goes to the
-// null device while it runs.
-func serveScript(prof config.Profile, bindHost string, port int, token string) string {
+// the profile's settings and init SQL, the Quack server start, then the
+// post-start SQL. Every connection of the engine can read two things of the
+// CLI: the lines it read from stdin (shell_history()) and its last result
+// (FROM _). So the token is read from the environment (QUACK_TOKEN), only
+// the address of the row that quack_serve returns is selected (with the
+// output on the null device), and a harmless SELECT follows the post-start
+// SQL.
+func serveScript(prof config.Profile, bindHost string, port int) string {
 	var b strings.Builder
 	b.WriteString(engine.RenderInitSQL(prof))
 	b.WriteString(".output " + os.DevNull + "\n")
-	fmt.Fprintf(&b, "CALL quack_serve(%s, token = %s, disable_ssl = true, allow_other_hostname = %t);\n",
-		engine.QuoteSQLString(quackURI(bindHost, port)), engine.QuoteSQLString(token), !isLocalHost(bindHost))
+	fmt.Fprintf(&b, "SELECT listen_uri FROM quack_serve(%s, token = getenv('%s'), disable_ssl = true, allow_other_hostname = %t);\n",
+		engine.QuoteSQLString(quackURI(bindHost, port)), engine.EnvToken, !isLocalHost(bindHost))
 	b.WriteString(".output stdout\n")
+	if sql := engine.RenderPostStartSQL(prof); sql != "" {
+		b.WriteString(sql)
+		b.WriteString(".output " + os.DevNull + "\n")
+		b.WriteString("SELECT 'started' AS quackmux_engine;\n")
+		b.WriteString(".output stdout\n")
+	}
 	return b.String()
 }
 
