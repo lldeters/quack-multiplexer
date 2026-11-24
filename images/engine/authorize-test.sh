@@ -19,7 +19,8 @@
 #   OK     no error
 #
 # Neither the token nor QUACKMUX_TEST_SECRET (for example the engine token
-# behind a gateway) may appear in the output of the client. The script prints
+# behind a gateway) may appear in the output of the client (checked for
+# values of at least 16 characters). The script prints
 # the cases that fail and a summary, and exits with status 0 only if every
 # case passes. QUACKMUX_TEST_VERBOSE=1 prints every case,
 # QUACKMUX_TEST_OUT=DIR keeps the client's script and output in DIR.
@@ -193,14 +194,18 @@ if [[ ! -v got[end] ]]; then
 fi
 
 # grep reads the secrets from a file, so they are not in its command line.
+# Values shorter than 16 characters (such as the token of auth.mode none)
+# would match anywhere.
 (
 	umask 077
-	printf '%s\n' "${QUACK_TOKEN%%\?*}" >"$work/secrets"
-	if [[ -n ${QUACKMUX_TEST_SECRET:-} ]]; then
-		printf '%s\n' "$QUACKMUX_TEST_SECRET" >>"$work/secrets"
-	fi
+	: >"$work/secrets"
+	for secret in "${QUACK_TOKEN%%\?*}" "${QUACKMUX_TEST_SECRET:-}"; do
+		if ((${#secret} >= 16)); then
+			printf '%s\n' "$secret" >>"$work/secrets"
+		fi
+	done
 )
-if grep -qF -f "$work/secrets" "$work/client.out" "$work/client.err"; then
+if [[ -s $work/secrets ]] && grep -qF -f "$work/secrets" "$work/client.out" "$work/client.err"; then
 	failed=$((failed + 1))
 	printf 'FAIL a token appeared in the output of the client\n'
 fi
