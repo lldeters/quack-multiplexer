@@ -424,8 +424,17 @@ Weitere Provider:
   Extra-Header. Dort Token-Optionen nutzen.
 * Das Gateway prüft kein SQL. Autorisierung innerhalb geteilter Engines bleibt Sache der Engine (Init-SQL,
   Rechte der angehängten Daten) oder der Wahl des Share-Levels. Das Engine-Image bringt dafür ein Makro für
-  `quack_authorization_function` mit, eine Sperrliste über den SQL-Text. Schickt das Gateway künftig selbst
-  Anfragen an Engines (etwa `quack_active_connections()` zum Aufräumen), muss das Makro sie durchlassen; heute
-  sendet es nur Handshake, Heartbeats, `DISCONNECT` und `CANCEL`.
+  `quack_authorization_function` mit, eine Sperrliste über den SQL-Text. Das Gateway selbst sendet heute nur
+  Handshake, Heartbeats, `DISCONNECT` und `CANCEL`, keine Anfragen.
+* Kontroll-Anfragen des Gateways an gehärtete Engines, etwa `quack_active_connections()` zum Aufräumen von
+  Zombie-Verbindungen, lehnt das Makro ab, und es kann das Gateway nicht von Clients unterscheiden: Es bekommt nur
+  Verbindungs-ID und SQL-Text, die IDs vergibt der Server, und das Gateway meldet sich mit demselben Engine-Token
+  an wie die Sessions, die es weiterreicht. Einen Kanal, den das Makro prüfen und den kein Client nachspielen
+  kann, bietet das Protokoll nicht; jede Ausnahme im Makro gilt für alle Sessions. Vorgabe für das Aufräumen:
+  Das Makro lässt genau einen festen Text durch, der nur unkritische Spalten liest
+  (`SELECT connection_id FROM quack_active_connections()`, nie die Spalte `query` mit dem SQL anderer Sessions),
+  als Vergleich des ganzen Texts. Jede Session sieht damit die Verbindungs-IDs der Engine; sie nützen ihr nichts,
+  weil das Gateway nur versiegelte IDs routet und das Makro alle `quack_*`-Funktionen sperrt. Die Ausnahme kommt
+  mit dem Aufräumen in `images/engine/authorize.sql`, mit Fällen in `images/engine/authorize-cases.tsv`.
 * Der Client verlangt eine exakte Protokollversion (3). Neue Quack-Versionen erfordern ein Gateway-Update. Das
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.

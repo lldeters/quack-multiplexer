@@ -135,24 +135,45 @@ docker compose and kind (Kubernetes v1.37). Recordings of the traffic are fixtur
     `quack_serve` itself needs file access (`$HOME/.duckdb/stored_secrets`). Set after `quack_serve`, it blocks
     `getenv` and file access for every session while the server keeps working (queries, uploads, fetches).
   - `quack_stop(…)` stays callable by any session, with or without a locked configuration.
-  - Once `enable_external_access` is false it cannot be set to true again. `allowed_paths` and
-    `allowed_directories` (prefixes, URLs included) set before it keep working; `INSTALL`, `LOAD` of a file,
-    `COPY … TO`, `EXPORT`/`IMPORT DATABASE` and `ATTACH` of a file fail. `quack_stop` and `FORCE CHECKPOINT` on
-    the engine's own connection still work.
+  - Once `enable_external_access` is false it cannot be set to true again, and `allowed_paths` and
+    `allowed_directories` cannot change any more. Switching it off at run time adds DuckDB's temp directory to
+    `allowed_directories` and every attached database file (with `.wal`, `.wal.checkpoint` and `.wal.recovery`) to
+    `allowed_paths` (`EnableExternalAccessSetting::OnSet`, `src/main/settings/custom_settings.cpp`). Every session
+    can read and write them: `COPY … TO '<database file>' (USE_TMP_FILE false)` destroyed the database (the engine
+    never started again), and `EXPORT DATABASE` into the temp directory, a `schema.sql` written with `COPY` and
+    `IMPORT DATABASE` ran that SQL without the authorization function, which replaced the macro (`PragmaImportDatabase`
+    in `src/function/pragma/pragma_queries.cpp` builds the SQL from the files). `SET temp_directory = ''` before it
+    keeps the temp directory out (and spilling off). Other paths and URLs need `allowed_paths` or
+    `allowed_directories` set before it; httpfs then also needs the CA bundle in `allowed_paths` ("Cannot read a CA
+    certificate bundle"), unless an earlier HTTPS request read it. Databases attached before stay readable (their
+    paths are allowed), views over `read_parquet(<url>)` do not. `INSTALL`, `LOAD` and autoload fail ("Loading
+    external extensions is disabled through configuration"), and so does `duckdb_extensions()`, which lists the
+    extension directory. `quack_stop` and `FORCE CHECKPOINT` on the engine's own connection still work.
+  - Besides `query()` and `json_execute_serialized_sql`, SQL that is not in the text of a query runs through
+    `PRAGMA import_database` and the external resources of DuckDB 2.0: `register_external_resource_type(…)` names
+    callback functions by string, and `create_external_resource(…)` or `CREATE EXTERNAL RESOURCE` then run
+    `SELECT * FROM <callback>(MAP {})` on an internal connection (`create_external_resource.cpp`). `CONNECT '<uri>'`
+    attaches a database without the word `ATTACH` (`physical_connect.cpp`). `truncate_duckdb_logs()` has no lock
+    check, `disable_logging()` has one.
   - The CLI hands its own state to every connection: `FROM _` (a replacement scan of the CLI) returns the last
     result of the CLI's connection, which after the start was the row of `quack_serve` with the token, and
     `shell_history()` returns the lines it read from stdin (not the contents of `.read` files). With file access,
     a session can write into the CLI's stdin through `/proc/self/fd/0` (`COPY … TO`); the CLI runs that on its
     own connection, dot commands such as `.shell` included. The entrypoint selects only `listen_uri` from
-    `quack_serve`, ends with a harmless SELECT and makes the FIFO read-only (mode 0400) once fd 3 is open.
+    `quack_serve`, ends with a harmless SELECT and makes the FIFO read-only (mode 0400) once fd 3 is open; the
+    process provider does the same with its anonymous pipe. Root with `CAP_DAC_OVERRIDE` (the default capabilities
+    of a container) opens it anyway.
   - A macro in `main` takes precedence over a built-in function of the same name for all connections, also over
     operators that are functions (`CREATE MACRO "||"(a, b)` changes `||`); `system.main.<name>` is not affected,
     but a schema named `system` makes it ambiguous. `CREATE TYPE` cannot shadow built-in types.
   - DuckDB 2.0 parses with a PEG tokenizer: identifiers have no escape sequences (no `U&"…"`), may be quoted with
     `"` or backticks, and Unicode spaces outside quotes become spaces (`Parser::NormalizeSQLString`). Function
     names and keywords match case-insensitively for ASCII letters only (a Kelvin sign for `k` does not resolve).
-  - The authorization macro of the image (`images/engine/authorize.sql`) costs about 1 to 2 ms per query: the
-    server binds it, and compiles its regular expression, for every PREPARE (2.1 ms without, 3.7 to 4.1 ms with
-    it for a trivial query through `r.query`).
+  - The authorization macro of the image (`images/engine/authorize.sql`) costs about 2 ms per query: the server
+    binds it for every PREPARE and compiles every occurrence of its regular expression anew, about 1 ms each (2.1 ms
+    without, 4.3 ms with it for a trivial query through `r.query`; 5.3 ms while the CASE held the expression twice).
+  - What the init SQL creates stays visible to every session: paths of attached databases (`duckdb_databases()`,
+    query strings included), view and macro definitions (`duckdb_views()`, `duckdb_functions()`), name, scope and
+    `KEY_ID` of secrets.
 - **Kubernetes.** From Kubernetes 1.35 on the kubelet refuses hosts with cgroup v1 (`failCgroupV1: true`); kind needs
   a KubeletConfiguration patch there (`test/e2e/README.md`).
