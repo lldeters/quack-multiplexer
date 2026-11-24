@@ -97,17 +97,20 @@ RUN set -eu; \
     HOME=/tmp duckdb -init /dev/null -bail -c "$sql$load FROM duckdb_extensions() WHERE installed ORDER BY 1;"; \
     chmod -R a+rX,go-w /opt/duckdb
 
-# The entrypoint, the self-test and the authorization macro for shared
-# engines (line endings normalized for checkouts on Windows).
-COPY entrypoint.sh selftest.sh authorize.sql /usr/local/src/quackmux-engine/
+# The entrypoint, the self-test, the authorization macro for shared engines
+# and its test cases (line endings normalized for checkouts on Windows).
+COPY entrypoint.sh selftest.sh authorize.sql authorize-test.sh authorize-cases.tsv /usr/local/src/quackmux-engine/
 RUN set -eu; \
     cd /usr/local/src/quackmux-engine; \
-    sed -i 's/\r$//' entrypoint.sh selftest.sh authorize.sql; \
+    sed -i 's/\r$//' entrypoint.sh selftest.sh authorize.sql authorize-test.sh authorize-cases.tsv; \
     bash -n entrypoint.sh; \
     bash -n selftest.sh; \
+    bash -n authorize-test.sh; \
     install -m 0755 entrypoint.sh /usr/local/bin/quackmux-engine; \
     install -m 0755 selftest.sh /usr/local/bin/quackmux-engine-selftest; \
-    install -D -m 0644 authorize.sql /usr/local/share/quackmux/authorize.sql
+    install -m 0755 authorize-test.sh /usr/local/bin/quackmux-authorize-test; \
+    install -D -m 0644 authorize.sql /usr/local/share/quackmux/authorize.sql; \
+    install -D -m 0644 authorize-cases.tsv /usr/local/share/quackmux/authorize-cases.tsv
 
 # -----------------------------------------------------------------------------
 # Stage 2: the runtime image.
@@ -136,7 +139,8 @@ RUN set -eu; \
 
 COPY --from=duckdb /usr/local/bin/duckdb /usr/local/bin/duckdb
 COPY --from=duckdb /opt/duckdb/extensions /opt/duckdb/extensions
-COPY --from=duckdb /usr/local/bin/quackmux-engine /usr/local/bin/quackmux-engine-selftest /usr/local/bin/
+COPY --from=duckdb /usr/local/bin/quackmux-engine /usr/local/bin/quackmux-engine-selftest /usr/local/bin/quackmux-authorize-test \
+     /usr/local/bin/
 COPY --from=duckdb /usr/local/share/quackmux /usr/local/share/quackmux
 
 ENV HOME=/tmp

@@ -11,10 +11,12 @@
 # output, stops the engine with SIGTERM and expects exit status 0. In the
 # second scenario a Quack client (the DuckDB CLI of the image) checks what a
 # session of the engine must not get: the token through FROM _ and the
-# standard input of the engine's CLI; in the third one that the macro lets
-# ordinary queries through and rejects quack_stop and getenv, and that file
-# access is off. Finally it opens the database files and checks that all four
-# scripts ran, the post-start SQL while the server ran.
+# standard input of the engine's CLI. In the third one the cases of the macro
+# run (quackmux-authorize-test), and a session tries to overwrite the
+# engine's database file and to plant SQL for IMPORT DATABASE in its temp
+# directory, the paths that DuckDB keeps writable. Finally it opens the
+# database files and checks that all four scripts ran, the post-start SQL
+# while the server ran, and that the hardened engine's data is intact.
 #
 # The image build runs it (build argument ENGINE_SELFTEST=true). It also works
 # in derived images:
@@ -29,6 +31,7 @@ set -euo pipefail
 
 entrypoint=${1:-/usr/local/bin/quackmux-engine}
 authorize_sql=/usr/local/share/quackmux/authorize.sql
+authorize_test=/usr/local/bin/quackmux-authorize-test
 duckdb_bin=${QUACKMUX_DUCKDB_BIN:-duckdb}
 timeout=${SELFTEST_TIMEOUT:-120}
 
@@ -95,41 +98,32 @@ EOF
 	say "scenario '$name': a session gets neither the token nor the CLI's standard input"
 }
 
-# check_hardened NAME PORT LOG runs a Quack client against an engine with the
-# authorization macro and the post-start settings.
+# check_hardened NAME PORT LOG checks an engine with the authorization macro
+# and the post-start settings: first the cases of the macro, then the same
+# attacks on the real paths of this engine (database file $dir/NAME.duckdb):
+# overwriting the database file and writing SQL for IMPORT DATABASE into the
+# temp directory.
 check_hardened() {
-	local name=$1 port=$2 out=$dir/$1-client.log
-	(
-		umask 077
-		cat >"$dir/client.sql" <<EOF
-SET extension_directories = ['${QUACKMUX_EXTENSION_DIR:-/opt/duckdb/extensions}'];
-LOAD quack;
-CREATE SECRET (TYPE quack, TOKEN '$QUACK_TOKEN', SCOPE 'quack:127.0.0.1:$port');
-ATTACH 'quack:127.0.0.1:$port' AS engine (DISABLE_SSL true);
-SELECT 'query: ' || answer FROM engine.selftest_hardened;
-FROM engine.query('CALL quack_stop(''quack:0.0.0.0:$port'')');
-FROM engine.query('SELECT getenv(''QUACK_TOKEN'')');
-FROM engine.query('SELECT * FROM read_text(''/proc/1/environ'')');
-SELECT 'still serving: ' || answer FROM engine.selftest_hardened;
-EOF
-	)
-	timeout 60 "$duckdb_bin" -init /dev/null -noheader -list <"$dir/client.sql" >"$out" 2>&1 || true
-	if ! grep -q '^query: 42$' "$out" || ! grep -q '^still serving: 42$' "$out"; then
-		show_log "$out" >&2
-		fail "scenario '$name': an ordinary query of a session failed"
+	local name=$1 port=$2 db=$dir/$1.duckdb report
+	report=$dir/$name-authorize.log
+	if ! QUACKMUX_TEST_OUT=$dir/$name-authorize "$authorize_test" "127.0.0.1:$port" >"$report" 2>&1; then
+		show_log "$report" >&2
+		fail "scenario '$name': the authorization macro did not behave as expected"
 	fi
-	if [[ $(grep -c 'quackmux_authorize: not allowed on this engine' "$out") != 2 ]]; then
-		show_log "$out" >&2
-		fail "scenario '$name': the authorization macro did not reject quack_stop and getenv"
+	say "scenario '$name': $(tail -n 1 "$report")"
+	printf '%s\t%s\t%s\t%s\n' \
+		x01 BLOCK Q "COPY (SELECT 'garbage' AS x) TO '$db' (FORMAT csv, HEADER false, USE_TMP_FILE false)" \
+		x02 BLOCK Q "COPY (SELECT 'garbage' AS x) TO '$db.wal' (FORMAT csv, HEADER false, USE_TMP_FILE false)" \
+		x03 BLOCK Q "EXPORT DATABASE '$db.tmp'" \
+		x04 BLOCK Q "COPY (SELECT concat('CREATE OR REPLACE MAC', 'RO quack', 'mux_authorize(c, s) AS true;') AS l) TO (current_setting('temp_directory') || '/schema.sql') (FORMAT csv, HEADER false, QUOTE '')" \
+		x05 BLOCK Q "IMPORT DATABASE '$db.tmp'" \
+		x06 BLOCK Q "SELECT 'quack_stop' AS s" \
+		x07 OK Q "SELECT answer FROM selftest_hardened" >"$dir/$name-cases.tsv"
+	if ! "$authorize_test" "127.0.0.1:$port" "$dir/$name-cases.tsv" >"$report" 2>&1; then
+		show_log "$report" >&2
+		fail "scenario '$name': a session could write to the database file or the temp directory"
 	fi
-	if ! grep -q 'Permission Error' "$out"; then
-		show_log "$out" >&2
-		fail "scenario '$name': a session could read a file"
-	fi
-	if grep -qF -f "$dir/token" "$out"; then
-		fail "scenario '$name': a session of the engine read the token"
-	fi
-	say "scenario '$name': the macro rejects quack_stop and getenv, file access is off, queries run"
+	say "scenario '$name': the database file and the temp directory are out of reach"
 }
 
 # check_duckdb_env fails if a running DuckDB process has VAR in its
@@ -234,12 +228,13 @@ run_scenario hardened 19495 check_hardened \
 .read $authorize_sql" \
 	QUACKMUX_POST_START_SQL="SET enable_external_access = false;
 SET lock_configuration = true;"
-# The engine stopped cleanly with the configuration locked; the table is on
-# disk.
+# The engine stopped cleanly with the configuration locked; the database file
+# is intact and the table is on disk.
 if ! result=$("$duckdb_bin" -init /dev/null -bail "$dir/hardened.duckdb" -c "SELECT answer FROM selftest_hardened;" 2>&1) ||
 	[[ $result != *42* ]]; then
 	fail "reading the database of the hardened engine failed: $result"
 fi
+say "the database of the hardened engine is intact"
 
 # All four scripts must have run, quotes intact, the post-start SQL while
 # the server was listed, and the data must be on disk.
