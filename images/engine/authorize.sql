@@ -35,21 +35,32 @@
 --   macros);
 -- * getenv (the environment holds the token and the init SQL) and
 --   shell_history (what the engine's CLI read from its standard input);
--- * query followed by "(", a comment or white space and "(" (the table
---   function query() runs SQL that is built at run time),
---   json_execute_serialized_sql and json_serialize_plan (likewise);
+-- * SQL that is not in the text of the query: query followed by "(", a
+--   comment or white space and "(" (the table function query() runs SQL that
+--   is built at run time), json_execute_serialized_sql and
+--   json_serialize_plan (likewise), import followed later by database, and
+--   import_database (IMPORT DATABASE runs the SQL of files), the external
+--   resources of DuckDB 2.0 (*external_resource*, and external followed later
+--   by resource or resources: they call functions that strings name);
+-- * files and databases: copy followed later by to or from, copy_database,
+--   export followed later by database, attach, detach and connect. With
+--   external access off, DuckDB itself still lets every session write to its
+--   temp directory and to the files of the attached databases, the database
+--   file and its WAL included; the databases are shared by all sessions;
 -- * checkpoint and force_checkpoint (FORCE CHECKPOINT aborts the transactions
---   of all sessions), attach and detach (databases that all sessions share);
--- * create or drop followed later by secret, macro or function: secrets and
---   macros are shared by all sessions, a secret supplies the credentials for
---   its scope, a macro takes precedence over a built-in function or an
---   operator of the same name;
+--   of all sessions), truncate_duckdb_logs and write_log (DuckDB's log);
+-- * create or drop followed later by secret, macro or function, and
+--   add_parquet_key: secrets, macros and Parquet keys are shared by all
+--   sessions, a secret supplies the credentials for its scope, a macro takes
+--   precedence over a built-in function or an operator of the same name;
 -- * schema followed later by system: a schema named "system" would make
 --   system.main.<name> below ambiguous, and with it every query fail.
 --
--- DuckDB 2.0 has no other spelling of a name: identifiers have no escape
--- sequences, and comments, quotes and Unicode spaces never join two words
--- into one. SQL that is built at run time is rejected as a whole.
+-- DuckDB 2.0 has no other spelling of a name or keyword: identifiers have no
+-- escape sequences, and comments, quotes and Unicode spaces never join two
+-- words into one. The ways to run SQL that is not in the text of the query
+-- are rejected as a whole. A later DuckDB version or an extension may bring
+-- new ones: check the list after every update (images/engine/README.md).
 --
 -- Every built-in function is called as system.main.<name> and no operator is
 -- used that DuckDB resolves through the catalog (such as || or LIKE): a macro
@@ -65,8 +76,12 @@ CREATE OR REPLACE MACRO quackmux_rejection(sql) AS
         'quack_\w*\b|quackmux_\w*\b|getenv\b|shell_history\b',
         '|query["`]?(?:[\s\v]|[^\x00-\x7f])*(?:\(|/\*|--)',
         '|json_execute_serialized_sql\b|json_serialize_plan\b',
-        '|checkpoint\b|force_checkpoint\b|attach\b|detach\b',
-        '|(?:create|drop)\b[\s\S]*[^a-z_](?:secret|macro|function)\b',
+        '|import\b[\s\S]*[^a-z_]database\b|import_database\b',
+        '|\w*external_resource\w*\b|external\b[\s\S]*[^a-z_]resources?\b',
+        '|copy\b[\s\S]*[^a-z_](?:to|from)\b|copy_database\b|export\b[\s\S]*[^a-z_]database\b',
+        '|attach\b|detach\b|connect\b',
+        '|checkpoint\b|force_checkpoint\b|truncate_duckdb_logs\b|write_log\b',
+        '|(?:create|drop)\b[\s\S]*[^a-z_](?:secret|macro|function)\b|add_parquet_key\b',
         '|schema\b[\s\S]*[^a-z_]system\b',
         ')'), 1, 'i'), '');
 
