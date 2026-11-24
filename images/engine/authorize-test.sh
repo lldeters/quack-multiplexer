@@ -26,7 +26,8 @@
 # QUACKMUX_TEST_OUT=DIR keeps the client's script and output in DIR.
 #
 # It needs only bash, coreutils, grep and the DuckDB CLI with the quack
-# extension (QUACKMUX_DUCKDB_BIN, QUACKMUX_EXTENSION_DIR as for the engine).
+# extension (QUACKMUX_DUCKDB_BIN; QUACKMUX_EXTENSION_DIR, default
+# /opt/duckdb/extensions, empty for the DuckDB default).
 
 set -euo pipefail
 
@@ -34,7 +35,7 @@ prog=${0##*/}
 target=${1:-}
 cases=${2:-/usr/local/share/quackmux/authorize-cases.tsv}
 duckdb_bin=${QUACKMUX_DUCKDB_BIN:-duckdb}
-extension_dir=${QUACKMUX_EXTENSION_DIR:-/opt/duckdb/extensions}
+extension_dir=${QUACKMUX_EXTENSION_DIR-/opt/duckdb/extensions}
 timeout=${QUACKMUX_TEST_TIMEOUT:-300}
 
 die() {
@@ -120,7 +121,9 @@ fi
 (
 	umask 077
 	{
-		printf 'SET extension_directories = [%s];\n' "$(sql_string "$extension_dir")"
+		if [[ -n $extension_dir ]]; then
+			printf 'SET extension_directories = [%s];\n' "$(sql_string "$extension_dir")"
+		fi
 		printf 'LOAD quack;\n'
 		printf 'CREATE SECRET (TYPE quack, TOKEN %s, SCOPE %s);\n' "$(sql_string "$QUACK_TOKEN")" "$(sql_string "quack:$target")"
 		printf 'ATTACH %s AS r (DISABLE_SSL true);\n' "$(sql_string "quack:$target")"
