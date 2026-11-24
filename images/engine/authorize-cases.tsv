@@ -155,6 +155,9 @@ e21	ERR	Q	FORCE CHEC{kelvin}POINT
 e22	OK	Q	CREATE TYPE authz_mood AS ENUM ('ok', 'sad')
 e23	BLOCK	Q	CREATE OR REPLACE MACRO sum(x) AS 0
 e24	BLOCK	Q	PRAGMA add_parquet_key('authz_key', '0123456789112345')
+e25	BLOCK	Q	CREATE TRIGGER authz_trg AFTER INSERT ON authz_t FOR EACH ROW EXECUTE SELECT 1
+e26	BLOCK	Q	DROP TRIGGER IF EXISTS authz_trg
+e27	BLOCK	Q	ALTER DATABASE memory SET ALIAS TO authz_alias
 
 # Writing files: with external access off, DuckDB still allows its temp
 # directory and the files of the attached databases (the database file and
@@ -233,6 +236,7 @@ f29	OK	Q	SELECT half * 2 FROM authz_scratch
 f30	OK	Q	SELECT database_name, path FROM duckdb_databases()
 f31	OK	C	COPY (SELECT * FROM r.authz_t) TO '/tmp/authz-client.csv' (HEADER true)
 f32	OK	C	CREATE OR REPLACE TABLE r.authz_copy AS SELECT * FROM r.authz_t LIMIT 0; COPY r.authz_copy FROM '/tmp/authz-client.csv' (HEADER true); SELECT count(*) FROM r.authz_copy; DROP TABLE r.authz_copy
+f33	OK	Q	SELECT 'trigger' AS word, 'database' AS first, 'alter' AS second
 
 # Clean up; the engine still serves.
 z01	OK	Q	DROP TABLE IF EXISTS system; DROP TYPE IF EXISTS authz_mood

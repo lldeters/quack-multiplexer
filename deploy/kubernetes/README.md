@@ -899,9 +899,10 @@ Die Teile brauchen einander:
      `database`, `attach`, `detach` und `connect`;
    * `checkpoint` (`FORCE CHECKPOINT` bricht die Transaktionen aller Sessions ab), `truncate_duckdb_logs` und
      `write_log` (das Log von DuckDB);
-   * `create` oder `drop` mit später `secret`, `macro` oder `function` und `add_parquet_key`: Secrets, Makros und
-     Parquet-Schlüssel gelten für alle Sessions, und ein Makro verdeckt sogar eingebaute Funktionen und Operatoren
-     gleichen Namens;
+   * `create` oder `drop` mit später `secret`, `macro`, `function` oder `trigger` und `add_parquet_key`: Secrets,
+     Makros, Trigger und Parquet-Schlüssel gelten für alle Sessions, ein Makro verdeckt sogar eingebaute Funktionen
+     und Operatoren gleichen Namens, und ein Trigger führt sein SQL in den Schreibvorgängen anderer Sessions aus;
+   * `alter` mit später `database` (`ALTER DATABASE … SET ALIAS` benennt eine Datenbank für alle Sessions um);
    * `schema` mit später `system`.
 
    Bis das `postStartSQL` beide Einstellungen gesetzt hat, lehnt es jede Anfrage ab: Vorher ist die Engine nicht

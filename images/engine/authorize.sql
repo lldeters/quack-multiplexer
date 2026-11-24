@@ -49,10 +49,13 @@
 --   file and its WAL included; the databases are shared by all sessions;
 -- * checkpoint and force_checkpoint (FORCE CHECKPOINT aborts the transactions
 --   of all sessions), truncate_duckdb_logs and write_log (DuckDB's log);
--- * create or drop followed later by secret, macro or function, and
---   add_parquet_key: secrets, macros and Parquet keys are shared by all
---   sessions, a secret supplies the credentials for its scope, a macro takes
---   precedence over a built-in function or an operator of the same name;
+-- * create or drop followed later by secret, macro, function or trigger,
+--   and add_parquet_key: secrets, macros, triggers and Parquet keys are
+--   shared by all sessions, a secret supplies the credentials for its scope,
+--   a macro takes precedence over a built-in function or an operator of the
+--   same name, a trigger runs its SQL in the writes of other sessions;
+-- * alter followed later by database (ALTER DATABASE ... SET ALIAS renames a
+--   database for all sessions);
 -- * schema followed later by system: a schema named "system" would make
 --   system.main.<name> below ambiguous, and with it every query fail.
 --
@@ -81,7 +84,8 @@ CREATE OR REPLACE MACRO quackmux_rejection(sql) AS
         '|copy\b[\s\S]*[^a-z_](?:to|from)\b|copy_database\b|export\b[\s\S]*[^a-z_]database\b',
         '|attach\b|detach\b|connect\b',
         '|checkpoint\b|force_checkpoint\b|truncate_duckdb_logs\b|write_log\b',
-        '|(?:create|drop)\b[\s\S]*[^a-z_](?:secret|macro|function)\b|add_parquet_key\b',
+        '|(?:create|drop)\b[\s\S]*[^a-z_](?:secret|macro|function|trigger)\b|add_parquet_key\b',
+        '|alter\b[\s\S]*[^a-z_]database\b',
         '|schema\b[\s\S]*[^a-z_]system\b',
         ')'), 1, 'i'), '');
 
