@@ -47,8 +47,9 @@ profiles:
 	if sql := string(secret.Data[postStartSQLDataKey]); sql != want || engine.RenderPostStartSQL(prof) != want {
 		t.Fatalf("post-start SQL in the secret %q, want %q", sql, want)
 	}
-	// A trailing dot command gets no ";" (the CLI would read "authorize.sql;").
-	if sql := string(secret.Data[initSQLDataKey]); sql != ".read /usr/local/share/quackmux/authorize.sql\n" {
+	// A trailing dot command gets its ";" on a line of its own (the CLI would
+	// read the file "authorize.sql;").
+	if sql := string(secret.Data[initSQLDataKey]); sql != ".read /usr/local/share/quackmux/authorize.sql\n;\n" {
 		t.Fatalf("init SQL in the secret %q", sql)
 	}
 	sum := sha256.Sum256([]byte(want))

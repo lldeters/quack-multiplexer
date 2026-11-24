@@ -73,39 +73,29 @@ func RenderPostStartSQL(p config.Profile) string {
 }
 
 // writeScript writes the script s, trimmed, with its last statement
-// terminated, so that more statements may follow: ";" after SQL, a line
-// break after a dot command of the DuckDB CLI (".read file;" would read the
-// file "file;"). Blank scripts write nothing.
+// terminated, so that more statements may follow. Blank scripts write
+// nothing. A ";" at the end of the last line does not always end a
+// statement: after a dot command of the DuckDB CLI it becomes part of the
+// argument (".read file;" reads the file "file;"), and after "--" it is part
+// of the comment. Such a line gets the ";" on a line of its own, which ends
+// a pending statement and is an empty statement otherwise. A line that
+// starts with "." may also continue a pending statement (".5"); the ";"
+// ends it too.
 func writeScript(b *strings.Builder, s string) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return
 	}
 	b.WriteString(s)
-	if !strings.HasSuffix(s, ";") && !endsWithDotCommand(s) {
+	last := s[strings.LastIndexByte(s, '\n')+1:]
+	switch {
+	case strings.HasSuffix(s, ";"):
+	case strings.HasPrefix(last, ".") || strings.Contains(last, "--"):
+		b.WriteString("\n;")
+	default:
 		b.WriteString(";")
 	}
 	b.WriteString("\n")
-}
-
-// endsWithDotCommand reports whether the CLI takes the last line of the
-// trimmed script s for a dot command: it starts with "." and no statement is
-// pending, that is the closest earlier line that is neither blank nor a "--"
-// comment ends with ";" or is a dot command too (or there is none). A comment
-// after the end of the last statement is not recognized.
-func endsWithDotCommand(s string) bool {
-	lines := strings.Split(s, "\n")
-	if !strings.HasPrefix(lines[len(lines)-1], ".") {
-		return false
-	}
-	for i := len(lines) - 2; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" || strings.HasPrefix(line, "--") {
-			continue
-		}
-		return strings.HasSuffix(line, ";") || strings.HasPrefix(lines[i], ".")
-	}
-	return true
 }
 
 // QuoteSQLString renders s as a single-quoted SQL string literal.
