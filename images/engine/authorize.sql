@@ -86,17 +86,21 @@ CREATE OR REPLACE MACRO quackmux_rejection(sql) AS
         ')'), 1, 'i'), '');
 
 -- quackmux_authorize is the authorization function. It returns BOOLEAN:
--- a VARCHAR result would replace the SQL of the query.
+-- a VARCHAR result would replace the SQL of the query. The lambda evaluates
+-- quackmux_rejection once: every occurrence of the regular expression is
+-- compiled anew for every query (about 1 ms each).
 CREATE OR REPLACE MACRO quackmux_authorize(connection_id, sql) AS
     CASE
         WHEN system.main.current_setting('enable_external_access')
                 OR NOT system.main.current_setting('lock_configuration') THEN
             system.main.error('quackmux_authorize: the engine is not hardened yet (the post-start SQL must set enable_external_access = false and lock_configuration = true); try again')
-        WHEN quackmux_rejection(sql) IS NULL THEN
-            true
         ELSE
-            system.main.error(system.main.concat('quackmux_authorize: not allowed on this engine: "',
-                system.main.left(quackmux_rejection(sql), 60), '"'))
+            system.main.list_extract(system.main.list_transform(system.main.list_value(quackmux_rejection(sql)),
+                lambda rejection: CASE
+                    WHEN rejection IS NULL THEN true
+                    ELSE system.main.error(system.main.concat('quackmux_authorize: not allowed on this engine: "',
+                        system.main.left(rejection, 60), '"'))
+                END), 1)
     END;
 
 SET GLOBAL quack_authorization_function = 'quackmux_authorize';
