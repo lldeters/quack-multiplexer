@@ -61,6 +61,9 @@ func (a noneAuth) Authenticate(_ context.Context, r auth.Request) (auth.Identity
 
 func (noneAuth) Close() error { return nil }
 
+// GroupsOf implements auth.GroupLookup.
+func (a noneAuth) GroupsOf(user string) []string { return a.groups[user] }
+
 type harness struct {
 	t        *testing.T
 	cfg      *config.Config

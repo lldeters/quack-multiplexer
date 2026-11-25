@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"quackmux/internal/auth"
 	"quackmux/internal/policy"
 	"quackmux/internal/session"
 	"quackmux/internal/upstream"
@@ -202,9 +203,16 @@ func newQueryLimits(g *Gateway) *queryLimits {
 }
 
 // limitFor resolves the time limit of the queries of s (0: none) and the
-// setting it comes from.
+// setting it comes from. A session adopted after a restart carries no
+// groups; the authenticator may know them.
 func (l *queryLimits) limitFor(s *session.Session) (time.Duration, string) {
-	return policy.QueryTimeout(l.g.cfg, s.User, s.Groups, s.EngineKey.Profile)
+	groups := s.Groups
+	if s.Adopted && groups == nil {
+		if gl, ok := l.g.auth.(auth.GroupLookup); ok {
+			groups = gl.GroupsOf(s.User)
+		}
+	}
+	return policy.QueryTimeout(l.g.cfg, s.User, groups, s.EngineKey.Profile)
 }
 
 // fresh reports whether the gateway may act on engines (see Options.Fence).

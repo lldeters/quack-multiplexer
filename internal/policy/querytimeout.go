@@ -13,9 +13,10 @@ import (
 // limits.queryTimeout. 0 means no limit. It also returns the setting the
 // limit comes from (such as "profiles.adhoc.queryTimeout"), for messages.
 //
-// Like Resolve, only the first matching override counts. For a session
-// adopted after a gateway restart the groups are unknown (connection ids do
-// not carry them), so only overrides that match by user name apply there.
+// Like Resolve, only the first matching override counts. A connection id
+// carries the user but not the groups: for a session adopted after a gateway
+// restart the caller passes the groups that the authenticator knows (see
+// auth.GroupLookup); with auth.mode jwt there are none.
 func QueryTimeout(cfg *config.Config, user string, groups []string, profile string) (time.Duration, string) {
 	for i := range cfg.Overrides {
 		if cfg.Overrides[i].Matches(user, groups) {

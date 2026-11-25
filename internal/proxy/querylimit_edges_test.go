@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"quackmux/internal/engine/fake"
 	"quackmux/internal/proxy"
 	"quackmux/internal/quacktest"
 	"quackmux/internal/wire"
@@ -298,6 +299,30 @@ func TestQueryLimitWaitsForAFreshLease(t *testing.T) {
 	fresh.Store(true)
 	mustTimeout(t, wait(t, "the PREPARE", answer), "300ms", "limits.queryTimeout")
 	waitCancels(t, srv, uuidA)
+}
+
+// A session adopted after a restart has no groups in its id; the gateway
+// asks the authenticator for them, so that overrides by group still apply.
+func TestGroupOverrideAppliesAfterARestart(t *testing.T) {
+	const cfg = `
+limits: {queryTimeout: 300ms}
+overrides:
+  - groups: [admins]
+    queryTimeout: 0s
+`
+	h1 := newHarness(t, cfg, nil)
+	alice := h1.connect("tok?user=alice", nil) // admins
+	bob := h1.connect("tok?user=bob", nil)     // analytics only
+	mustType(t, h1.prepare(alice, "SLEEP 800", uuidA), wire.TypePrepareResponse)
+
+	prov2 := fake.New()
+	prov2.Adopt(h1.prov)
+	h1.cancel()
+	h2 := newHarness(t, cfg, prov2)
+	mustType(t, h2.heartbeat(alice), wire.TypeSuccessResponse)
+	mustType(t, h2.heartbeat(bob), wire.TypeSuccessResponse)
+	mustType(t, h2.prepare(alice, "SLEEP 800", uuidB), wire.TypePrepareResponse)
+	mustTimeout(t, h2.prepare(bob, "SLEEP 10000", uuidB), "300ms", "limits.queryTimeout")
 }
 
 // A streamed PREPARE whose client goes away before its uuid passed never
