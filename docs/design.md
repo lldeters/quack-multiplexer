@@ -396,7 +396,8 @@ vergehen. Bei einem Upload trifft es den nächsten SEND_DATA.
   `test/e2e/kind/ha.sh`, Szenario h3. Ein aufgeweckter Leader gibt außerdem keine Lease frei, die er nicht mehr
   hält: client-go (v0.37) entscheidet beim Freigeben nach dem zuletzt beobachteten Stand und hätte die Lease
   des neuen Leaders geleert. Der Lock-Wrapper schreibt eine Freigabe nur, wenn die gerade gelesene Lease uns
-  gehört. Dieselbe Frische gilt für den Proxy und das Label: Ohne frische Lease nimmt ein Leader keine Requests
+  gehört. Auf dem master von client-go ist das behoben, in den Release-Zweigen bis 1.37 nicht
+  ([Upstream-Bericht](upstream/client-go-leaderelection-release.md)). Dieselbe Frische gilt für den Proxy und das Label: Ohne frische Lease nimmt ein Leader keine Requests
   an und setzt sein Label nicht (wieder); geprüft wird direkt vor jedem Patch. Ready meldet er sich erst wieder
   nach dem Neustart als Follower (`Elector.SteppingDown`), damit ihn das PodDisruptionBudget nicht als Standby
   zählt.
