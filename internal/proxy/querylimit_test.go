@@ -1,13 +1,11 @@
 package proxy_test
 
 import (
-	"bytes"
 	"fmt"
-	"io"
-	"net/http"
 	"testing"
 	"time"
 
+	"quackmux/internal/engine/fake"
 	"quackmux/internal/metrics"
 	"quackmux/internal/proxy"
 	"quackmux/internal/quacktest"
@@ -48,6 +46,17 @@ func (h *harness) sendData(connID string) []byte {
 func mustTimeout(t *testing.T, body []byte, limit, source string) {
 	t.Helper()
 	e := mustError(t, body, "ran longer than its time limit of "+limit+" ("+source+") and was cancelled")
+	if e.ExceptionType != wire.ExceptionInterrupt || e.MustInvalidate {
+		t.Fatalf("timeout error %+v: want type %s without must_invalidate", e, wire.ExceptionInterrupt)
+	}
+}
+
+// mustTimeoutFailed checks that body is the gateway's error for a query that
+// ran out of time and that the gateway could not cancel on the engine.
+func mustTimeoutFailed(t *testing.T, body []byte, limit, source string) {
+	t.Helper()
+	e := mustError(t, body, "ran longer than its time limit of "+limit+" ("+source+"); the gateway could not cancel "+
+		"it on the engine, so it may still be running")
 	if e.ExceptionType != wire.ExceptionInterrupt || e.MustInvalidate {
 		t.Fatalf("timeout error %+v: want type %s without must_invalidate", e, wire.ExceptionInterrupt)
 	}
@@ -212,8 +221,10 @@ func TestQueryTimeoutWhileFetching(t *testing.T) {
 	}
 }
 
-// Time the client spends between FETCHes counts: the gateway cancels the
-// query while the client rests, and its next FETCH gets the error.
+// Time the client spends between FETCHes counts. While the client rests,
+// the engine does not work for the query (the client may have read all it
+// wants), so the gateway sends no CANCEL then; the next FETCH after the limit
+// gets the error, and the gateway cancels the query.
 func TestQueryTimeoutBetweenFetches(t *testing.T) {
 	h := newHarness(t, "limits: {queryTimeout: 400ms}\n", nil)
 	c := h.connect("tok?user=alice", nil)
@@ -224,8 +235,17 @@ func TestQueryTimeoutBetweenFetches(t *testing.T) {
 			t.Fatalf("FETCH %d: %+v, %v", i, f, err)
 		}
 	}
-	eventually(t, "CANCEL at the limit", func() bool { return len(cancels(srv)) == 1 })
+	time.Sleep(900 * time.Millisecond)
+	if got := cancels(srv); len(got) != 0 {
+		t.Fatalf("engine got CANCEL for %v while the client rested", got)
+	}
+	fetches := srv.CountType(wire.TypeFetchRequest)
 	mustTimeout(t, h.fetch(c, uuidA, 3), "400ms", "limits.queryTimeout")
+	if n := srv.CountType(wire.TypeFetchRequest); n != fetches {
+		t.Fatal("the FETCH after the limit reached the engine")
+	}
+	waitCancels(t, srv, uuidA)
+	waitTimeouts(t, h.met, "cancelled", 1)
 }
 
 // The gateway cannot tell from a PREPARE_RESPONSE whether the result is
@@ -244,35 +264,42 @@ func TestRestingQueryIsCancelledWhenTheClientReturns(t *testing.T) {
 	waitCancels(t, srv, uuidA)
 }
 
-// Uploads count like FETCHes: an upload that runs past the limit is cancelled,
-// and the next part of it gets the error.
+// Uploads count like FETCHes: the next part of an upload after the limit
+// gets the error, and the gateway cancels the query then.
 func TestQueryTimeoutDuringUpload(t *testing.T) {
 	h := newHarness(t, "limits: {queryTimeout: 400ms}\n", nil)
 	c := h.connect("tok?user=alice", nil)
 	srv := h.prov.Server(h.sessionEngine(c))
 	mustType(t, h.prepare(c, "STREAM 1 60000", uuidA), wire.TypePrepareResponse) // INSERT ... FROM the client
 	mustType(t, h.sendData(c), wire.TypeSendDataResponse)
-	eventually(t, "CANCEL at the limit", func() bool { return len(cancels(srv)) == 1 })
+	time.Sleep(900 * time.Millisecond)
+	if got := cancels(srv); len(got) != 0 {
+		t.Fatalf("engine got CANCEL for %v between two parts of the upload", got)
+	}
 	uploads := srv.CountType(wire.TypeSendDataRequest)
 	mustTimeout(t, h.sendData(c), "400ms", "limits.queryTimeout")
 	if n := srv.CountType(wire.TypeSendDataRequest); n != uploads {
 		t.Fatal("the upload after the timeout reached the engine")
 	}
+	waitCancels(t, srv, uuidA)
 }
 
 // If the engine does not confirm the CANCEL, the gateway answers the waiting
-// request itself.
+// request itself, and says that the query may still run.
 func TestQueryTimeoutWhenTheCancelFails(t *testing.T) {
 	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
 	c := h.connect("tok?user=alice", nil)
 	srv := h.prov.Server(h.sessionEngine(c))
 	srv.CancelError = "boom"
 	start := time.Now()
-	mustTimeout(t, h.prepare(c, "SLEEP 3000", uuidA), "300ms", "limits.queryTimeout")
+	mustTimeoutFailed(t, h.prepare(c, "SLEEP 3000", uuidA), "300ms", "limits.queryTimeout")
 	if d := time.Since(start); d > 2500*time.Millisecond {
 		t.Fatalf("the client waited %s for the query that the engine did not cancel", d)
 	}
 	waitTimeouts(t, h.met, "failed", 1)
+	if n := timeouts(t, h.met, "cancelled"); n != 0 {
+		t.Fatalf("%v timeouts counted as cancelled", n)
+	}
 }
 
 // A CANCEL of the client ends the query: the gateway does not cancel it again
@@ -314,31 +341,46 @@ func TestSupersededQueries(t *testing.T) {
 	mustType(t, h.prepare(c, "STREAM 3 10", uuidC), wire.TypePrepareResponse)
 	h.fetch(c, uuidC, 1)
 	mustError(t, h.prepare(c, "FAIL boom", uuidA), "boom")
-	// The engine's statement is the failed one now: the CANCEL for uuidC at
-	// its limit is refused.
-	eventually(t, "CANCEL at the limit", func() bool { return len(cancels(srv)) == 1 })
-	eventually(t, "the query forgotten", func() bool { _, q := proxy.TrackedQueries(h.gw); return q == 0 })
+	// The engine's statement is the failed one now. A FETCH for uuidC after
+	// its limit makes the gateway cancel it, the engine refuses, and the
+	// FETCH gets the engine's answer.
+	time.Sleep(800 * time.Millisecond)
+	mustError(t, h.fetch(c, uuidC, 2), quacktest.MsgResultClosed)
+	waitCancels(t, srv, uuidC)
+	if _, q := proxy.TrackedQueries(h.gw); q != 0 {
+		t.Fatalf("%d queries followed after the engine refused the CANCEL", q)
+	}
 	if n := timeouts(t, h.met, "cancelled") + timeouts(t, h.met, "failed"); n != 0 {
 		t.Fatalf("%v timeouts counted for a query that was over", n)
 	}
-	mustError(t, h.fetch(c, uuidC, 2), quacktest.MsgResultClosed)
 }
 
-// A FETCH for a query the gateway has not seen (it began before a gateway
-// restart) starts the limit.
+// After a gateway restart, a FETCH of an adopted session for a query the
+// gateway has not seen (it began before the restart) starts the limit.
+// FETCHes for uuids the engine does not have leave nothing behind.
 func TestQueryTimeoutForQueryFromBeforeARestart(t *testing.T) {
-	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
-	c := h.connect("tok?user=alice", nil)
-	srv := h.prov.Server(h.sessionEngine(c))
-	// The previous gateway forwarded the PREPARE.
-	msg := wire.PrepareRequest{SQL: "STREAM 3 60000", QueryUUID: uuidA}.Encode(wire.Header{ConnectionID: h.backendConn(c)})
-	resp, err := http.Post(srv.URL()+"/quack", wire.ContentType, bytes.NewReader(msg))
-	if err != nil {
-		t.Fatal(err)
+	const cfg = "limits: {queryTimeout: 300ms}\n"
+	h1 := newHarness(t, cfg, nil)
+	c := h1.connect("tok?user=alice", nil)
+	srv := h1.prov.Server(h1.sessionEngine(c))
+	mustType(t, h1.prepare(c, "STREAM 3 60000", uuidA), wire.TypePrepareResponse)
+
+	prov2 := fake.New()
+	prov2.Adopt(h1.prov)
+	h1.cancel()
+	h2 := newHarness(t, cfg, prov2)
+	mustType(t, h2.heartbeat(c), wire.TypeSuccessResponse) // adopted
+	for i := uint64(1); i <= 3; i++ {
+		mustError(t, h2.fetch(c, wire.Hugeint{Upper: 99, Lower: i}, 1), quacktest.MsgResultClosed)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	mustTimeout(t, h.fetch(c, uuidA, 1), "300ms", "limits.queryTimeout")
+	if _, q := proxy.TrackedQueries(h2.gw); q != 0 {
+		t.Fatalf("%d queries followed after FETCHes for queries the engine does not have", q)
+	}
+	start := time.Now()
+	mustTimeout(t, h2.fetch(c, uuidA, 1), "300ms", "limits.queryTimeout")
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Fatalf("the FETCH got the error after %s, before the limit", d)
+	}
 	waitCancels(t, srv, uuidA)
 }
 

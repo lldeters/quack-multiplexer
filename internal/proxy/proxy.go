@@ -554,9 +554,9 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		contentLength = r.ContentLength - int64(hlen) + int64(len(newHeader))
 	}
 	// The query time limit reads the query uuid of FETCH and CANCEL from the
-	// start of their body.
+	// start of their body, and whether a PREPARE ends a transaction.
 	var queryHead []byte
-	if g.limits != nil && (h.Type == wire.TypeFetchRequest || h.Type == wire.TypeCancelRequest) {
+	if g.limits != nil && (h.Type == wire.TypeFetchRequest || h.Type == wire.TypeCancelRequest || h.Type == wire.TypePrepareRequest) {
 		queryHead = peekQueryHead(br, r.ContentLength-int64(hlen))
 	}
 	// The transport may still read the body after Do has returned (it probes
@@ -564,7 +564,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	// must never reach past the client's message and the byte count is
 	// atomic.
 	var in io.Reader
-	var sent func() int64
+	var cr *countingReader           // what the transport has read of in
 	var body []byte                  // the body after the header, if buffered
 	var prepareScan *prepareUUIDSink // finds the uuid of a PREPARE that streams
 	if contentLength >= 0 && uc.MaxBufferedRequestBytes > 0 && contentLength <= uc.MaxBufferedRequestBytes && g.buffers.TryAcquire(contentLength) {
@@ -582,8 +582,8 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		// wait long for the engine under backpressure.
 		release := sync.OnceFunc(func() { g.buffers.Release(contentLength) })
 		defer release()
-		in = &releasingReader{Reader: bytes.NewReader(buf), release: release}
-		sent = func() int64 { return contentLength }
+		cr = &countingReader{r: bytes.NewReader(buf), size: contentLength}
+		in = &releasingReader{Reader: cr, release: release}
 		body = buf[len(newHeader):]
 	} else {
 		var rest io.Reader = br
@@ -594,9 +594,10 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 			prepareScan = &prepareUUIDSink{}
 			rest = io.TeeReader(rest, prepareScan)
 		}
-		cr := &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest)}
-		in, sent = cr, cr.n.Load
+		cr = &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest), size: contentLength}
+		in = cr
 	}
+	sent := cr.n.Load
 	upCtx := r.Context()
 	stopAbort := func() bool { return true }
 	if h.Type == wire.TypePrepareRequest || g.limits != nil {
@@ -609,7 +610,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 			stopAbort = context.AfterFunc(g.abortCtx, cancelUp)
 		}
 		if g.limits != nil {
-			qr, timedOut, err := g.limits.track(r.Context(), h, sess, body, queryHead, prepareScan, cancelUp)
+			qr, timedOut, err := g.limits.track(r.Context(), h, sess, body, queryHead, prepareScan, cancelUp, cr)
 			switch {
 			case errors.Is(err, errShuttingDown):
 				stopAbort()
@@ -622,7 +623,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 				// Read what the client sends before answering, so that its
 				// connection stays usable.
 				_, _ = io.Copy(io.Discard, in)
-				writeError(w, timedOut.message(), wire.ExceptionInterrupt, false)
+				writeError(w, g.limits.message(timedOut), wire.ExceptionInterrupt, false)
 				return "query_timeout"
 			}
 			return g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, qr)
@@ -703,8 +704,11 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 		ev = evResult
 	case wire.TypeFetchResponse:
 		if qr != nil {
-			if f, err := wire.DecodeFetchResponseHead(p); err == nil && f.Terminal() {
-				ev = evComplete
+			if f, err := wire.DecodeFetchResponseHead(p); err == nil {
+				ev = evBatch
+				if f.Terminal() {
+					ev = evComplete
+				}
 			}
 		}
 	}
@@ -831,7 +835,7 @@ func mayHoldCredentials(sql string) bool {
 // releasingReader is a request body that runs release once the transport
 // closes it (after sending it, or on failure).
 type releasingReader struct {
-	*bytes.Reader
+	io.Reader
 	release func()
 }
 
@@ -840,15 +844,57 @@ func (r *releasingReader) Close() error {
 	return nil
 }
 
-// countingReader counts the bytes read through it. The count is atomic: the
-// HTTP transport reads in its own goroutine.
+// countingReader is the body of a request to the engine, as the HTTP
+// transport reads it (in its own goroutine). It counts the bytes read
+// through it, and stop can cut it off.
 type countingReader struct {
-	r io.Reader
-	n atomic.Int64
+	r    io.Reader
+	size int64 // the length of the body; negative: unknown, it ends at EOF
+	n    atomic.Int64
+
+	mu       sync.Mutex
+	complete bool // the transport has read all of the body
+	stopped  bool // stop cut it off
 }
 
+// errBodyCut is what the transport reads from a body that stop cut off.
+var errBodyCut = errors.New("quackmux: the request body was cut off")
+
 func (c *countingReader) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	stopped := c.stopped
+	c.mu.Unlock()
+	if stopped {
+		return 0, errBodyCut
+	}
 	n, err := c.r.Read(p)
-	c.n.Add(int64(n))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return 0, errBodyCut // the transport never gets these bytes
+	}
+	total := c.n.Add(int64(n))
+	if err == io.EOF || (c.size >= 0 && total >= c.size) {
+		c.complete = true
+	}
 	return n, err
+}
+
+// stop cuts the body off unless the transport has read all of it, and
+// reports whether it did: the engine cannot get the whole message then.
+func (c *countingReader) stop() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.complete {
+		c.stopped = true
+	}
+	return c.stopped
+}
+
+// sentAll reports whether the transport has read all of the body, so that
+// the engine may have the whole message.
+func (c *countingReader) sentAll() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.complete
 }
