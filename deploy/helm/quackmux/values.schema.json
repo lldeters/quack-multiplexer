@@ -1,5 +1,5 @@
 {
-  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Values of the quackmux chart",
   "description": "Unknown keys are errors, like in the gateway configuration: a typo must not silently fall back to a default.",
   "type": "object",
