@@ -18,18 +18,43 @@ import (
 // restart the caller passes the groups that the authenticator knows (see
 // auth.GroupLookup); with auth.mode jwt there are none.
 func QueryTimeout(cfg *config.Config, user string, groups []string, profile string) (time.Duration, string) {
+	d, rule := queryTimeoutRule(cfg, user, groups, profile)
+	switch {
+	case rule >= 0:
+		return d, fmt.Sprintf("overrides[%d].queryTimeout", rule)
+	case rule == ruleProfile:
+		return d, "profiles." + profile + ".queryTimeout"
+	}
+	return d, "limits.queryTimeout"
+}
+
+// QueryTimeoutLimit is the limit QueryTimeout resolves, without the setting
+// it comes from.
+func QueryTimeoutLimit(cfg *config.Config, user string, groups []string, profile string) time.Duration {
+	d, _ := queryTimeoutRule(cfg, user, groups, profile)
+	return d
+}
+
+// The rules a query time limit comes from besides an override (whose index
+// queryTimeoutRule returns).
+const (
+	ruleProfile = -1
+	ruleLimits  = -2
+)
+
+func queryTimeoutRule(cfg *config.Config, user string, groups []string, profile string) (time.Duration, int) {
 	for i := range cfg.Overrides {
 		if cfg.Overrides[i].Matches(user, groups) {
 			if d := cfg.Overrides[i].QueryTimeout; d != nil {
-				return d.Duration, fmt.Sprintf("overrides[%d].queryTimeout", i)
+				return d.Duration, i
 			}
 			break
 		}
 	}
 	if p, ok := cfg.Profiles[profile]; ok && p.QueryTimeout != nil {
-		return p.QueryTimeout.Duration, "profiles." + profile + ".queryTimeout"
+		return p.QueryTimeout.Duration, ruleProfile
 	}
-	return cfg.Limits.QueryTimeout.Duration, "limits.queryTimeout"
+	return cfg.Limits.QueryTimeout.Duration, ruleLimits
 }
 
 // QueryTimeoutConfigured reports whether any query time limit is configured

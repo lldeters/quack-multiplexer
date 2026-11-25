@@ -45,6 +45,14 @@ import (
 // waits for the answer to a PREPARE also when its client goes away: the
 // engine runs the query anyway.
 //
+// The engine gets a request only once all of it arrived, and then serves
+// the statement the connection has. A FETCH or an upload that no query of
+// the session claims when the gateway forwards it (its body may come
+// slowly) therefore counts as a request of the first query the gateway
+// begins to follow afterwards that it may serve: a FETCH one with its uuid,
+// an upload any query. So do the requests of a query that ends while they
+// are in flight, for the next query they may serve.
+//
 // The gateway cannot see whether a client still wants a query that it does
 // not ask anything for: an answered PREPARE may carry the whole result
 // (needs_more_fetch follows the column types, which the gateway does not
@@ -156,6 +164,9 @@ type sessionQueries struct {
 	// DISCONNECT to the engine (see sessionClosed).
 	closed bool
 	hold   chan struct{}
+	// strays are the FETCHes and uploads in flight that no query claims
+	// (see strayLocked).
+	strays map[*queryRequest]struct{}
 }
 
 // trackedQuery is one query of a session.
@@ -194,7 +205,11 @@ type queryRequest struct {
 	l    *queryLimits
 	sess *session.Session
 	kind wire.MessageType
-	q    *trackedQuery // nil for CANCEL_REQUEST
+	q    *trackedQuery // nil for CANCEL_REQUEST and a stray
+	// sq follows a stray (a FETCH or an upload that no query claims), uuid
+	// is the uuid of a FETCH.
+	sq   *sessionQueries
+	uuid wire.Hugeint
 	// ends are the queries a CANCEL_REQUEST of the client ends once the
 	// engine confirms it: those it names whose PREPARE had been answered when
 	// the gateway forwarded it.
@@ -240,16 +255,25 @@ func newQueryLimits(g *Gateway) *queryLimits {
 }
 
 // limitFor resolves the time limit of the queries of s (0: none) and the
-// setting it comes from. A session adopted after a restart carries no
-// groups; the authenticator may know them.
+// setting it comes from.
 func (l *queryLimits) limitFor(s *session.Session) (time.Duration, string) {
-	groups := s.Groups
-	if s.Adopted && groups == nil {
+	return policy.QueryTimeout(l.g.cfg, s.User, l.groupsOf(s), s.EngineKey.Profile)
+}
+
+// limited reports whether the queries of s have a time limit.
+func (l *queryLimits) limited(s *session.Session) bool {
+	return policy.QueryTimeoutLimit(l.g.cfg, s.User, l.groupsOf(s), s.EngineKey.Profile) > 0
+}
+
+// groupsOf returns the groups of s. A session adopted after a restart
+// carries none; the authenticator may know them.
+func (l *queryLimits) groupsOf(s *session.Session) []string {
+	if s.Adopted && s.Groups == nil {
 		if gl, ok := l.g.auth.(auth.GroupLookup); ok {
-			groups = gl.GroupsOf(s.User)
+			return gl.GroupsOf(s.User)
 		}
 	}
-	return policy.QueryTimeout(l.g.cfg, s.User, groups, s.EngineKey.Profile)
+	return s.Groups
 }
 
 // fresh reports whether the gateway may act on engines (see Options.Fence).
@@ -303,7 +327,57 @@ func (l *queryLimits) endLocked(q *trackedQuery) {
 			break
 		}
 	}
+	// Its FETCHes and uploads in flight may serve a later statement.
+	for r := range q.waiting {
+		if r.kind != wire.TypePrepareRequest {
+			delete(q.waiting, r)
+			l.rehomeLocked(sq, r)
+		}
+	}
 	l.forgetIdleLocked(sq)
+}
+
+// rehomeLocked hands a FETCH or an upload in flight to the newest query of
+// sq that it may serve (a FETCH: one with its uuid), or makes it a stray.
+// Its answer ends nothing: it may be about another statement.
+func (l *queryLimits) rehomeLocked(sq *sessionQueries, r *queryRequest) {
+	r.early = true
+	for i := len(sq.queries) - 1; i >= 0; i-- {
+		o := sq.queries[i]
+		if o.limit > 0 && (r.kind != wire.TypeFetchRequest || (o.uuidKnown && o.uuid == r.uuid)) {
+			r.q, r.sq = o, nil
+			o.waiting[r] = struct{}{}
+			return
+		}
+	}
+	r.q = nil
+	l.addStrayLocked(sq, r)
+}
+
+// addStrayLocked follows r as a stray of sq.
+func (l *queryLimits) addStrayLocked(sq *sessionQueries, r *queryRequest) {
+	r.sq = sq
+	if sq.strays == nil {
+		sq.strays = map[*queryRequest]struct{}{}
+	}
+	sq.strays[r] = struct{}{}
+}
+
+// homeLocked hands q the strays of its session that it may serve: uploads,
+// and FETCHes with its uuid.
+func (l *queryLimits) homeLocked(q *trackedQuery) {
+	if q.limit <= 0 {
+		return // nothing to enforce for it
+	}
+	sq := q.sq
+	for r := range sq.strays {
+		if r.kind == wire.TypeFetchRequest && (!q.uuidKnown || r.uuid != q.uuid) {
+			continue
+		}
+		delete(sq.strays, r)
+		r.q, r.sq = q, nil
+		q.waiting[r] = struct{}{}
+	}
 }
 
 // forgetIdleLocked drops the state of a session that has nothing left to
@@ -317,7 +391,8 @@ func (l *queryLimits) forgetIdleLocked(sq *sessionQueries) {
 		}
 		return
 	}
-	if len(sq.queries) == 0 && sq.cancels == 0 && (!sq.sess.Adopted || sq.adopting) && l.sessions[sq.sess.ID] == sq {
+	if len(sq.queries) == 0 && len(sq.strays) == 0 && sq.cancels == 0 && (!sq.sess.Adopted || sq.adopting) &&
+		l.sessions[sq.sess.ID] == sq {
 		delete(l.sessions, sq.sess.ID)
 	}
 }
@@ -378,7 +453,7 @@ func (l *queryLimits) dropLocked(sq *sessionQueries) {
 			}
 		}
 	}
-	sq.queries = nil
+	sq.queries, sq.strays = nil, nil
 	if l.sessions[sq.sess.ID] == sq {
 		delete(l.sessions, sq.sess.ID)
 	}
@@ -504,6 +579,7 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 		}
 		q.prepare, q.prepared, q.preparing = r, make(chan struct{}), true
 		q.waiting[r] = struct{}{}
+		l.homeLocked(q)
 		return r, nil
 	}
 }
@@ -545,9 +621,14 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 		}
 		if q == nil {
 			var err error
-			if q, err = l.adoptLocked(sess, sq, uuid); q == nil {
+			if q, err = l.adoptLocked(sess, sq, uuid); err != nil {
 				l.mu.Unlock()
 				return nil, nil, err
+			}
+			if q == nil {
+				r, err := l.strayLocked(sess, sq, uuid, abort)
+				l.mu.Unlock()
+				return r, nil, err
 			}
 		}
 		if q.timedOut {
@@ -598,8 +679,30 @@ func (l *queryLimits) closedLocked(sess *session.Session, sq *sessionQueries) bo
 	if _, closed := sess.Closed(); !closed {
 		return false
 	}
-	limit, _ := l.limitFor(sess)
-	return limit > 0
+	return l.limited(sess)
+}
+
+// strayLocked follows a FETCH (of the query with *uuid) or an upload (uuid
+// nil) that no query of the session claims, as a stray of the session (nil:
+// the limit does not apply to it). The gateway forwards it; a query that
+// it may serve and that the gateway begins to follow while it is in flight
+// takes it (homeLocked).
+func (l *queryLimits) strayLocked(sess *session.Session, sq *sessionQueries, uuid *wire.Hugeint,
+	abort context.CancelFunc) (*queryRequest, error) {
+	if sq == nil {
+		if !l.limited(sess) {
+			return nil, nil
+		}
+		if sq = l.sessionLocked(sess, true); sq == nil {
+			return nil, errSessionClosed
+		}
+	}
+	r := &queryRequest{l: l, sess: sess, kind: wire.TypeSendDataRequest, early: true, abort: abort}
+	if uuid != nil {
+		r.kind, r.uuid = wire.TypeFetchRequest, *uuid
+	}
+	l.addStrayLocked(sq, r)
+	return r, nil
 }
 
 // adoptLocked starts following the query that a FETCH for a uuid the gateway
@@ -664,6 +767,7 @@ func (r *queryRequest) setUUID(uuid wire.Hugeint) {
 	defer l.mu.Unlock()
 	if q := r.q; !q.ended && !q.uuidKnown {
 		q.uuid, q.uuidKnown = uuid, true
+		l.homeLocked(q)
 	}
 }
 
@@ -700,6 +804,14 @@ func (r *queryRequest) finish(ev requestEvent) {
 	l := r.l
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if r.q == nil && r.kind != wire.TypeCancelRequest {
+		// A stray: no query took it.
+		if sq := r.sq; sq != nil {
+			delete(sq.strays, r)
+			l.forgetIdleLocked(sq)
+		}
+		return
+	}
 	if r.q == nil {
 		// A CANCEL of the client: once the engine confirmed it, it ended the
 		// statement of the connection, so the queries it named are over, and
