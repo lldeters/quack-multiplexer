@@ -30,9 +30,19 @@ defaults:
 session:
   # The default idle timeout (6h) never interferes with the scenarios.
   checkInterval: 2s
+  # Clients heartbeat at least every 8s (0.4 x 20s), so the orphan grace of
+  # scenario k can be short.
+  maxHeartbeatTimeout: 20s
 
 engine:
   checkInterval: 2s
+  # Scenario k: after a restart the gateway closes the connections that no
+  # client asks for within the orphan grace, here 30s (the longest of 20s,
+  # 0.4 x 20s + heartbeatGrace and server.upstream.handshakeTimeout). Static
+  # engines need the switch. gateway-idle uses the same engines and leaves it
+  # off; it never restarts during the run.
+  closeOrphanedConnections: true
+  recoveryGrace: 20s
 
 provider:
   type: static

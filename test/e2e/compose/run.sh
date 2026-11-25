@@ -317,6 +317,162 @@ SQL
 	expect_output "$E2E_WORK/j_after.log" 'still=analytics' "the engine keeps serving" || return 1
 }
 
+# list_connections SESSION TAG FILE lists the connections of the engine of
+# SESSION, an attached client, into FILE (sorted): the query the gateway uses
+# after a restart, which the macro of a hardened engine lets through.
+list_connections() {
+	session_send "$1" "SELECT 'conn=' || connection_id AS result FROM remote.query('SELECT connection_id FROM quack_active_connections()');
+SELECT 'listed=$2' AS result;" || return 1
+	session_wait "$1" "listed=$2" 60 || return 1
+	session_output "$1" | sed -n 's/^conn=//p' | sort >"$3"
+}
+
+# new_connection BEFORE AFTER prints the one connection in AFTER that is not
+# in BEFORE (listings of list_connections).
+new_connection() {
+	local new
+	new=$(comm -13 "$1" "$2")
+	if [ "$(nlines "$new")" != 1 ]; then
+		bad "expected exactly one new connection, got: ${new:-none}"
+		return 1
+	fi
+	printf '%s\n' "$new"
+}
+
+# orphan_setup NAME OPTIONS attaches two clients of alice with OPTIONS: one
+# that lives (NAME_live, with a temporary table on its engine connection) and
+# one that will die (NAME_dead, in the container $E2E_PROJECT-k-NAME). It
+# sets LIVE_NAME and DEAD_NAME to their engine connections.
+orphan_setup() {
+	local name=$1 opts=$2 list=k_${1}_list before=$E2E_WORK/k_${1}_0.ids live=$E2E_WORK/k_${1}_1.ids dead=$E2E_WORK/k_${1}_2.ids id
+	session_start "$list" "${CLIENT[@]}" || return 1
+	session_send "$list" "$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?$opts" gateway)" || return 1
+	list_connections "$list" "${name}0" "$before" || return 1
+
+	session_start "k_${name}_live" "${CLIENT[@]}" || return 1
+	session_send "k_${name}_live" "$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?$opts" gateway)
+FROM remote.query('CREATE TEMP TABLE e2e_orphan_scratch AS SELECT 21 AS half');
+SELECT 'live=' || engine AS result FROM remote.whoami;" || return 1
+	session_wait "k_${name}_live" "live=$name" 120 || return 1
+	list_connections "$list" "${name}1" "$live" || return 1
+	id=$(new_connection "$before" "$live") || return 1
+	eval "LIVE_$name=\$id"
+
+	session_start "k_${name}_dead" "${COMPOSE[@]}" run --rm -T --no-deps --name "$E2E_PROJECT-k-$name" client || return 1
+	session_send "k_${name}_dead" "$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?$opts" gateway)
+SELECT 'dead=' || engine AS result FROM remote.whoami;" || return 1
+	session_wait "k_${name}_dead" "dead=$name" 120 || return 1
+	list_connections "$list" "${name}2" "$dead" || return 1
+	id=$(new_connection "$live" "$dead") || return 1
+	eval "DEAD_$name=\$id"
+
+	session_send "$list" "DETACH remote;" || return 1
+	session_end "$list" || return 1
+	ok "$name: a living and a doomed client of alice are attached ($opts)"
+}
+
+# orphan_id LIVE|DEAD NAME prints a connection that orphan_setup NAME found.
+orphan_id() { eval "printf '%s' \"\${${1}_$2:-}\""; }
+
+# orphans_closed N succeeds once the gateway has closed N orphaned
+# connections since it started.
+orphans_closed() { [ "$(metric_sum "$GATEWAY_ADMIN" quackmux_orphaned_connections_closed_total)" -ge "$1" ]; }
+
+# temp_table_alive NAME checks that the living client of orphan_setup NAME
+# still reaches its temporary table, that is its engine connection.
+temp_table_alive() {
+	session_send "k_${1}_live" "SELECT 'temp=' || CAST(half * 2 AS VARCHAR) AS result FROM remote.query('SELECT half FROM e2e_orphan_scratch');
+SELECT 'checked=$2' AS result;" || return 1
+	session_wait "k_${1}_live" "checked=$2" 60 || return 1
+	case $(session_output "k_${1}_live") in
+	*temp=42*) ok "$1: the living client still has its connection and its temporary table ($2)" ;;
+	*)
+		bad "$1: the living client lost its temporary table ($2):"
+		session_output "k_${1}_live" | indent
+		return 1
+		;;
+	esac
+}
+
+# orphan_opts NAME prints the token options of the clients of orphan_setup
+# NAME (shared: engine-shared, analytics: the hardened engine-analytics).
+orphan_opts() {
+	case $1 in
+	shared) echo "share_level=server" ;;
+	analytics) echo "share_level=group&group=analytics" ;;
+	esac
+}
+
+# (k) Orphaned engine connections: on engine-shared and on the hardened
+# engine-analytics, a client dies while the gateway is stopped. After the
+# restart and the orphan grace (30s with gateway.yaml) the gateway has closed
+# its connection on the engine; a client that lived through the restart
+# keeps its connection, its temporary table and its queries.
+scenario_orphans() {
+	local name list=$E2E_WORK/k_final.ids live dead
+	for name in shared analytics; do
+		orphan_setup "$name" "$(orphan_opts "$name")" || return 1
+	done
+
+	"${COMPOSE[@]}" stop gateway >/dev/null 2>&1 || {
+		bad "docker compose stop gateway failed"
+		return 1
+	}
+	for name in shared analytics; do
+		docker kill "$E2E_PROJECT-k-$name" >/dev/null 2>&1 || {
+			bad "cannot kill the client container $E2E_PROJECT-k-$name"
+			return 1
+		}
+		session_end "k_${name}_dead" 30 || true # killed
+	done
+	ok "the gateway is stopped, and the doomed clients were killed without DETACH"
+	"${COMPOSE[@]}" start gateway >/dev/null 2>&1 || {
+		bad "docker compose start gateway failed"
+		return 1
+	}
+	wait_for 90 "gateway /readyz after the restart" curl -fsS "$GATEWAY_ADMIN/readyz" || return 1
+	wait_for 60 "the living clients to be adopted" session_count_is "$GATEWAY_ADMIN" alice 2 || {
+		expect_sessions "$GATEWAY_ADMIN" alice 2 "the living clients are adopted"
+		return 1
+	}
+	ok "the gateway is back; the living clients are adopted"
+	for name in shared analytics; do
+		temp_table_alive "$name" "after the restart" || return 1
+	done
+
+	wait_for 120 "the gateway to close both orphaned connections" orphans_closed 2 || return 1
+	expect_ge "$(metric_sum "$GATEWAY_ADMIN" quackmux_orphan_sweeps_total 'result="ok"')" 2 \
+		"quackmux_orphan_sweeps_total{result=\"ok\"} counted both engines" || return 1
+	for name in shared analytics; do
+		live=$(orphan_id LIVE "$name")
+		dead=$(orphan_id DEAD "$name")
+		session_start "k_${name}_check" "${CLIENT[@]}" || return 1
+		session_send "k_${name}_check" "$(client_preamble)
+$(attach_sql "${E2E_ALICE_TOKEN}?$(orphan_opts "$name")" gateway)" || return 1
+		list_connections "k_${name}_check" "${name}3" "$list" || return 1
+		session_send "k_${name}_check" "DETACH remote;" || return 1
+		session_end "k_${name}_check" || return 1
+		if grep -qx "$dead" "$list"; then
+			bad "$name: the engine still lists the connection of the dead client"
+			indent "$list"
+			return 1
+		fi
+		ok "$name: the engine no longer lists the connection of the dead client"
+		if ! grep -qx "$live" "$list"; then
+			bad "$name: the engine no longer lists the connection of the living client"
+			indent "$list"
+			return 1
+		fi
+		ok "$name: the connection of the living client is still there"
+		temp_table_alive "$name" "after the orphan grace" || return 1
+		session_send "k_${name}_live" "DETACH remote;" || return 1
+		session_end "k_${name}_live" || return 1
+	done
+}
+
 # (h) Nothing above may have crashed a request handler.
 scenario_no_panics() {
 	local log=$E2E_WORK/h_gateways.log
@@ -351,6 +507,7 @@ run_scenario e "the admin API lists an open attachment" scenario_admin_sessions
 run_scenario f "the idle timeout closes a quiet session" scenario_idle_timeout
 run_scenario g "CREATE TABLE AS uploads rows with SEND_DATA" scenario_send_data
 run_scenario j "a hardened engine serves, but not quack_stop, the token or files" scenario_hardened_engine
+run_scenario k "a restart closes the connections of clients that died meanwhile" scenario_orphans
 run_scenario h "no panics in the gateway logs" scenario_no_panics
 
 summary "compose e2e" || exit 1

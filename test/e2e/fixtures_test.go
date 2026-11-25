@@ -302,12 +302,23 @@ func TestGatewayConfigs(t *testing.T) {
 		t.Errorf("%s: session.idleTimeout %s is short enough to break scenarios", gatewayConfig, d)
 	}
 
-	// Apart from the timing, the two files must agree.
+	// Scenario k restarts gateway and waits for the orphan grace; gateway-idle
+	// shares the engines and must not close connections of gateway.
+	if !gw.CloseOrphanedConnectionsEnabled() || idle.CloseOrphanedConnectionsEnabled() {
+		t.Errorf("engine.closeOrphanedConnections must be on in %s only", gatewayConfig)
+	}
+	if d := gw.OrphanGrace(); d > time.Minute {
+		t.Errorf("%s: the orphan grace %s is too long for scenario k", gatewayConfig, d)
+	}
+
+	// Apart from the timing and the orphan sweep, the two files must agree.
 	adjusted := *idle
 	adjusted.Session = gw.Session
 	adjusted.Engine.CheckInterval = gw.Engine.CheckInterval
+	adjusted.Engine.CloseOrphanedConnections = gw.Engine.CloseOrphanedConnections
+	adjusted.Engine.RecoveryGrace = gw.Engine.RecoveryGrace
 	if !reflect.DeepEqual(&adjusted, gw) {
-		t.Errorf("%s and %s differ in more than the session and engine timing", gatewayConfig, idleConfig)
+		t.Errorf("%s and %s differ in more than the session and engine timing and the orphan sweep", gatewayConfig, idleConfig)
 	}
 }
 
