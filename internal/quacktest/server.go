@@ -83,6 +83,9 @@ type Server struct {
 	// as the Quack server does. It is off by default, so that tests can run
 	// queries side by side on one connection. Set it before the first query.
 	Supersede bool
+	// PrepareDelay delays every PREPARE_REQUEST before it becomes the
+	// connection's statement, like a slow quack_authorization_function.
+	PrepareDelay time.Duration
 
 	mu       sync.Mutex
 	conns    map[string]*conn
@@ -262,6 +265,10 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 			return errorResponse("Failed to deserialize: %v", err), 0
 		}
 		rec.SQL, rec.QueryUUID = p.SQL, p.QueryUUID
+		s.mu.Lock()
+		delay := s.PrepareDelay
+		s.mu.Unlock()
+		time.Sleep(delay)
 		return s.runQuery(c, p)
 	}
 	return errorResponse("Unimplemented message type %s", h.Type), 0
