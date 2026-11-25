@@ -68,6 +68,9 @@ type Gateway struct {
 	// limits follows queries for the query time limit (querylimit.go); nil
 	// if no limit is configured.
 	limits *queryLimits
+	// fence, if set, must report true for the query time limit to cancel
+	// queries on engines (see Options.Fence).
+	fence func() bool
 
 	inFlight atomic.Int64
 
@@ -92,6 +95,11 @@ type Options struct {
 	// is ready, and the Service selects the leader by its label. A replica
 	// that does not lead gives the reason ReasonNotLeader.
 	Ready func() (bool, string)
+	// Fence, if set, reports whether this process may act on engines on its
+	// own (with leader election: it holds a fresh lease). The query time
+	// limit cancels queries only while it reports true: a leader that
+	// resumes after a freeze must not cancel what the new leader serves.
+	Fence func() bool
 }
 
 // New creates the gateway handler.
@@ -102,7 +110,7 @@ func New(o Options) *Gateway {
 	}
 	g := &Gateway{
 		cfg: o.Config, auth: o.Auth, engines: o.Engines, sessions: o.Sessions, up: o.Upstream,
-		log: o.Log.With("component", "proxy"), met: o.Metrics, now: time.Now, ready: o.Ready,
+		log: o.Log.With("component", "proxy"), met: o.Metrics, now: time.Now, ready: o.Ready, fence: o.Fence,
 		buffers: semaphore.NewWeighted(budget),
 	}
 	g.abortCtx, g.abort = context.WithCancel(context.Background())

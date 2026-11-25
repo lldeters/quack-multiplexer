@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,6 +279,25 @@ func TestFetchBeforeThePrepareAnswerKeepsTheClock(t *testing.T) {
 		t.Fatalf("FETCH: %+v, %v (the fake engine answers terminal for a statement without a stream)", f, err)
 	}
 	mustTimeout(t, wait(t, "the PREPARE", first), "300ms", "limits.queryTimeout")
+}
+
+// A replica without a fresh lease does not cancel queries: another replica
+// may serve the session by now. It looks again until it is fresh.
+func TestQueryLimitWaitsForAFreshLease(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+	var fresh atomic.Bool
+	proxy.SetFence(h.gw, fresh.Load)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	answer := make(chan []byte, 1)
+	go func() { answer <- h.prepare(c, "SLEEP 10000", uuidA) }()
+	time.Sleep(900 * time.Millisecond)
+	if got := cancels(srv); len(got) != 0 {
+		t.Fatalf("engine got CANCEL for %v without a fresh lease", got)
+	}
+	fresh.Store(true)
+	mustTimeout(t, wait(t, "the PREPARE", answer), "300ms", "limits.queryTimeout")
+	waitCancels(t, srv, uuidA)
 }
 
 // A streamed PREPARE whose client goes away before its uuid passed never

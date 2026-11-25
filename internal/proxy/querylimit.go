@@ -89,9 +89,17 @@ const (
 // has run so many PREPAREs of the session since that it replaced it.
 const maxSessionQueries = 64
 
+// fenceRetry is how soon the gateway looks again at a limit that passed
+// while it did not hold a fresh lease (see Options.Fence).
+const fenceRetry = time.Second
+
 // errShuttingDown reports a PREPARE that waited for a CANCEL when the gateway
 // began to shut down.
 var errShuttingDown = errors.New("the gateway is shutting down")
+
+// errNotFresh reports a CANCEL the gateway did not send because it does not
+// hold a fresh lease: another replica may serve the session by now.
+var errNotFresh = errors.New("this gateway does not hold a fresh lease")
 
 // queryLimits follows the queries of the sessions that have a time limit.
 type queryLimits struct {
@@ -197,6 +205,11 @@ func newQueryLimits(g *Gateway) *queryLimits {
 // setting it comes from.
 func (l *queryLimits) limitFor(s *session.Session) (time.Duration, string) {
 	return policy.QueryTimeout(l.g.cfg, s.User, s.Groups, s.EngineKey.Profile)
+}
+
+// fresh reports whether the gateway may act on engines (see Options.Fence).
+func (l *queryLimits) fresh() bool {
+	return l.g.fence == nil || l.g.fence()
 }
 
 // sessionLocked returns the state of s; with create it makes one for an open
@@ -635,6 +648,13 @@ func (l *queryLimits) expire(q *trackedQuery) {
 		l.mu.Unlock()
 		return
 	}
+	if !l.fresh() {
+		// Another replica may serve the session by now: leave its engine
+		// alone, and look again later.
+		q.timer.Reset(fenceRetry)
+		l.mu.Unlock()
+		return
+	}
 	if len(q.waiting) == 0 && !q.unanswered {
 		// The engine does not work for the query, which may well be
 		// complete. The limit is enforced when the client comes back for it
@@ -757,6 +777,8 @@ func (l *queryLimits) cancelOnEngine(q *trackedQuery) (string, error) {
 			return "", nil // it ended on its own as its limit passed, and no client saw the timeout
 		case ended:
 			return "cancelled", nil // the engine has ended it
+		case !l.fresh():
+			return "failed", errNotFresh
 		}
 		err := l.sendCancel(q)
 		if err == nil {

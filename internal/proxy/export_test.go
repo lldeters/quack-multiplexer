@@ -13,3 +13,6 @@ func TrackedQueries(g *Gateway) (sessions, queries int) {
 	}
 	return len(g.limits.sessions), queries
 }
+
+// SetFence replaces Options.Fence.
+func SetFence(g *Gateway, fence func() bool) { g.fence = fence }
