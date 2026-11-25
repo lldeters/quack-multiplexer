@@ -239,21 +239,19 @@ live in the release namespace).
 {{- end -}}
 
 {{/*
-quackmux.affinity: the affinity of the values, else with ha.enabled a
-preferred podAntiAffinity (as overlays/ha).
+quackmux.affinity: the affinity of the values; with ha.enabled it has a
+preferred podAntiAffinity (as overlays/ha) unless the values set
+affinity.podAntiAffinity, so that a nodeAffinity alone keeps the replicas
+spread over nodes.
 */}}
 {{- define "quackmux.affinity" -}}
-{{- if .Values.affinity -}}
-{{- toYaml .Values.affinity -}}
-{{- else if .Values.ha.enabled -}}
-podAntiAffinity:
-  preferredDuringSchedulingIgnoredDuringExecution:
-    - weight: 100
-      podAffinityTerm:
-        topologyKey: kubernetes.io/hostname
-        labelSelector:
-          matchLabels:
-            {{- include "quackmux.selectorLabels" . | nindent 12 }}
+{{- $affinity := deepCopy (default dict .Values.affinity) -}}
+{{- if and .Values.ha.enabled (not (hasKey $affinity "podAntiAffinity")) -}}
+{{- $term := dict "topologyKey" "kubernetes.io/hostname" "labelSelector" (dict "matchLabels" (fromYaml (include "quackmux.selectorLabels" .))) -}}
+{{- $_ := set $affinity "podAntiAffinity" (dict "preferredDuringSchedulingIgnoredDuringExecution" (list (dict "weight" 100 "podAffinityTerm" $term))) -}}
+{{- end -}}
+{{- with $affinity -}}
+{{- toYaml . -}}
 {{- end -}}
 {{- end -}}
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -363,8 +364,10 @@ func TestChartOptions(t *testing.T) {
 	if want := []string{"POD_NAME", "POD_NAMESPACE", "GOMEMLIMIT", "QUACKMUX_EXTRA"}; !reflect.DeepEqual(env, want) {
 		t.Errorf("env %v, want %v", env, want)
 	}
-	if got := mapAt(pod, "affinity"); got["nodeAffinity"] == nil || got["podAntiAffinity"] != nil {
-		t.Errorf("affinity %v: the values replace the default anti-affinity", got)
+	// A nodeAffinity keeps the anti-affinity of ha.enabled: a node failure
+	// must leave a follower.
+	if got := mapAt(pod, "affinity"); got["nodeAffinity"] == nil || got["podAntiAffinity"] == nil {
+		t.Errorf("affinity %v: want the nodeAffinity of the values and the default podAntiAffinity", got)
 	}
 	if got := get(dep, "spec", "replicas"); got != float64(3) {
 		t.Errorf("replicas %v, want 3", got)
@@ -378,6 +381,28 @@ func TestChartOptions(t *testing.T) {
 	if sa := mustFind(t, objs, "ServiceAccount", "quackmux-gateway"); mapAt(sa, "metadata", "annotations")["iam.example.com/role"] != "quackmux" {
 		t.Errorf("ServiceAccount annotations %v", mapAt(sa, "metadata", "annotations"))
 	}
+
+	t.Run("podAntiAffinity of the values", func(t *testing.T) {
+		values := filepath.Join(t.TempDir(), "values.yaml")
+		own := "affinity:\n  podAntiAffinity:\n    requiredDuringSchedulingIgnoredDuringExecution:\n" +
+			"      - topologyKey: topology.kubernetes.io/zone\n        labelSelector: {matchLabels: {app.kubernetes.io/component: gateway}}\n"
+		for _, tc := range []struct {
+			name, values string
+			want         []string // the keys of the rendered podAntiAffinity
+		}{
+			{"replaces the default", own, []string{"requiredDuringSchedulingIgnoredDuringExecution"}},
+			{"empty turns it off", "affinity: {podAntiAffinity: {}}\n", []string{}},
+		} {
+			if err := os.WriteFile(values, []byte(tc.values), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			dep := mustFind(t, render(t, "quackmux", "--set", "ha.enabled=true", "-f", values), "Deployment", "quackmux")
+			anti := mapAt(dep, "spec", "template", "spec", "affinity", "podAntiAffinity")
+			if got := sortedKeys(anti); anti == nil || !slices.Equal(got, tc.want) {
+				t.Errorf("%s: podAntiAffinity %v, want the keys %v", tc.name, anti, tc.want)
+			}
+		}
+	})
 
 	t.Run("NodePort", func(t *testing.T) {
 		ext := mustFind(t, render(t, "quackmux", "--set", "externalService.enabled=true", "--set", "externalService.type=NodePort"),

@@ -87,7 +87,7 @@ zurück.
 | `terminationGracePeriodSeconds` | 45 | `server.shutdownTimeout` (30 s) plus Reserve; beide zusammen ändern |
 | `podAnnotations`, `podLabels` | `prometheus.io/*`, keine | am Pod-Template |
 | `extraEnv`, `extraVolumes`, `extraVolumeMounts` | keine | etwa ein TLS-Zertifikat für `server.tls` (Beispiel in `values.yaml`) |
-| `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | keine; mit `ha.enabled` eine bevorzugte `podAntiAffinity` | Scheduling des Gateways (nicht der Engines: die stehen im Profil) |
+| `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | keine; mit `ha.enabled` eine bevorzugte `podAntiAffinity` | Scheduling des Gateways (nicht der Engines: die stehen im Profil). Die `podAntiAffinity` von `ha.enabled` bleibt neben anderen Regeln wie einer `nodeAffinity`; `affinity.podAntiAffinity` ersetzt sie, `{}` schaltet sie ab |
 | `serviceAccount.create`, `.name`, `.annotations`, `rbac.create` | an, `<name>-gateway` | ServiceAccount, Role und RoleBinding im Namespace des Releases |
 | `service.type`, `service.annotations` | `ClusterIP` | Service mit Quack-Port 9494 und Admin-Port 9495 |
 | `externalService.*` | aus | zweiter Service nur mit dem Quack-Port, Typ `LoadBalancer` (oder `NodePort`, dann ohne `loadBalancerSourceRanges` und `loadBalancerClass`), `externalTrafficPolicy: Local` |

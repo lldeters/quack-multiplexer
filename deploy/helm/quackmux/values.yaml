@@ -173,7 +173,9 @@ extraVolumeMounts: []
 nodeSelector: {}
 tolerations: []
 # Default: none; with ha.enabled a preferred podAntiAffinity that spreads the
-# replicas over nodes, so that a node failure leaves a follower.
+# replicas over nodes, so that a node failure leaves a follower. It stays
+# next to other affinity rules (nodeAffinity); affinity.podAntiAffinity
+# replaces it, {} turns it off.
 affinity: {}
 topologySpreadConstraints: []
 priorityClassName: ""
