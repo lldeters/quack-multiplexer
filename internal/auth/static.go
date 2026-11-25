@@ -103,6 +103,8 @@ type staticState struct {
 	// tokens maps the lower-case hex sha256 of a token to the token.
 	tokens map[string]*staticToken
 	users  int
+	// byName maps a user name to the user (see GroupsOf).
+	byName map[string]*staticUser
 	// digest of the file content, to skip reloads that change nothing.
 	digest [sha256.Size]byte
 }
@@ -124,7 +126,7 @@ func parseUsersFile(data []byte, now time.Time) (*staticState, []logEntry, error
 	if f.Users == nil {
 		return nil, nil, errors.New(`users file has no "users" list (write "users: []" to reject everybody)`)
 	}
-	st := &staticState{tokens: map[string]*staticToken{}}
+	st := &staticState{tokens: map[string]*staticToken{}, byName: map[string]*staticUser{}}
 	var (
 		errs     []error
 		warnings []logEntry
@@ -150,6 +152,7 @@ func parseUsersFile(data []byte, now time.Time) (*staticState, []logEntry, error
 		}
 		user := &staticUser{name: u.Name, groups: dedupe(u.Groups), disabled: u.Disabled}
 		st.users++
+		st.byName[u.Name] = user
 		for ti, t := range u.Tokens {
 			twhere := fmt.Sprintf("%s tokens[%d]", where, ti)
 			hash, plain, err := tokenHash(t)
