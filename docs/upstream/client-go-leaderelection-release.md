@@ -58,7 +58,10 @@ CPU starvation, or a network partition that heals while the release is still bei
 What follows depends on the other candidates. Any candidate, including a restarted A, can acquire the empty lease
 at once; B acts as leader until its next renewal finds the lease taken and gives up after `RenewDeadline`. For
 that time two processes act as leader, and then B's leadership ends: a second, unnecessary failover. With only two
-candidates B acquires the empty lease again at its next renewal, with `LeaderTransitions` incremented.
+candidates B acquires the empty lease again at its next renewal, with `LeaderTransitions` incremented. Both follow
+the reproduction below when it runs on: with two candidates the next write is B's new acquisition
+(`leaseTransitions` 1 to 2); a third candidate started after A's release acquires the empty lease at once while B
+still leads, and B steps down after its next renewals fail.
 
 We hit this in an HA test of our gateway (two replicas on kind, Kubernetes v1.37, client-go v0.37.2): the leader
 was stopped with SIGSTOP until the follower had taken over, then continued with SIGCONT. It emptied the new
