@@ -58,7 +58,7 @@ Welche Kombinationen ein Benutzer wählen darf, regeln Profile (`allowedShareLev
 | `session.idleTimeout` | 6 h | Session ohne Query wird geschlossen. Heartbeats zählen nicht. |
 | Heartbeat-Lease | Client-Lease + 15 s | Stumme Clients werden erkannt, das Gateway schickt `DISCONNECT` an die Engine. Der Quack-Server selbst räumt solche Verbindungen nie auf. |
 | `session.maxLifetime` | aus | Harte Obergrenze pro Session. |
-| `limits.queryTimeout` | aus | Längste Laufzeit einer Query, das Abholen des Ergebnisses eingeschlossen. Danach bricht das Gateway sie auf der Engine ab, der Client bekommt einen Fehler, die Session bleibt. Profile und `overrides` ersetzen den Wert ([Design, 5.3](docs/design.md#53-query-zeitlimit)). |
+| `limits.queryTimeout` | aus | Längste Laufzeit einer Query, das Abholen des Ergebnisses eingeschlossen (`COMMIT` und `ROLLBACK` ausgenommen). Danach bricht das Gateway sie auf der Engine ab, der Client bekommt einen Fehler, die Session bleibt. Profile und `overrides` ersetzen den Wert ([Design, 5.3](docs/design.md#53-query-zeitlimit)). |
 | `engine.idleTimeout` | CONNECTION 0, sonst 30 min | Engine ohne Sessions wird beendet. |
 | `engine.startupTimeout` | 180 s | Start-Budget für einen Pod. |
 | `engine.maxLifetime` / `drainTimeout` | aus / 1 h | Alte Engines werden gedrained: keine neuen Sessions, alte laufen aus. |

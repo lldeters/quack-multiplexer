@@ -187,8 +187,10 @@ overrides: []
 #     # Replaces limits.maxSessionsPerUser for matching users (0 = keep it).
 #     maxSessions: 20
 #     # Replaces the query time limit of the profile and limits.queryTimeout
-#     # for matching users (0s = no limit). Sessions that the gateway adopts
-#     # after a restart have no groups: only "users" entries apply to them.
+#     # for matching users (0s = no limit). For sessions that the gateway
+#     # adopts after a restart it takes the groups from the users file (static)
+#     # or auth.none.defaultGroups; with jwt it does not know them, and only
+#     # "users" entries apply to those sessions.
 #     queryTimeout: 6h
 
 # -----------------------------------------------------------------------------
@@ -270,6 +272,7 @@ limits:
   # included. Then the gateway cancels it on the engine, the client gets an
   # error, and the session stays usable. 0s disables (default). Choose it
   # generously: it also counts for big results that a slow client fetches.
+  # COMMIT and ROLLBACK have none (DuckDB does not interrupt a commit).
   # profiles.<name>.queryTimeout and overrides[].queryTimeout replace it.
   queryTimeout: 0s
 
