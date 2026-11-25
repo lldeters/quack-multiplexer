@@ -36,6 +36,8 @@ type Backend interface {
 	Disconnect(ctx context.Context, endpoint, backendConnID string) error
 	CancelAll(ctx context.Context, endpoint, backendConnID string) error
 	Heartbeat(ctx context.Context, endpoint, backendConnID string) error
+	// Connections lists the connections an engine holds (see orphans.go).
+	Connections(ctx context.Context, endpoint, token string) ([]string, error)
 }
 
 // State of a session.
@@ -150,6 +152,12 @@ type Manager struct {
 	// adoptions confirms each adopted session with the engine once, also
 	// when many requests of it arrive at the same time.
 	adoptions singleflight.Group
+	// seen records the connections that clients asked for while an orphan
+	// sweep is pending, orphans the connections it closed (orphans.go).
+	// Guarded by mu.
+	seen    map[backendRef]bool
+	sweeps  int
+	orphans map[backendRef]time.Time
 }
 
 // NewManager creates a session manager.
@@ -318,6 +326,11 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	engineID, known := m.engines.IDByUID(route.EngineUID)
 	if !known {
 		return nil, &Closed{Reason: "engine no longer exists", MustInvalidate: true, ClosedAt: m.now()}, nil
+	}
+	// A pending orphan sweep leaves the connection alone from here on, or
+	// the sweep closed it already.
+	if c := m.noteAdoption(engineID, route); c != nil {
+		return nil, c, nil
 	}
 	target, ok := m.engines.Lookup(engineID)
 	if !ok {
@@ -649,6 +662,7 @@ func (m *Manager) Reap() {
 			delete(m.tombstones, id)
 		}
 	}
+	m.expireOrphansLocked(now, ttl)
 	m.mu.Unlock()
 }
 

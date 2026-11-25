@@ -398,6 +398,9 @@ func cmdServe(args []string) error {
 			return err
 		}
 		go sessions.Run(ctx)
+		// Before the first request is served: the sweep notes from now on
+		// which connections of the recovered engines clients ask for.
+		sessions.SweepOrphans(ctx, engines.RecoveredTargets())
 		started.Store(true)
 		if labeler != nil {
 			labeler.Kick() // label the pod now: from then on the Service routes to it

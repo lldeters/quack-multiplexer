@@ -34,6 +34,11 @@ type Metrics struct {
 	LeaderLabel        prometheus.Gauge
 	LeaderLabelUpdates *prometheus.CounterVec
 	leaderLabelOnce    sync.Once
+
+	// OrphanSweeps and OrphansClosed follow the closing of the connections
+	// that no session adopted after a restart (package session, orphans.go).
+	OrphanSweeps  *prometheus.CounterVec
+	OrphansClosed prometheus.Counter
 }
 
 // New creates all collectors and registers them on a fresh registry (those
@@ -93,7 +98,16 @@ func New() *Metrics {
 		LeaderLabelUpdates: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "quackmux_leader_label_updates_total", Help: "Patches of the label quackmux.io/leader, by action (set, remove, remove_stale) and result.",
 		}, []string{"action", "result"}),
+		OrphanSweeps: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "quackmux_orphan_sweeps_total",
+			Help: "Recovered engines checked for connections that no session adopted, by result (ok; failed: a listing or a close failed; skipped: the engine was gone or the leader lease not fresh).",
+		}, []string{"result"}),
+		OrphansClosed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "quackmux_orphaned_connections_closed_total",
+			Help: "Connections on recovered engines that no session adopted within the recovery grace and that the gateway closed.",
+		}),
 	}
+	r.MustRegister(m.OrphanSweeps, m.OrphansClosed)
 	r.MustRegister(m.SessionsOpen, m.SessionsOpened, m.SessionsClosed, m.ConnectFailures, m.AuthFailures,
 		m.Engines, m.EngineStarts, m.EngineStartTime, m.EngineTerminated, m.Requests, m.RequestSeconds,
 		m.Bytes, m.InFlight, m.IsLeader)
