@@ -70,9 +70,14 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 chmod 644 "$E2E_TLS_DIR/tls.key" "$E2E_TLS_DIR/tls.crt"
 
 cleanup() {
-	local rc=$?
+	local rc=$? c
 	trap - EXIT
 	session_kill_all
+	# The clients of scenario l in the network namespace of gateway-tls are
+	# not part of the Compose project.
+	for c in $(docker ps -aq --filter "name=^$E2E_PROJECT-l-" 2>/dev/null); do
+		docker rm -f "$c" >/dev/null 2>&1 || true
+	done
 	if [ "$rc" -ne 0 ]; then
 		step "container logs (last 150 lines each)"
 		"${COMPOSE[@]}" logs --no-color --tail=150 >&2 || true
