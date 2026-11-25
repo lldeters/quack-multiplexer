@@ -358,10 +358,14 @@ func TestEndsTransaction(t *testing.T) {
 
 // FETCHes that no query claims change hands while their handlers look at
 // them: a PREPARE of their uuid takes them, and they move on when its query
-// ends. All of it happens under the lock (run with -race).
+// ends. All of it happens under the lock (run with -race). At most
+// prepareSlots PREPAREs are open at once, well below maxSessionQueries:
+// more would be refused, rightly, with errTooManyQueries.
 func TestStraysChangeHandsSafely(t *testing.T) {
+	const prepareSlots = maxSessionQueries / 2
 	l, s := newTestLimits(t, false)
 	l.testPrepare(t, s, wire.Hugeint{Upper: 99}) // unanswered, so nothing replaces it: the state stays
+	slots := make(chan struct{}, prepareSlots)
 	var wg sync.WaitGroup
 	for i := 0; i < 200; i++ {
 		u := wire.Hugeint{Upper: 5, Lower: uint64(i % 3)}
@@ -378,6 +382,8 @@ func TestStraysChangeHandsSafely(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
 			p, err := l.beginPrepare(context.Background(), s, wire.OptionalIdx{}, u, true, false, func() {}, nil)
 			if err != nil || p == nil {
 				t.Errorf("PREPARE %d: %v, %v", i, p, err)
