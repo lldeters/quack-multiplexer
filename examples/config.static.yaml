@@ -55,6 +55,13 @@ overrides:
     defaults:
       shareLevel: GROUP
 
+# After a restart the gateway can close the connections of clients that died
+# while it was down (the Quack server never collects them). With static
+# engines this is off: switch it on only if no other gateway or client uses
+# these engines, or it would close their connections.
+# engine:
+#   closeOrphanedConnections: true
+
 provider:
   type: static
   static:

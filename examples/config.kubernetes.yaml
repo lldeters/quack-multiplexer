@@ -238,6 +238,13 @@ engine:
   # next heartbeat. Default: session.maxHeartbeatTimeout / 2 + 30s; must be
   # at least 0.4 * session.maxHeartbeatTimeout.
   recoveryGrace: 180s
+  # After a restart or a leader takeover, close the connections on the
+  # recovered USER, GROUP and SERVER engines that no client asked for within
+  # recoveryGrace (but at least 0.4 * session.maxHeartbeatTimeout +
+  # session.heartbeatGrace): clients that died while no gateway ran, which
+  # the Quack server never collects. Default true, false for the static
+  # provider (its engines may serve other gateways or clients too).
+  closeOrphanedConnections: true
   # Period of the engine reconciler (timeouts, warm pools).
   checkInterval: 5s
   # Drain engines whose profile changed since their launch and start new

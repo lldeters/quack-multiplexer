@@ -320,8 +320,11 @@ Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
   Default-Capabilities eines Containers gilt der Modus nicht; der Entrypoint warnt dann beim Start. Der
   Selbsttest prüft beides mit einem Quack-Client.
 * Für geteilte Engines bringt das Image ein Makro für `quack_authorization_function` mit, das `quack_stop`,
-  `quack_serve`, `getenv` und andere gefährliche Aufrufe der Clients ablehnt. Es wirkt nur zusammen mit dem
-  Post-Start-SQL oben:
+  `quack_serve`, `getenv` und andere gefährliche Aufrufe der Clients ablehnt. Durch lässt es von den
+  `quack_*`-Funktionen nur genau `SELECT connection_id FROM quack_active_connections()`: Damit listet das Gateway
+  nach einem Neustart die Verbindungen der Engine und schließt die verwaisten. Ältere Images lehnen auch diese
+  Anfrage ab; das Gateway räumt dann nicht auf und warnt. Das Makro wirkt nur zusammen mit dem Post-Start-SQL
+  oben:
 
   ```sh
   -e QUACKMUX_INIT_SQL=".read /usr/local/share/quackmux/authorize.sql"
