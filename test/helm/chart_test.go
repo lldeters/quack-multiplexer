@@ -89,10 +89,23 @@ func TestChartMatchesKustomize(t *testing.T) {
 	}
 }
 
-// configText returns config.yaml of the chart's ConfigMap.
+// mountedConfigMap returns the name of the ConfigMap that the gateway mounts
+// (volume "config").
+func mountedConfigMap(t *testing.T, objs []object) string {
+	t.Helper()
+	for _, v := range listAt(mustFind(t, objs, "Deployment", "quackmux"), "spec", "template", "spec", "volumes") {
+		if str(v, "name") == "config" {
+			return str(v, "configMap", "name")
+		}
+	}
+	t.Fatal("the gateway has no volume config")
+	return ""
+}
+
+// configText returns config.yaml of the ConfigMap that the gateway mounts.
 func configText(t *testing.T, objs []object) string {
 	t.Helper()
-	text, ok := get(mustFind(t, objs, "ConfigMap", "quackmux-config"), "data", "config.yaml").(string)
+	text, ok := get(mustFind(t, objs, "ConfigMap", mountedConfigMap(t, objs)), "data", "config.yaml").(string)
 	if !ok {
 		t.Fatal("the ConfigMap has no config.yaml")
 	}

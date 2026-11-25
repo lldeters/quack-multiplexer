@@ -1,7 +1,7 @@
 {{/*
 Names. With the release name "quackmux" they are those of deploy/kubernetes:
 Deployment and Service "quackmux", ServiceAccount, Role and RoleBinding
-"quackmux-gateway", ConfigMap "quackmux-config", and so on.
+"quackmux-gateway", ConfigMap "quackmux-config-<hash>", and so on.
 */}}
 {{- define "quackmux.fullname" -}}
 {{- if .Values.fullnameOverride -}}
@@ -252,6 +252,14 @@ live in the release namespace).
 {{- else -}}
 {{- $text -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+quackmux.configMapName: <fullname>-config-<hash>, the hash the first 10 hex
+digits of the SHA-256 of config.yaml (configmap.yaml).
+*/}}
+{{- define "quackmux.configMapName" -}}
+{{- printf "%s-config-%s" (include "quackmux.fullname" .) (include "quackmux.config" . | sha256sum | trunc 10) -}}
 {{- end -}}
 
 {{/*

@@ -58,7 +58,7 @@ kubectl -n quackmux get secret quackmux-admin-token -o jsonpath='{.data.token}' 
 ```
 
 Mit dem Release-Namen `quackmux` heißen die Objekte wie bei Kustomize: Deployment und Service `quackmux`,
-ServiceAccount, Role und RoleBinding `quackmux-gateway`, ConfigMap `quackmux-config`, Secrets
+ServiceAccount, Role und RoleBinding `quackmux-gateway`, ConfigMap `quackmux-config-<hash>`, Secrets
 `quackmux-session-key`, `quackmux-admin-token`, `quackmux-users`. Ein anderer Release-Name ohne „quackmux“
 ergibt `<release>-quackmux`; `fullnameOverride` setzt den Namen direkt. Verbinden, Admin-API und Metriken wie in
 [deploy/kubernetes/README.md](../../kubernetes/README.md#verbinden), mit dem Service-Namen des Releases.
@@ -134,8 +134,23 @@ helm template quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --ku
   --show-only templates/configmap.yaml
 ```
 
-* Eine geänderte Konfiguration rollt das Gateway aus (Annotation `checksum/config` am Pod-Template). Ohne HA ist
-  das eine kurze Unterbrechung, die Sessions überleben; mit HA übergibt der Rollout an einen neuen Pod.
+* Eine geänderte Konfiguration rollt das Gateway aus: Wie bei Kustomize trägt der Name der ConfigMap einen Hash
+  des Inhalts (`quackmux-config-<hash>`), jede Konfiguration bekommt eine eigene. Ohne HA ist das eine kurze
+  Unterbrechung, die Sessions überleben; mit HA übergibt der Rollout an einen neuen Pod.
+* **Frühere ConfigMaps bleiben** (`helm.sh/resource-policy: keep`), auch nach `helm uninstall`: Startet während
+  eines Rollouts ein Pod des alten ReplicaSets neu (Verlust der Lease, OOM, Eviction), kommt er mit seiner
+  bisherigen Konfiguration zurück, nicht mit der neuen, die sein Gateway vielleicht ablehnt. So bleibt ein
+  Rollout, dessen neue Pods nicht ready werden, stehen, und die alten bedienen weiter (mit HA). Aufräumen, wenn
+  der Rollout fertig ist (`kubectl rollout status`), alle bis auf die aktuelle:
+
+  ```sh
+  CONFIG=$(kubectl -n quackmux get deployment quackmux \
+    -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
+  kubectl -n quackmux delete configmap -l app.kubernetes.io/name=quackmux,app.kubernetes.io/instance=quackmux \
+    --field-selector "metadata.name!=$CONFIG"
+  ```
+
+  `helm rollback` legt die ConfigMap seiner Revision bei Bedarf wieder an.
 * **Die Engines laufen im Namespace des Releases.** In einem anderen Namespace als `quackmux` setzt das Chart
   `provider.kubernetes.namespace` der mitgelieferten Konfiguration auf den Namespace des Releases. Eine eigene
   Konfiguration lässt den Wert weg oder nennt diesen Namespace; ein anderer bricht `helm install` mit einem Fehler
@@ -280,16 +295,16 @@ CI rendert das Chart mit den Default-Werten und mit `ha.enabled` und vergleicht 
 `kubectl kustomize deploy/kubernetes/base` bzw. `overlays/ha` ([test/helm](../../../test/helm)). Gleich sein muss
 alles außer:
 
-1. **Labels:** Die Objekte des Charts tragen zusätzlich die Helm-Labels `helm.sh/chart`,
+1. **Helm-Metadaten:** Die Objekte des Charts tragen zusätzlich die Helm-Labels `helm.sh/chart`,
    `app.kubernetes.io/instance`, `app.kubernetes.io/version` und `app.kubernetes.io/managed-by: Helm` (nicht am
-   Pod-Template: Die Selektoren und Pod-Labels sind dieselben).
-2. **Rollout bei neuer Konfiguration:** Das Pod-Template trägt die Annotation `checksum/config`.
-3. **Namen ohne Hash:** Kustomize hängt an ConfigMap, Session-Key- und Admin-Token-Secret einen Hash des Inhalts;
-   das Chart nicht. Alte ConfigMaps und Secrets sammeln sich deshalb nicht an; zurück geht es mit `helm rollback`
-   statt `kubectl rollout undo`.
-4. **Secret-Inhalte** (verglichen werden nur die Schlüssel): Kustomize liefert öffentliche Platzhalter, das Chart
+   Pod-Template: Die Selektoren und Pod-Labels sind dieselben); was Helm behalten soll, die Annotation
+   `helm.sh/resource-policy: keep`.
+2. **Hash im Namen:** Kustomize hängt an ConfigMap, Session-Key- und Admin-Token-Secret einen Hash des Inhalts,
+   das Chart einen eigenen an die ConfigMap. Die Secrets haben feste Namen (das Chart behält ihre Werte); zurück
+   geht es mit `helm rollback` statt `kubectl rollout undo`.
+3. **Secret-Inhalte** (verglichen werden nur die Schlüssel): Kustomize liefert öffentliche Platzhalter, das Chart
    erzeugt Session-Key und Admin-Token und baut `users.yaml` aus den Werten.
-5. **Kein Namespace-Objekt:** Das Release kommt in einen vorhandenen Namespace (siehe Installation).
+4. **Kein Namespace-Objekt:** Das Release kommt in einen vorhandenen Namespace (siehe Installation).
 
 Dazu kommt Verhalten, das Kustomize nicht hat: Die mitgelieferte Konfiguration folgt dem Namespace des Releases,
 und das Chart bricht ab bei mehreren Replikas ohne `ha.enabled`, bei einer Replika mit `ha.enabled`, bei

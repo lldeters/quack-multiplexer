@@ -10,8 +10,9 @@ at that moment fail. With ha.enabled every healthy replica is ready, and a
 rollout starts a new pod before it removes an old one; the leader gives its
 pod a deletion cost, so a rollout hands over exactly once.
 
-The pod template carries a checksum of the configuration: the gateway reads
-it once at start-up, so a changed configuration rolls out.
+The gateway reads its configuration once at start-up. A changed one has a
+ConfigMap of a new name (configmap.yaml), so it rolls out, and the pods of
+earlier ReplicaSets keep theirs.
 */ -}}
 {{- include "quackmux.checkHASwitch" . -}}
 {{- include "quackmux.checkGracePeriod" . -}}
@@ -44,11 +45,10 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- with .Values.podAnnotations }}
       annotations:
-        checksum/config: {{ include "quackmux.config" . | sha256sum }}
-        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "quackmux.serviceAccountName" . }}
       # The gateway talks to the Kubernetes API (engine pods, token Secrets,
@@ -134,8 +134,8 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            # Read once at start-up; a change rolls out (checksum above), so a
-            # subPath mount (which never updates) is fine.
+            # Read once at start-up; a change rolls out (a new ConfigMap), so
+            # a subPath mount (which never updates) is fine.
             - name: config
               mountPath: /etc/quackmux/config.yaml
               subPath: config.yaml
@@ -162,7 +162,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "quackmux.fullname" . }}-config
+            name: {{ include "quackmux.configMapName" . }}
         - name: users
           secret:
             secretName: {{ include "quackmux.usersSecret" . }}

@@ -163,16 +163,15 @@ func mustFind(t *testing.T, objs []object, kind, name string) object {
 // else must be equal:
 //
 //  1. The chart's objects carry Helm's labels in their metadata (helmLabels),
-//     and the Secrets that Helm keeps the annotation helmAnnotations.
-//  2. Its pod template carries the annotation checksum/config: the chart
-//     rolls the gateway out on a changed configuration this way.
-//  3. Kustomize appends a hash of the content to the names of the ConfigMap
-//     and the Secrets of the session key and the admin token; the chart's
-//     names have none.
-//  4. Secrets: only their keys are compared. Kustomize ships public
+//     and those that Helm keeps the annotation helmAnnotations.
+//  2. Names: Kustomize appends a hash of the content to the names of the
+//     ConfigMap and the Secrets of the session key and the admin token. The
+//     chart appends one of its own to the ConfigMap's name; its Secrets have
+//     fixed names (the chart keeps their values).
+//  3. Secrets: only their keys are compared. Kustomize ships public
 //     placeholders, the chart generates the session key and the admin token
 //     and builds the users file from its values.
-//  5. Kustomize creates the Namespace (with the Pod Security labels); a Helm
+//  4. Kustomize creates the Namespace (with the Pod Security labels); a Helm
 //     release goes into an existing one.
 
 // helmLabels and helmAnnotations are the metadata of difference 1.
@@ -181,24 +180,35 @@ var (
 	helmAnnotations = []string{"helm.sh/resource-policy"}
 )
 
-// checksumAnnotation is the annotation of difference 2.
-const checksumAnnotation = "checksum/config"
+// The names with a hash of difference 2: kustomizeHashSuffix those of
+// Kustomize, chartHashSuffix that of the chart's ConfigMap
+// (quackmux.configMapName).
+var (
+	kustomizeHashSuffix = regexp.MustCompile(`^(.+)-[a-z0-9]{10}$`)
+	chartHashSuffix     = regexp.MustCompile(`^(.+-config)-[0-9a-f]{10}$`)
+)
 
-// kustomizeHashSuffix matches a name with the hash of difference 3.
-var kustomizeHashSuffix = regexp.MustCompile(`^(.+)-[a-z0-9]{10}$`)
-
-// normalizeHelm removes differences 1, 2 and 4 from the chart's objects.
+// normalizeHelm removes differences 1, 2 and 3 from the chart's objects.
 func normalizeHelm(objs []object) []object {
+	renamed := map[string]string{}
+	for _, o := range objs {
+		if str(o, "kind") == "ConfigMap" {
+			name := str(o, "metadata", "name")
+			if m := chartHashSuffix.FindStringSubmatch(name); m != nil {
+				renamed[name] = m[1]
+			}
+		}
+	}
 	for _, o := range objs {
 		deleteKeys(mapAt(o, "metadata"), "labels", helmLabels...)
 		deleteKeys(mapAt(o, "metadata"), "annotations", helmAnnotations...)
-		deleteKeys(mapAt(o, "spec", "template", "metadata"), "annotations", checksumAnnotation)
+		rename(o, renamed)
 		redactSecret(o)
 	}
 	return objs
 }
 
-// normalizeKustomize removes differences 3, 4 and 5 from the objects of
+// normalizeKustomize removes differences 2, 3 and 4 from the objects of
 // kubectl kustomize.
 func normalizeKustomize(objs []object) []object {
 	renamed := map[string]string{}
@@ -448,7 +458,7 @@ spec:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: quackmux-config
+  name: quackmux-config-0123456789
   namespace: quackmux
   labels:
     app.kubernetes.io/name: quackmux
@@ -457,6 +467,8 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
     helm.sh/chart: quackmux-0.1.0
+  annotations:
+    helm.sh/resource-policy: keep
 data:
   config.yaml: |
     a: 1
@@ -483,13 +495,12 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: 0123
         prometheus.io/scrape: "true"
     spec:
       volumes:
         - name: config
           configMap:
-            name: quackmux-config
+            name: quackmux-config-0123456789
         - name: session-key
           secret:
             secretName: quackmux-session-key
@@ -505,9 +516,10 @@ spec:
 	}
 	for _, tc := range []struct{ name, from, to, want string }{
 		{"configuration", "    a: 1\n", "    a: 2\n", "ConfigMap quackmux/quackmux-config differs"},
+		{"configuration reference", "            name: quackmux-config-0123456789\n", "            name: quackmux-config-9876543210\n", "Deployment quackmux/quackmux differs"},
 		{"secret key", "  key: \"R0VORVJBVEVE\"", "  token: \"R0VORVJBVEVE\"", "Secret quackmux/quackmux-session-key differs"},
-		{"label", "    helm.sh/chart: quackmux-0.1.0\n  annotations", "    app.kubernetes.io/part-of: other\n  annotations", "Secret quackmux/quackmux-session-key differs"},
-		{"other annotation", "    helm.sh/resource-policy: keep", "    example.com/policy: keep", "Secret quackmux/quackmux-session-key differs"},
+		{"label", "    helm.sh/chart: quackmux-0.1.0\n  annotations", "    app.kubernetes.io/part-of: other\n  annotations", "ConfigMap quackmux/quackmux-config differs"},
+		{"other annotation", "    helm.sh/resource-policy: keep", "    example.com/policy: keep", "ConfigMap quackmux/quackmux-config differs"},
 		{"reference", "secretName: quackmux-session-key\n", "secretName: other\n", "Deployment quackmux/quackmux differs"},
 		{"annotation", "        prometheus.io/scrape: \"true\"", "        prometheus.io/scrape: \"false\"", "Deployment quackmux/quackmux differs"},
 		{"object only in helm", "kind: ConfigMap", "kind: Job", "ConfigMap quackmux/quackmux-config: in kustomize, missing in helm"},
