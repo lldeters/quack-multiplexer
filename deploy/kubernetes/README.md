@@ -554,11 +554,16 @@ Konfiguration ab.
 
 ## Entwicklung mit kind (`overlays/dev`)
 
-`auth.mode: none`, Admin-API ohne Token, kleine Ressourcen (Gateway bis 512 MiB, Engines 100m/256 MiB
-angefordert, bis 1 CPU/1 GiB), höchstens 8 Engines, Debug-Logs im Textformat. Das Profil `persistent`
-(`TOKEN 'dev?user=alice&profile=persistent'`) gibt jedem Benutzer ein Volume von 1 GiB aus der
-Default-StorageClass von kind. **Nur auf dem eigenen Rechner verwenden:** Jeder Client darf sich jeden
-Benutzernamen aussuchen.
+`auth.mode: none`, Admin-API ohne Token, kleine Ressourcen (Gateway bis 512 MiB, Engines 100m/256 MiB/256 MiB
+Platte angefordert, bis 1 CPU/1 GiB/4 GiB Platte, davon bis 2 GiB Auslagerung), höchstens 8 Engines, Debug-Logs im
+Textformat. Das Profil `persistent` (`TOKEN 'dev?user=alice&profile=persistent'`) gibt jedem Benutzer ein Volume
+von 1 GiB aus der Default-StorageClass von kind. **Nur auf dem eigenen Rechner verwenden:** Jeder Client darf sich
+jeden Benutzernamen aussuchen.
+
+Ein kind-Node meldet als ephemeren Speicher die Größe der Platte des Hosts, nicht ihren freien Platz
+(`kubectl get nodes -o custom-columns=NAME:.metadata.name,EPHEMERAL:.status.allocatable.ephemeral-storage`). Die
+Requests der Engines (zusammen höchstens 2 GiB) passen deshalb praktisch immer; eine auslagernde Engine braucht den
+Platz aber wirklich ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)).
 
 ```sh
 kind create cluster --name quackmux
@@ -816,7 +821,9 @@ Profil entfernt oder das Gateway neu ausgerollt wird. Das Gateway löscht sie ni
 * Plattenplatz begrenzen: Eine ResourceQuota im Namespace (`count/persistentvolumeclaims`, `requests.storage`)
   deckelt alle Volumes. Scheitert das Anlegen an ihr, meldet der Client `… exceeded quota …`.
 * Bei einer Datei-Datenbank lagert DuckDB Zwischenergebnisse neben der Datei aus (`engine.duckdb.tmp`, also auf dem
-  Volume). Mit `settings.temp_directory: /tmp/duckdb-spill` landen sie im `emptyDir` des Pods.
+  Volume). Mit `settings.temp_directory: /tmp/duckdb-spill` (wie im Profil `persistent` von `overlays/dev`) landen
+  sie im `emptyDir` des Pods, unter denselben Grenzen wie bei `:memory:`
+  ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)).
 * Beim Beenden macht der Entrypoint einen `FORCE CHECKPOINT`, höchstens `QUACKMUX_STOP_TIMEOUT` lang (Grace Period
   minus 5 s). Große Datenbanken brauchen eine längere `provider.kubernetes.deleteGracePeriod`; sonst spielt die
   nächste Engine das WAL beim Start ein, was gegen `startupTimeout` zählt. Das Bereitstellen eines neuen Volumes
@@ -882,6 +889,44 @@ Eine einzige schreibbare Datei für alle: ein Profil mit `allowedShareLevels: [S
 `allowedSubdomains: [default]` und `persistence` (Umstieg von einem PVC im `podTemplate`: siehe
 [oben](#umstieg-von-einem-pvc-im-podtemplate)).
 
+## Plattenplatz für Auslagerungen
+
+Reicht `memory_limit` nicht, lagert DuckDB Zwischenergebnisse in sein Temp-Verzeichnis aus: bei `:memory:` nach
+`/tmp/.tmp`, bei einer Datenbankdatei daneben (`<datei>.tmp`). `/tmp` ist ein `emptyDir` auf der Platte des
+Nodes, das das Gateway jedem Engine-Pod mitgibt. Ohne Grenze belegt DuckDB bis zu 90 % des freien Platzes; eine
+einzige Query kann so den Node füllen. Die mitgelieferten Profile setzen deshalb zwei Grenzen:
+
+| Profil | `memory_limit` / `limits.memory` | `settings.max_temp_directory_size` | `ephemeral-storage` Request / Limit |
+|---|---|---|---|
+| `default` (base, ha) | 3GB / 4Gi | 8GiB | 1Gi / 10Gi |
+| `large` (base, ha) | 12GB / 16Gi | 32GiB | 1Gi / 34Gi |
+| `default`, `persistent` (dev) | 700MB / 1Gi | 2GiB | 256Mi / 4Gi |
+
+* **`settings.max_temp_directory_size`**, das Doppelte von `limits.memory`: Braucht eine Query mehr, scheitert nur
+  sie (`Out of Memory Error: failed to offload data block … This limit was set by the 'max_temp_directory_size'
+  setting.`), Session und Engine bleiben.
+* **`resources.limits.ephemeral-storage`**, 2 GiB darüber für das Container-Log und andere Dateien in `/tmp`: Das
+  `emptyDir` hat kein `sizeLimit`, zählt aber zum ephemeren Speicher des Pods. Belegt der Pod mehr, räumt das
+  Kubelet die Engine (`Pod ephemeral local storage usage exceeds the total limit of containers …`), und alle ihre
+  Sessions enden. Das Limit des Pods ist die Summe der Container-Limits; Sidecars aus dem `podTemplate` mit
+  eigenem Limit erhöhen es.
+* **`resources.requests.ephemeral-storage`** bleibt klein: Ohne Auslagern braucht eine Engine kaum Platte, und der
+  kleine Request hält die Profile auch auf Nodes mit wenig Platte planbar. Der Scheduler reserviert aber nur den
+  Request: Lagern mehrere
+  Engines eines Nodes gleichzeitig aus, kann seine Platte volllaufen, und das Kubelet räumt zuerst die Pods, die
+  mehr als ihren Request belegen (kind schaltet diese Schwelle ab). Wer das ausschließen will, setzt den Request
+  auf das Limit und braucht Nodes mit so viel freier Platte.
+* **Eigene Werte:** `max_temp_directory_size` unter `limits.ephemeral-storage` halten (`GiB` bei DuckDB und `Gi`
+  bei Kubernetes sind dieselbe Einheit, `GB` bei DuckDB ist kleiner). Die Nodes brauchen den Platz wirklich: Hat
+  ein Node weniger frei als `max_temp_directory_size`, läuft er voll, bevor eine der Grenzen greift.
+* **Persistente Profile:** Mit einer Datenbankdatei lagert DuckDB auf dem Volume aus und belegt dort den Platz der
+  Daten. Das Profil `persistent` von `overlays/dev` setzt deshalb `settings.temp_directory: /tmp/duckdb-spill`;
+  dann gelten dieselben Grenzen wie bei `:memory:`. Wer doch auf dem Volume auslagert, hält
+  `max_temp_directory_size` unter dessen freiem Platz, der mit den Daten schrumpft.
+* **Geteilte Engines:** Ohne `lock_configuration` kann jede Session die Grenze von DuckDB per `SET GLOBAL
+  max_temp_directory_size` verschieben; dann bleibt nur das Limit des Kubelets, und es trifft alle Sessions der
+  Engine. Eine gehärtete Engine sperrt das ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)).
+
 ## Härtung geteilter Engines
 
 Das Gateway authentifiziert, wählt die Engine und setzt Limits durch. **SQL prüft es nicht**: Innerhalb einer
@@ -917,12 +962,10 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
 * **Laufzeit:** `limits.queryTimeout`, `profiles.<name>.queryTimeout` oder `overrides[].queryTimeout` begrenzen, wie
   lange eine Query die Engine belegt; danach bricht das Gateway sie ab ([Design, 5.3](../../docs/design.md#53-query-zeitlimit)).
   Das Abholen des Ergebnisses zählt mit; `COMMIT` und `ROLLBACK` haben kein Limit.
-* **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
-  `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
-  Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere
-  Pods verdrängen. Setzen Sie je Profil `settings.max_temp_directory_size` und darüber
-  `resources.limits.ephemeral-storage` (mit passendem `requests`-Wert): Dann scheitert die Query mit einem
-  Fehler, statt dass der Node volläuft, und im Notfall räumt das Kubelet nur diese Engine.
+* **Plattenplatz:** Die Auslagerungen aller Sessions einer Engine teilen sich ihre Grenzen
+  ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)): Eine Session, die viel auslagert, lässt die
+  Queries der anderen scheitern. Ohne `lock_configuration` kann sie zudem `max_temp_directory_size` anheben; dann
+  räumt das Kubelet die Engine samt allen Sessions.
 * **Sandbox:** Wo vorhanden, isoliert eine Sandbox-Runtime die Engines zusätzlich
   (`profiles.<name>.podTemplate.spec.runtimeClassName`, z. B. gVisor).
 * **Namespace:** Pod Security `restricted` ist aktiv. Das Gateway darf alle Secrets des Namespace lesen;
