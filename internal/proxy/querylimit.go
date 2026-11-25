@@ -53,7 +53,10 @@ import (
 // slowly) therefore counts as a request of the first query the gateway
 // begins to follow afterwards that it may serve: a FETCH one with its uuid,
 // an upload any query. So do the requests of a query that ends while they
-// are in flight, for the next query they may serve.
+// are in flight, or that the gateway forgets, for the next query they may
+// serve; if that query already passed its limit, the gateway cancels it
+// then, as at its next request. A statement without a limit (see below)
+// claims no FETCH or upload: it has no clock that could stop one.
 //
 // The gateway cannot see whether a client still wants a query that it does
 // not ask anything for: an answered PREPARE may carry the whole result
@@ -332,14 +335,20 @@ func (l *queryLimits) endLocked(q *trackedQuery) {
 			break
 		}
 	}
-	// Its FETCHes and uploads in flight may serve a later statement.
+	l.rehomeWaitingLocked(q)
+	l.forgetIdleLocked(sq)
+}
+
+// rehomeWaitingLocked hands the FETCHes and uploads in flight of q, which
+// the gateway no longer follows, to the queries they may serve next: the
+// engine may serve them for a later statement.
+func (l *queryLimits) rehomeWaitingLocked(q *trackedQuery) {
 	for r := range q.waiting {
 		if r.kind != wire.TypePrepareRequest {
 			delete(q.waiting, r)
-			l.rehomeLocked(sq, r)
+			l.rehomeLocked(q.sq, r)
 		}
 	}
-	l.forgetIdleLocked(sq)
 }
 
 // rehomeLocked hands a FETCH or an upload in flight to the newest query of
@@ -348,15 +357,39 @@ func (l *queryLimits) endLocked(q *trackedQuery) {
 func (l *queryLimits) rehomeLocked(sq *sessionQueries, r *queryRequest) {
 	r.early = true
 	for i := len(sq.queries) - 1; i >= 0; i-- {
-		o := sq.queries[i]
-		if o.limit > 0 && (r.kind != wire.TypeFetchRequest || (o.uuidKnown && o.uuid == r.uuid)) {
-			r.q, r.sq = o, nil
-			o.waiting[r] = struct{}{}
+		if o := sq.queries[i]; o.mayServe(r) {
+			l.claimLocked(o, r)
 			return
 		}
 	}
 	r.q = nil
 	l.addStrayLocked(sq, r)
+}
+
+// mayServe reports whether the engine may serve r, a FETCH or an upload, for
+// q: q has a limit, and a FETCH has its uuid.
+func (q *trackedQuery) mayServe(r *queryRequest) bool {
+	return q.limit > 0 && (r.kind != wire.TypeFetchRequest || (q.uuidKnown && q.uuid == r.uuid))
+}
+
+// claimLocked makes r, a FETCH or an upload in flight that q may serve, a
+// request of q. The engine may work for q then. If the limit of q passed
+// while it did not, the gateway enforces the limit now, as at a request that
+// comes later (beginReading); once the gateway is done with q at its limit
+// (or gave up on it), it cuts r off, and r's client gets the timeout error,
+// as later requests of q do.
+func (l *queryLimits) claimLocked(q *trackedQuery, r *queryRequest) {
+	r.q, r.sq = q, nil
+	q.waiting[r] = struct{}{}
+	switch {
+	case q.expired:
+		e := l.startLocked(q)
+		go l.run(q, e)
+	case q.timedOut && (q.failed || !q.enforcing):
+		// An enforcement that runs aborts its requests itself if the CANCEL
+		// fails; one that succeeds makes the engine answer them.
+		go r.abort()
+	}
 }
 
 // addStrayLocked follows r as a stray of sq.
@@ -369,19 +402,14 @@ func (l *queryLimits) addStrayLocked(sq *sessionQueries, r *queryRequest) {
 }
 
 // homeLocked hands q the strays of its session that it may serve: uploads,
-// and FETCHes with its uuid.
+// and FETCHes with its uuid (none without a limit: nothing to enforce).
 func (l *queryLimits) homeLocked(q *trackedQuery) {
-	if q.limit <= 0 {
-		return // nothing to enforce for it
-	}
 	sq := q.sq
 	for r := range sq.strays {
-		if r.kind == wire.TypeFetchRequest && (!q.uuidKnown || r.uuid != q.uuid) {
-			continue
+		if q.mayServe(r) {
+			delete(sq.strays, r)
+			l.claimLocked(q, r)
 		}
-		delete(sq.strays, r)
-		r.q, r.sq = q, nil
-		q.waiting[r] = struct{}{}
 	}
 }
 
@@ -428,10 +456,11 @@ func (l *queryLimits) roomLocked(sq *sessionQueries) bool {
 		return true
 	}
 	kept := make([]*trackedQuery, 0, len(sq.queries))
+	var forgotten []*trackedQuery
 	counted := 0
 	for _, o := range sq.queries {
 		if o.timedOut && !o.enforcing && !o.failed {
-			forgetLocked(o)
+			forgotten = append(forgotten, o)
 			continue
 		}
 		if !o.givenUp() {
@@ -440,6 +469,7 @@ func (l *queryLimits) roomLocked(sq *sessionQueries) bool {
 		kept = append(kept, o)
 	}
 	sq.queries = kept
+	l.forgetLocked(forgotten)
 	return counted < maxSessionQueries
 }
 
@@ -461,24 +491,31 @@ func (l *queryLimits) pruneLocked(sq *sessionQueries) {
 		return
 	}
 	kept := make([]*trackedQuery, 0, len(sq.queries))
+	var forgotten []*trackedQuery
 	for _, o := range sq.queries {
 		if n > maxSessionQueries && o.givenUp() {
-			forgetLocked(o)
+			forgotten = append(forgotten, o)
 			n--
 			continue
 		}
 		kept = append(kept, o)
 	}
 	sq.queries = kept
+	l.forgetLocked(forgotten)
 }
 
-// forgetLocked marks a query that the gateway stops following without
-// evidence of its end: requests of it in flight keep it (their answers
-// still get its timeout error), nothing else does.
-func forgetLocked(q *trackedQuery) {
-	q.ended = true
-	if q.timer != nil {
-		q.timer.Stop()
+// forgetLocked stops following queries that timed out, without evidence of
+// their end; the caller has taken them out of the session's queries. Their
+// PREPAREs in flight keep them (their answers still get the timeout error);
+// their FETCHes and uploads in flight move on, as those of a query that
+// ends: the engine may serve them for a later statement.
+func (l *queryLimits) forgetLocked(qs []*trackedQuery) {
+	for _, q := range qs {
+		q.ended = true
+		if q.timer != nil {
+			q.timer.Stop()
+		}
+		l.rehomeWaitingLocked(q)
 	}
 }
 
@@ -621,6 +658,9 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 		if !l.roomLocked(sq) {
 			return nil, errTooManyQueries
 		}
+		if sq.cancelsDone != nil {
+			continue // a request of a query it forgot started an enforcement (claimLocked)
+		}
 		sq.prepares++
 		q := l.newQueryLocked(sq, uuid, known, clientQueryID, limit, source)
 		q.seq = sq.prepares
@@ -636,23 +676,31 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 }
 
 // findLocked returns the query a FETCH (of the query with *uuid) or an
-// upload (uuid nil) is for: the newest one whose PREPARE was answered (a
-// result exists only then), else the newest one.
-func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) *trackedQuery {
+// upload (uuid nil) is for, among those with a limit: the newest one whose
+// PREPARE was answered (a result exists only then), else the newest one. A
+// statement without a limit claims nothing: the engine may serve the
+// request for the next query, and nothing would stop its clock. known
+// reports whether a query of the session has *uuid, also one without a
+// limit.
+func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) (q *trackedQuery, known bool) {
 	var newest *trackedQuery
 	for i := len(sq.queries) - 1; i >= 0; i-- {
 		o := sq.queries[i]
 		if uuid != nil && (!o.uuidKnown || o.uuid != *uuid) {
 			continue
 		}
+		known = true
+		if o.limit <= 0 {
+			continue
+		}
 		if !o.preparing {
-			return o
+			return o, true
 		}
 		if newest == nil {
 			newest = o
 		}
 	}
-	return newest
+	return newest, known
 }
 
 // beginReading follows a FETCH (of the query with *uuid) or an upload (uuid
@@ -667,14 +715,17 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 			return nil, nil, errSessionClosed
 		}
 		var q *trackedQuery
+		known := false
 		if sq != nil {
-			q = sq.findLocked(uuid)
+			q, known = sq.findLocked(uuid)
 		}
 		if q == nil {
-			var err error
-			if q, err = l.adoptLocked(sess, sq, uuid); err != nil {
-				l.mu.Unlock()
-				return nil, nil, err
+			if !known {
+				var err error
+				if q, err = l.adoptLocked(sess, sq, uuid); err != nil {
+					l.mu.Unlock()
+					return nil, nil, err
+				}
 			}
 			if q == nil {
 				r, err := l.strayLocked(sess, sq, uuid, abort)
@@ -711,6 +762,8 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 		r := &queryRequest{l: l, sess: sess, kind: wire.TypeFetchRequest, q: q, decoded: decoded, early: q.preparing, abort: abort}
 		if uuid == nil {
 			r.kind = wire.TypeSendDataRequest
+		} else {
+			r.uuid = *uuid // it moves to another query by its uuid (rehomeLocked)
 		}
 		q.waiting[r] = struct{}{}
 		l.mu.Unlock()
@@ -787,6 +840,7 @@ func (l *queryLimits) adoptLocked(sess *session.Session, sq *sessionQueries, uui
 	}
 	q := l.newQueryLocked(sq, *uuid, true, wire.OptionalIdx{}, limit, source)
 	q.adopted = true
+	l.homeLocked(q) // uploads in flight may serve it, as for any query
 	return q, nil
 }
 
