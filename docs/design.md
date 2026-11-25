@@ -255,12 +255,21 @@ das Gateway keine Queries.
   das Gateway nicht kennt (die Engine hatte sie nie, oder die Query ist vorbei, etwa ein später Read-Ahead nach der
   letzten Antwort), startet nichts. Die Engine bekommt einen Request aber erst, wenn er ganz angekommen ist, und
   bedient dann die Anweisung, die die Verbindung gerade hat: Ein FETCH oder Upload, für den das Gateway beim
-  Weiterleiten keine Query kennt (sein Body kann langsam kommen), zählt deshalb als Request der ersten Query, die das
-  Gateway danach zu verfolgen beginnt und die er bedienen kann (ein FETCH eine mit seiner `query_uuid`, ein Upload
-  jede); ebenso die Requests einer Query, die endet, während sie unterwegs sind. Ihre Antworten beenden nichts. Ein
-  Client kann die Uhr einer laufenden Query so nicht anhalten, auch nicht mit einem PREPARE derselben `query_uuid`, das
-  die Engine ablehnt, mit vielen PREPAREs, die er nicht abwartet (siehe „Speicher“), oder indem er seine Session
-  schließt (siehe „Schließen der Session“).
+  Weiterleiten keine Query mit Limit kennt (sein Body kann langsam kommen), zählt deshalb als Request der ersten
+  Query, die das Gateway danach zu verfolgen beginnt und die er bedienen kann (ein FETCH eine mit seiner
+  `query_uuid`, ein Upload jede mit Limit). Ebenso zählen die Requests einer Query, die endet oder die das Gateway
+  vergisst (siehe „Speicher“), während sie unterwegs sind, für die neueste Query, die sie bedienen können. Hat diese
+  ihr Limit schon überschritten, ohne dass ein Request auf sie wartete, bricht das Gateway sie sofort ab wie beim
+  nächsten Request für sie; ist es mit ihr am Limit schon fertig, bricht es den Request ab und beantwortet ihn mit
+  dem Fehler des Zeitlimits. `COMMIT` und `ROLLBACK` beanspruchen keinen FETCH und keinen Upload, auch keinen FETCH
+  mit ihrer `query_uuid`: Sie haben keine Uhr, die ihn begrenzen könnte. Antworten auf solche Requests beenden nichts.
+  Ein Client kann die Uhr einer laufenden Query so nicht anhalten, auch nicht mit einem PREPARE derselben
+  `query_uuid`, das die Engine ablehnt oder das eine frühere Query ersetzt, mit einem `COMMIT`, dessen Body er
+  zurückhält, mit vielen PREPAREs, die er nicht abwartet (siehe „Speicher“), oder indem er seine Session schließt
+  (siehe „Schließen der Session“). Nur wenn sich PREPAREs einer Session überlappen (ein Client schickt eines, bevor
+  das vorige beantwortet ist; der DuckDB-Client tut das nie), weiß das Gateway nicht, welches die Engine zuletzt zu
+  ihrer Anweisung machte. Einen FETCH oder Upload zählt es dann vielleicht für eine andere Query der Session, die er
+  bedienen kann; er läuft höchstens, bis das Gateway die neueste von ihnen an ihrem Limit abbricht.
 * **Durchsetzung:** ein Timer pro Query. Läuft er ab, während die Engine für die Query arbeitet (ein Request der
   Query wartet auf sie, oder ihr PREPARE blieb ohne Antwort, obwohl die Engine es ganz hatte: nach einer Störung
   zwischen Gateway und Engine, oder das Gateway ließ es ohne frische Lease los), bricht das Gateway sie sofort ab. Sonst bricht es sie beim nächsten FETCH oder Upload
@@ -299,8 +308,9 @@ das Gateway keine Queries.
   Clients wie immer sofort. Kann das Limit aber noch eine Query der Session abbrechen müssen (ein Request einer Query
   mit Limit wartet auf die Engine, ihr PREPARE blieb ohne Antwort, obwohl die Engine es ganz hatte, oder ein Abbruch
   läuft), verfolgt das Gateway die Queries weiter und schickt das `DISCONNECT` erst an die Engine, wenn es mit ihnen
-  fertig ist: Die Uhren laufen weiter, das Limit bricht ab wie in einer offenen Session, das Gateway hält die Lease der
-  Verbindung am Leben, und die Session bleibt so lange geschlossen, auch über die TTL ihres Tombstones hinaus. Das gilt
+  fertig ist, spätestens also, wenn es sie an ihrem Limit abgebrochen hat: Die Uhren laufen weiter, das Limit bricht
+  ab wie in einer offenen Session, das Gateway hält die Lease der Verbindung am Leben, und die Session bleibt so lange
+  geschlossen, auch über die TTL ihres Tombstones hinaus. Das gilt
   für jedes Schließen, nach dem die Engine ein `DISCONNECT` bekommt (Client, `idleTimeout`, Heartbeat-Lease,
   `maxLifetime`, Drain, Admin); ein Schließen, das abbricht (Drain, Admin), schickt sein CANCEL sofort. Requests der
   Session, die angekommen, aber noch nicht weitergeleitet waren (ein PREPARE hinter einem laufenden Abbruch, ein FETCH,
