@@ -21,7 +21,8 @@ Wo es geht, ist die CA-Prüfung die bessere Wahl, auch mit einer eigenen CA oder
 können oder sollen; dann gelten die Einschränkungen [unten](#was-sich-mit-pinning-ändert).
 
 Das Verhalten der Clients ist gegen DuckDB 2.0.0 (quack `f96420ed46`) mit einem selbstsignierten Zertifikat
-geprüft.
+geprüft. Szenario l des Compose-Tests ([test/e2e](../test/e2e/README.md#szenarien)) prüft das meiste davon bei
+jedem Lauf; die Timeouts ohne httpfs und über 30 s nicht.
 
 ## Gateway
 
