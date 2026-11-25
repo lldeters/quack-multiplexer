@@ -228,8 +228,10 @@ das Gateway keine Queries.
   FETCHes oder Uploads verbringt, zählt mit. Auch Katalog-Queries, `BEGIN TRANSACTION` und DDL zählen; der
   DuckDB-Client schickt sie mit `query_uuid {0,0}`, und die `query_uuid` wählt der Client. `COMMIT`, `END`,
   `ROLLBACK` und `ABORT` (auch mit `WORK` oder `TRANSACTION`) haben kein Limit: DuckDB unterbricht keinen Commit, die
-  Engine meldete einen abgebrochenen `COMMIT` als unterbrochen, obwohl er geschrieben hatte. Der DuckDB-Client
-  schickt jede Anweisung auf einer Remote-Datenbank in `BEGIN TRANSACTION … COMMIT`.
+  Engine meldete einen abgebrochenen `COMMIT` als unterbrochen, obwohl er geschrieben hatte. Schreibende
+  Anweisungen und Anweisungen, die er ganz zur Engine schiebt, schickt der DuckDB-Client in
+  `BEGIN TRANSACTION … COMMIT`; `remote.query(…)` und Scans von Remote-Tabellen in lokalen Queries laufen im
+  Autocommit (im Audit-Log mit DuckDB 2.0 geprüft).
 * **Ende einer Query:** Das Gateway verfolgt die Queries einer Session über ihre `query_uuid` und glaubt nur Antworten
   der Engine. Eine Query endet, wenn
   * ihr PREPARE mit einem Fehler beantwortet wird;
@@ -273,9 +275,10 @@ das Gateway keine Queries.
     Query treffen.
 * **Folgen für den Client:** Die Session bleibt nutzbar, die nächste Query läuft. In einer offenen Transaktion bricht
   der Abbruch die Transaktion ab („Current transaction is aborted (please ROLLBACK)“), wie jeder Abbruch; der
-  DuckDB-Client rollt sie dann zurück. Eine Anweisung im Autocommit, die beim Abbruch schon committet, schreibt
-  trotzdem (DuckDB unterbricht keinen Commit), der Client bekommt aber den Fehler; die Anweisungen des DuckDB-Clients
-  committen erst mit dem `COMMIT`, das kein Limit hat.
+  DuckDB-Client rollt sie dann zurück (ein abgebrochenes `CREATE TABLE remote.t AS …` hinterlässt keine Tabelle).
+  Eine Anweisung im Autocommit, die beim Abbruch schon committet, schreibt trotzdem (DuckDB unterbricht keinen
+  Commit), der Client bekommt aber den Fehler. Schreibende Anweisungen des DuckDB-Clients committen erst mit dem
+  `COMMIT`, das kein Limit hat; im Autocommit schreibt nur, wer etwa über `remote.query(…)` schreibt.
 * **Neustart und Failover:** Die Queries leben nur im Speicher des Gateways. In einer übernommenen Session startet
   ein FETCH für eine Query, die das Gateway nicht kennt (begonnen vor dem Neustart), ihr Limit ab da, bis die Engine
   zeigt, was sie ausführt (ein PREPARE-Ergebnis, ein Batch, ein gelungenes CANCEL). Die versiegelte ID enthält die
