@@ -1,6 +1,7 @@
 # quackmux gateway configuration for the HA overlay (two replicas, leader
 # election). It replaces ../../base/config.yaml completely; keep both files
-# in sync - apart from the "ha" section they are identical.
+# in sync - apart from the "ha" section they are identical. The Helm chart
+# ships a copy (deploy/helm/quackmux/files/config-ha.yaml, see base).
 # Every option with its default: examples/config.kubernetes.yaml
 
 server:
