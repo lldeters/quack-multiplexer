@@ -14,6 +14,8 @@
 #                        (default /opt/duckdb/extensions; empty: DuckDB default)
 #   E2E_QUACK_PORT, E2E_ADMIN_PORT, E2E_IDLE_QUACK_PORT, E2E_IDLE_ADMIN_PORT
 #                        host ports on 127.0.0.1 (19494, 19495, 19594, 19595)
+#   E2E_TLS_QUACK_PORT, E2E_TLS_ADMIN_PORT
+#                        host ports of gateway-tls (19794, 19795)
 #   E2E_PROJECT          Compose project name (default quackmux-e2e); with its
 #                        own name and ports a second run can go on in parallel
 set -euo pipefail
@@ -36,15 +38,18 @@ export E2E_ENGINE_IMAGE=${E2E_ENGINE_IMAGE:-quackmux/duckdb-engine:2.0.0}
 export E2E_GATEWAY_IMAGE=${E2E_GATEWAY_IMAGE:-quackmux/quackmux:e2e}
 export E2E_QUACK_PORT=${E2E_QUACK_PORT:-19494} E2E_ADMIN_PORT=${E2E_ADMIN_PORT:-19495}
 export E2E_IDLE_QUACK_PORT=${E2E_IDLE_QUACK_PORT:-19594} E2E_IDLE_ADMIN_PORT=${E2E_IDLE_ADMIN_PORT:-19595}
+export E2E_TLS_QUACK_PORT=${E2E_TLS_QUACK_PORT:-19794} E2E_TLS_ADMIN_PORT=${E2E_TLS_ADMIN_PORT:-19795}
 E2E_PROJECT=${E2E_PROJECT:-quackmux-e2e}
 
 GATEWAY_ADMIN=http://127.0.0.1:$E2E_ADMIN_PORT
 IDLE_ADMIN=http://127.0.0.1:$E2E_IDLE_ADMIN_PORT
-COMPOSE=(docker compose -p "$E2E_PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE_DIR/docker-compose.yaml")
+TLS_ADMIN=http://127.0.0.1:$E2E_TLS_ADMIN_PORT
+# The profile "tls" adds gateway-tls (scenario l).
+COMPOSE=(docker compose -p "$E2E_PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE_DIR/docker-compose.yaml" --profile tls)
 # A fresh DuckDB CLI container for every client. Its stdin is the SQL script.
 CLIENT=("${COMPOSE[@]}" run --rm -T --no-deps client)
 
-need docker curl mkfifo awk sed grep
+need docker curl mkfifo awk sed grep openssl
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 # Writing to a session whose client died must fail the check, not kill the run.
 trap '' PIPE
@@ -52,6 +57,17 @@ trap '' PIPE
 E2E_WORK=$(make_workdir)
 ADMIN_HEADER_FILE=$E2E_WORK/admin.header
 (umask 077 && printf 'Authorization: Bearer %s\n' "$E2E_ADMIN_TOKEN" >"$ADMIN_HEADER_FILE")
+
+# Scenario l: a self-signed certificate for gateway-tls, made with the
+# command of docs/tls.md (with the compose host name and localhost). The
+# gateway runs as another user, so the throwaway key is readable for all.
+export E2E_TLS_DIR=$E2E_WORK/tls
+mkdir -m 755 "$E2E_TLS_DIR"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+	-subj '/CN=gateway-tls' -addext 'subjectAltName=DNS:gateway-tls,DNS:localhost' \
+	-keyout "$E2E_TLS_DIR/tls.key" -out "$E2E_TLS_DIR/tls.crt" 2>"$E2E_WORK/openssl.log" ||
+	die "openssl could not create the test certificate: $(cat "$E2E_WORK/openssl.log")"
+chmod 644 "$E2E_TLS_DIR/tls.key" "$E2E_TLS_DIR/tls.crt"
 
 cleanup() {
 	local rc=$?
@@ -63,7 +79,7 @@ cleanup() {
 	fi
 	if [ -n "${E2E_KEEP:-}" ]; then
 		say "E2E_KEEP is set: the containers keep running. Remove them with"
-		say "  docker compose -p $E2E_PROJECT --env-file $ENV_FILE -f $COMPOSE_DIR/docker-compose.yaml down -v"
+		say "  docker compose -p $E2E_PROJECT --env-file $ENV_FILE -f $COMPOSE_DIR/docker-compose.yaml --profile tls down -v"
 	else
 		"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || warn "docker compose down failed"
 	fi
@@ -558,10 +574,198 @@ orphan_opts() {
 	esac
 }
 
+# tls_client NAME runs the SQL script on stdin like client, with the
+# certificate of gateway-tls at /certs/tls.crt.
+tls_client() {
+	CLIENT_RC=0
+	"${COMPOSE[@]}" run --rm -T --no-deps -v "$E2E_TLS_DIR:/certs:ro" client -bail >"$E2E_WORK/$1.log" 2>&1 ||
+		CLIENT_RC=$?
+}
+
+# local_client NAME runs the SQL script on stdin like tls_client, but in the
+# network namespace of gateway-tls: there localhost is the gateway, as for a
+# client behind "kubectl port-forward".
+local_client() {
+	local cid
+	CLIENT_RC=0
+	cid=$("${COMPOSE[@]}" ps -q gateway-tls 2>/dev/null) || cid=''
+	if [ -z "$cid" ]; then
+		echo "gateway-tls is not running" >"$E2E_WORK/$1.log"
+		CLIENT_RC=1
+		return
+	fi
+	docker run --rm -i --name "$E2E_PROJECT-l-$1" --network "container:$cid" --read-only --tmpfs /tmp \
+		--cap-drop ALL --security-opt no-new-privileges=true -e HOME=/tmp -v "$E2E_TLS_DIR:/certs:ro" \
+		--entrypoint /usr/local/bin/duckdb "$E2E_ENGINE_IMAGE" -bail >"$E2E_WORK/$1.log" 2>&1 || CLIENT_RC=$?
+}
+
+# tls_secret TOKEN HOST [OPTIONS] prints a quack secret for HOST:9494.
+tls_secret() {
+	printf "CREATE SECRET (TYPE quack, TOKEN '%s', SCOPE 'quack:%s:9494'%s);\n" "$1" "$2" "${3:+, $3}"
+}
+
+# expect_refused NAME TEXT DESCRIPTION: the client NAME failed with TEXT and
+# never got to its last statement.
+expect_refused() {
+	local log=$E2E_WORK/$1.log
+	expect_status "$CLIENT_RC" nonzero "$1: the client failed" || return 1
+	expect_output "$log" "$2" "$3" || return 1
+	expect_no_output "$log" 'attached=unexpected' "$1: no statement ran after the failed ATTACH" || return 1
+}
+
+# (l) TLS (docs/tls.md): gateway-tls serves the Quack port with server.tls
+# and a self-signed certificate. A client that pins it (ssl_fingerprint)
+# gets in but sends no EXTRA_HTTP_HEADERS, so its session lands on the
+# defaults; a client that trusts it as its CA (SET GLOBAL ca_cert_file)
+# sends them. Both fetch a result of many batches, which the client fetches
+# ahead over several HTTP connections. A wrong pin, the whole openssl line as
+# the pin, a host that is not in the certificate and clients that speak HTTP
+# (DISABLE_SSL true, localhost without a pin) are refused with the messages
+# of docs/tls.md. A pinned client gives up after the global http_timeout.
+scenario_tls() {
+	local fp line headers many before after cid host
+	fp=$(openssl x509 -in "$E2E_TLS_DIR/tls.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+	line=$(openssl x509 -in "$E2E_TLS_DIR/tls.crt" -noout -fingerprint -sha256)
+	headers="EXTRA_HTTP_HEADERS MAP {'X-Quackmux-Share-Level': 'group', 'X-Quackmux-Group': 'analytics'}"
+	many="SELECT 'rows=' || CAST(count(*) AS VARCHAR) || '/' || CAST(count(DISTINCT h) AS VARCHAR) AS result
+FROM remote.query('SELECT i, md5(CAST(i AS VARCHAR)) AS h FROM range(1000000) t(i)');"
+
+	before=$(metric_sum "$TLS_ADMIN" quackmux_requests_total 'type="FETCH_REQUEST"')
+	tls_client l_pinned <<SQL
+$(client_preamble)
+$(tls_secret "$E2E_ALICE_TOKEN" gateway-tls "SSL_FINGERPRINT '$fp', $headers")
+ATTACH 'quack:gateway-tls:9494' AS remote;
+SELECT 'whoami=' || engine AS result FROM remote.whoami;
+$many
+DETACH remote;
+SQL
+	expect_status "$CLIENT_RC" 0 "the client with the pin in its secret ran all statements" || return 1
+	expect_output "$E2E_WORK/l_pinned.log" 'whoami=shared' \
+		"the pinned client sent no EXTRA_HTTP_HEADERS: its session has the defaults (engine-shared)" || return 1
+	expect_output "$E2E_WORK/l_pinned.log" 'rows=1000000/1000000' "it fetched a result of many batches" || return 1
+	after=$(metric_sum "$TLS_ADMIN" quackmux_requests_total 'type="FETCH_REQUEST"')
+	expect_ge "$after" $((before + 2)) "the result needed several FETCH requests ($before -> $after)" || return 1
+
+	before=$after
+	tls_client l_ca <<SQL
+$(client_preamble)
+SET GLOBAL ca_cert_file = '/certs/tls.crt';
+$(tls_secret "$E2E_ALICE_TOKEN" gateway-tls "$headers")
+ATTACH 'quack:gateway-tls:9494' AS remote;
+SELECT 'whoami=' || engine AS result FROM remote.whoami;
+$many
+DETACH remote;
+SQL
+	expect_status "$CLIENT_RC" 0 "the client with SET GLOBAL ca_cert_file ran all statements" || return 1
+	expect_output "$E2E_WORK/l_ca.log" 'whoami=analytics' \
+		"it verified the certificate and sent EXTRA_HTTP_HEADERS (engine-analytics)" || return 1
+	expect_output "$E2E_WORK/l_ca.log" 'rows=1000000/1000000' "it fetched a result of many batches" || return 1
+	after=$(metric_sum "$TLS_ADMIN" quackmux_requests_total 'type="FETCH_REQUEST"')
+	expect_ge "$after" $((before + 2)) "the result needed several FETCH requests ($before -> $after)" || return 1
+
+	tls_client l_wrong_pin <<SQL
+$(client_preamble)
+$(tls_secret "$E2E_ALICE_TOKEN" gateway-tls "SSL_FINGERPRINT '$(printf '%064d' 0)'")
+ATTACH 'quack:gateway-tls:9494' AS remote;
+SELECT 'attached=unexpected' AS result;
+SQL
+	expect_refused l_wrong_pin 'does not match the pinned ssl_fingerprint' "a wrong pin is refused" || return 1
+
+	tls_client l_line <<SQL
+$(client_preamble)
+$(tls_secret "$E2E_ALICE_TOKEN" gateway-tls "SSL_FINGERPRINT '$line'")
+ATTACH 'quack:gateway-tls:9494' AS remote;
+SELECT 'attached=unexpected' AS result;
+SQL
+	expect_refused l_line 'Invalid SSL fingerprint' "the whole openssl output line is no valid pin" || return 1
+
+	# The container name reaches the same gateway, but is not in the
+	# certificate.
+	cid=$("${COMPOSE[@]}" ps -q gateway-tls 2>/dev/null) || cid=''
+	host=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null) || host=''
+	host=${host#/}
+	if [ -z "$host" ]; then
+		bad "cannot find the container of gateway-tls"
+		return 1
+	fi
+	tls_client l_ca_host <<SQL
+$(client_preamble)
+SET GLOBAL ca_cert_file = '/certs/tls.crt';
+$(tls_secret "$E2E_ALICE_TOKEN" "$host")
+ATTACH 'quack:$host:9494' AS remote;
+SELECT 'attached=unexpected' AS result;
+SQL
+	expect_refused l_ca_host 'SSL peer certificate or SSH remote key was not OK' \
+		"the CA check refuses a host name that is not in the certificate ($host)" || return 1
+
+	tls_client l_http <<SQL
+$(client_preamble)
+$(tls_secret "$E2E_ALICE_TOKEN" gateway-tls)
+ATTACH 'quack:gateway-tls:9494' AS remote (DISABLE_SSL true);
+SELECT 'attached=unexpected' AS result;
+SQL
+	expect_refused l_http 'Bad Request' "a client with DISABLE_SSL true gets 'Bad Request'" || return 1
+
+	local_client l_localhost <<SQL
+$(client_preamble)
+$(tls_secret "$E2E_ALICE_TOKEN" localhost)
+ATTACH 'quack:localhost:9494' AS remote;
+SELECT 'attached=unexpected' AS result;
+SQL
+	expect_refused l_localhost 'Bad Request' "localhost without a pin speaks HTTP and gets 'Bad Request' (port-forward)" || return 1
+
+	local_client l_localhost_pinned <<SQL
+$(client_preamble)
+$(tls_secret "$E2E_ALICE_TOKEN" localhost "SSL_FINGERPRINT '$fp'")
+ATTACH 'quack:localhost:9494' AS remote;
+SELECT 'whoami=' || engine AS result FROM remote.whoami;
+DETACH remote;
+SQL
+	expect_status "$CLIENT_RC" 0 "localhost with a pin: the client ran all statements" || return 1
+	expect_output "$E2E_WORK/l_localhost_pinned.log" 'whoami=shared' "a pin makes the client use HTTPS for localhost" || return 1
+
+	local_client l_localhost_ca <<SQL
+$(client_preamble)
+SET GLOBAL ca_cert_file = '/certs/tls.crt';
+$(tls_secret "$E2E_ALICE_TOKEN" localhost)
+ATTACH 'quack:localhost:9494' AS remote (DISABLE_SSL false);
+SELECT 'whoami=' || engine AS result FROM remote.whoami;
+DETACH remote;
+SQL
+	expect_status "$CLIENT_RC" 0 "localhost with DISABLE_SSL false: the client ran all statements" || return 1
+	expect_output "$E2E_WORK/l_localhost_ca.log" 'whoami=shared' \
+		"DISABLE_SSL false and DNS:localhost in the certificate let the CA check pass for localhost" || return 1
+
+	# bob's queries have a time limit of 5s; the engine would count for much
+	# longer. With a global http_timeout of 1s the pinned client gives up
+	# first; the session's value does not reach its HTTP client.
+	tls_client l_timeout <<SQL
+$(client_preamble)
+SET GLOBAL http_timeout = 1;
+$(tls_secret "$E2E_BOB_TOKEN" gateway-tls "SSL_FINGERPRINT '$fp'")
+ATTACH 'quack:gateway-tls:9494' AS remote;
+SELECT 'long=' || CAST(n AS VARCHAR) AS result FROM remote.query('SELECT count(*) AS n FROM range(1000000000000)');
+SQL
+	expect_status "$CLIENT_RC" nonzero "with SET GLOBAL http_timeout = 1 the long query failed" || return 1
+	expect_output "$E2E_WORK/l_timeout.log" 'Failed to read connection' \
+		"the pinned client gave up after the global http_timeout" || return 1
+	expect_no_output "$E2E_WORK/l_timeout.log" 'time limit of 5s' "it did not wait for the gateway's time limit" || return 1
+
+	tls_client l_timeout_session <<SQL
+$(client_preamble)
+SET http_timeout = 1;
+$(tls_secret "$E2E_BOB_TOKEN" gateway-tls "SSL_FINGERPRINT '$fp'")
+ATTACH 'quack:gateway-tls:9494' AS remote;
+SELECT 'long=' || CAST(n AS VARCHAR) AS result FROM remote.query('SELECT count(*) AS n FROM range(1000000000000)');
+SQL
+	expect_output "$E2E_WORK/l_timeout_session.log" 'time limit of 5s' \
+		"with SET http_timeout = 1 (session) it waited until the gateway's time limit" || return 1
+}
+
 # (i) Nothing above may have crashed a request handler.
 scenario_no_panics() {
 	local log=$E2E_WORK/i_gateways.log
-	"${COMPOSE[@]}" logs --no-color gateway gateway-idle >"$log" 2>&1 || {
+	"${COMPOSE[@]}" logs --no-color gateway gateway-idle gateway-tls >"$log" 2>&1 || {
 		bad "docker compose logs failed"
 		return 1
 	}
@@ -580,8 +784,10 @@ step "start engines and gateways"
 "${COMPOSE[@]}" up -d
 wait_for 90 "gateway /readyz ($GATEWAY_ADMIN)" curl -fsS "$GATEWAY_ADMIN/readyz" || exit 1
 wait_for 90 "gateway-idle /readyz ($IDLE_ADMIN)" curl -fsS "$IDLE_ADMIN/readyz" || exit 1
+wait_for 90 "gateway-tls /readyz ($TLS_ADMIN)" curl -fsS "$TLS_ADMIN/readyz" || exit 1
 wait_for 120 "both engines READY in gateway" engines_ready "$GATEWAY_ADMIN" 2 || exit 1
 wait_for 120 "both engines READY in gateway-idle" engines_ready "$IDLE_ADMIN" 2 || exit 1
+wait_for 120 "both engines READY in gateway-tls" engines_ready "$TLS_ADMIN" 2 || exit 1
 ok "gateways ready, both engines healthy"
 
 run_scenario a "SERVER share level, temporary table, DETACH" scenario_server_share
@@ -594,6 +800,7 @@ run_scenario g "CREATE TABLE AS uploads rows with SEND_DATA" scenario_send_data
 run_scenario h "the query time limit cancels long queries in every phase" scenario_query_timeout
 run_scenario j "a hardened engine serves, but not quack_stop, the token or files" scenario_hardened_engine
 run_scenario k "a restart closes the connections of clients that died meanwhile" scenario_orphans
+run_scenario l "TLS: pinned and CA-verifying clients, and the ones that are refused" scenario_tls
 run_scenario i "no panics in the gateway logs" scenario_no_panics
 
 summary "compose e2e" || exit 1

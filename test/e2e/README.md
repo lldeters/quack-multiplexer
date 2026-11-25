@@ -14,14 +14,15 @@ Go-Tests in diesem Verzeichnis: Sie prüfen nur die Fixtures des Compose-Tests (
 ## Voraussetzungen
 
 * Linux, macOS oder Windows mit WSL2. Die Skripte brauchen `bash` (ab 3.2), `curl`, `awk`, `sed`, `grep` und
-  `mkfifo`. Git Bash unter Windows ist nicht vorgesehen.
+  `mkfifo`, der Compose-Test außerdem `openssl` (ab 1.1.1, für das Testzertifikat von Szenario l). Git Bash unter
+  Windows ist nicht vorgesehen.
 * Docker mit Compose v2 (`docker compose`).
 * Internetzugang beim ersten Build: Das Engine-Image ([images/engine](../../images/engine)) lädt die DuckDB-CLI
   2.0.0 von GitHub und installiert die Extensions `quack` und `httpfs`, das Gateway-Image lädt Go-Module. Die Tests
   selbst laufen danach offline (`autoinstall_known_extensions = false`).
 * Für kind zusätzlich `kind` und `kubectl` (mit eingebautem Kustomize, `kubectl kustomize`).
-* Freie Ports auf `127.0.0.1`: 19494, 19495, 19594 und 19595 (Compose) sowie 19695 (kind, Port-Forward). Alle
-  lassen sich über Variablen ändern.
+* Freie Ports auf `127.0.0.1`: 19494, 19495, 19594, 19595, 19794 und 19795 (Compose) sowie 19695 (kind,
+  Port-Forward). Alle lassen sich über Variablen ändern.
 
 ## Docker Compose
 
@@ -30,8 +31,8 @@ bash test/e2e/compose/run.sh
 ```
 
 `run.sh` baut die Images `quackmux/duckdb-engine:2.0.0` (aus `images/engine`) und `quackmux/quackmux:e2e` (aus
-dem `Dockerfile` im Repository), startet die Umgebung und wartet, bis beide Gateways auf `/readyz` antworten und
-beide Engines als `READY` melden. Danach laufen die Szenarien. Ein fehlgeschlagenes Szenario bricht den Lauf nicht
+dem `Dockerfile` im Repository), erzeugt ein selbstsigniertes Zertifikat für `gateway-tls`, startet die Umgebung
+und wartet, bis alle Gateways auf `/readyz` antworten und beide Engines als `READY` melden. Danach laufen die Szenarien. Ein fehlgeschlagenes Szenario bricht den Lauf nicht
 ab: Am Ende stehen eine Zusammenfassung, die Ausgabe der betroffenen DuckDB-Clients und die letzten Zeilen aller
 Container-Logs. Der Exit-Status ist 0 nur, wenn alle Szenarien bestehen. Aufgeräumt wird immer
 (`docker compose down -v`), auch nach einem Fehler oder Strg+C.
@@ -44,6 +45,7 @@ Container-Logs. Der Exit-Status ist 0 nur, wenn alle Szenarien bestehen. Aufger�
 | `engine-analytics` | Engine-Image | Dasselbe für Share-Level `GROUP` der Gruppe `analytics` (`engine = 'analytics'`), gehärtet wie eine geteilte Engine: Autorisierungs-Makro des Images in der Variante `quackmux_authorize_listing` im Init-SQL, `enable_external_access = false` und `lock_configuration = true` im Post-Start-SQL. |
 | `gateway` | Gateway-Image | quackmux mit [config/gateway.yaml](compose/config/gateway.yaml): Provider `static` auf beide Engines, Auth `static` mit [config/users.yaml](compose/config/users.yaml), Admin-API mit Bearer-Token. Schließt nach einem Neustart verwaiste Verbindungen (`engine.closeOrphanedConnections: true`); mit `session.backendHeartbeatTimeout: 60s` prüft es sie schon nach 75 s (Szenario k). |
 | `gateway-idle` | Gateway-Image | Wie `gateway`, aber [config/gateway-idle.yaml](compose/config/gateway-idle.yaml) mit `session.idleTimeout: 15s` und Prüfintervallen von 1 s, ohne das Schließen verwaister Verbindungen (es startet im Lauf nie neu). |
+| `gateway-tls` | Gateway-Image | Wie `gateway`, aber [config/gateway-tls.yaml](compose/config/gateway-tls.yaml) mit `server.tls`: Der Quack-Port spricht nur HTTPS, mit einem selbstsignierten Zertifikat für die Namen `gateway-tls` und `localhost`, das `run.sh` mit dem `openssl`-Befehl aus [docs/tls.md](../../docs/tls.md) erzeugt und über `E2E_TLS_DIR` mountet. Ohne verwaiste Verbindungen zu schließen, wie `gateway-idle`. Profil `tls`: Ein einfaches `docker compose up` startet es nicht. |
 | `client` | Engine-Image | Die DuckDB-CLI (`/usr/local/bin/duckdb` als Entrypoint, Profil `client`). Jeder Client ist ein eigener `docker compose run`. |
 
 Engines und Gateways laufen wie ihre Pods in Kubernetes mit read-only Root-Dateisystem, ohne Capabilities und mit
@@ -62,7 +64,8 @@ Admin-API, die Gateway-Konfigurationen die Engine-Tokens.
 ### Szenarien
 
 Die Clients setzen ihre Optionen im Token, etwa `TOKEN 'e2e-alice-…?share_level=group&group=analytics'`, und
-hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true)` an.
+hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true)` an. Nur Szenario l spricht
+HTTPS mit `gateway-tls`.
 
 | | Ablauf | Was es beweist |
 |---|---|---|
@@ -76,6 +79,7 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | h | bob (Query-Zeitlimit 5 s per `overrides`): eine kurze Query, dann drei lange: `remote.query('SELECT count(*) … FROM range(1000000000000)')` (die Engine zählt 10¹² Zeilen), ein Join von `remote.query(… range(5000000000))` mit einer lokalen Tabelle (der Client holt die Zeilen) und `CREATE TABLE remote.h_upload AS …` aus einer lokalen Query (der Client lädt hoch), nach jeder eine weitere Query | Die kurze Query bleibt unberührt. Jede lange bricht das Gateway nach 5 s auf der Engine ab (CANCEL): während die Engine rechnet, während der Client FETCHes schickt und während er hochlädt. bob bekommt jedes Mal „ran longer than its time limit of 5s“, die nächste Query der Session läuft, und das abgebrochene `CREATE TABLE … AS` hinterlässt keine Tabelle. `quackmux_query_timeouts_total{result="cancelled"}` zählt alle drei, `quackmux_requests_total{outcome="query_timeout"}` auch für `FETCH_REQUEST` und `SEND_DATA_REQUEST`. |
 | j | alice, `share_level=group&group=analytics` auf der gehärteten Engine: `ATTACH`, `SHOW ALL TABLES`, Upload einer lokalen Tabelle, temporäre Tabelle, `FROM _`. Danach laufen die Fälle des Autorisierungs-Makros ([images/engine/authorize-cases.tsv](../../images/engine/authorize-cases.tsv)) mit `quackmux-authorize-test` aus dem Client-Image durch das Gateway, zuletzt fragt ein Client `whoami` ab. | Das Makro lässt die Katalog-Abfragen des Clients, Queries, Uploads und Transaktionen durch und lehnt `quack_stop`, `getenv`, `COPY`, `EXPORT`/`IMPORT DATABASE` und die übrigen Fälle in jeder Schreibweise ab; Dateizugriff und `SET` scheitern an den Einstellungen des Post-Start-SQL. Das Engine-Token taucht nirgends auf, und die Engine läuft weiter. |
 | k | Auf `engine-shared` und auf der gehärteten `engine-analytics` je drei Clients mit einer temporären Tabelle: zwei von alice über `gateway`, einer direkt an der Engine mit ihrem Token. Ein weiterer Client listet vorher und nachher mit `remote.query('SELECT connection_id FROM quack_active_connections()')` die Verbindungen der Engine. `gateway` wird gestoppt, je ein Client von alice wird ohne `DETACH` getötet (`docker kill`), dann startet `gateway` wieder. Wenn die Engine-Lease der Verbindungen abgelaufen ist (mit `gateway.yaml` nach 75 s), listet ein neuer Client erneut. | Die überlebenden Clients von alice werden übernommen. Den Heartbeat des Gateways beantwortet die Engine für die Verbindung des getöteten Clients mit abgelaufener Lease und entfernt sie: Sie wird nicht mehr gelistet, `quackmux_orphaned_connections_closed_total` steigt auf 2. Die Verbindungen der überlebenden und der direkt angehängten Clients bleiben, mit ihren temporären Tabellen, vor und nach dem Aufräumen. Die gehärtete Engine lässt das Listing mit `quackmux_authorize_listing` durch. |
+| l | Gegen `gateway-tls`: alice pinnt das Zertifikat (`SSL_FINGERPRINT` im Secret, Fingerprint mit dem `openssl`-Befehl aus [docs/tls.md](../../docs/tls.md)) und setzt Optionen per `EXTRA_HTTP_HEADERS` (`share_level=group`, `group=analytics`); ein zweiter Client vertraut dem Zertifikat als CA (`SET GLOBAL ca_cert_file`), mit denselben Headern. Beide lesen `whoami` und holen 1 000 000 Zeilen mit `md5` ab. Dann ein falscher Pin, die ganze `openssl`-Zeile als Pin, die CA-Prüfung unter dem Containernamen (der nicht im Zertifikat steht) und `DISABLE_SSL true`; im Netz-Namespace des Gateways (wie hinter einem Port-Forward) `localhost` ohne Pin, mit Pin und mit `DISABLE_SSL false` und CA. Zuletzt bob (Zeitlimit 5 s), gepinnt, mit `SET GLOBAL http_timeout = 1` und mit `SET http_timeout = 1`, je mit einer Query, für die die Engine 10¹² Zeilen zählt. | Was docs/tls.md über die Clients sagt: Der gepinnte Client kommt herein, sendet aber keine Header (`whoami = shared`, die Defaults), der CA-Client sendet sie (`analytics`). Ein Ergebnis aus vielen Batches (mindestens zwei FETCH-Requests) kommt auf beiden Wegen vollständig an, auch über die weiteren Verbindungen des Fetch-Ahead. Falscher Pin: „does not match the pinned ssl_fingerprint“, `openssl`-Zeile: „Invalid SSL fingerprint“, fremder Name: „SSL peer certificate or SSH remote key was not OK“, HTTP gegen den TLS-Port, auch `localhost` ohne Pin: „Bad Request“. `localhost` mit Pin oder mit `DISABLE_SSL false` und `DNS:localhost` im Zertifikat geht. Der gepinnte Client gibt nach dem globalen `http_timeout` auf („Failed to read connection“); mit dem Wert der Sitzung wartet er bis zum Zeitlimit des Gateways. |
 | i | Logs beider Gateways | Kein Request-Handler ist mit einem Panic abgestürzt. |
 
 ### Variablen
@@ -90,6 +94,7 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | `E2E_EXTENSION_DIR` | `/opt/duckdb/extensions` | Extension-Verzeichnis im Engine-Image; leer: DuckDB-Default |
 | `E2E_QUACK_PORT`, `E2E_ADMIN_PORT` | 19494, 19495 | Host-Ports von `gateway` |
 | `E2E_IDLE_QUACK_PORT`, `E2E_IDLE_ADMIN_PORT` | 19594, 19595 | Host-Ports von `gateway-idle` |
+| `E2E_TLS_QUACK_PORT`, `E2E_TLS_ADMIN_PORT` | 19794, 19795 | Host-Ports von `gateway-tls` |
 | `E2E_PROJECT` | `quackmux-e2e` | Compose-Projektname; mit eigenem Namen und eigenen Ports kann ein zweiter Lauf parallel laufen |
 | `NO_COLOR` | – | gesetzt: Ausgabe ohne Farben |
 
@@ -106,7 +111,7 @@ CREATE SECRET (TYPE quack, TOKEN 'e2e-alice-3f9c2b7d1a8e4c60?share_level=server'
 ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true);
 FROM remote.whoami;
 SQL
-docker compose -p quackmux-e2e --env-file e2e.env down -v
+docker compose -p quackmux-e2e --env-file e2e.env --profile tls down -v   # tls: auch gateway-tls
 ```
 
 Eine lokale DuckDB-2.0-CLI erreicht das Gateway unter `quack:localhost:19494` (lokale Adressen nutzen ohnehin
@@ -246,10 +251,12 @@ go test ./test/e2e/
 Die Go-Tests dieses Pakets ([fixtures_test.go](fixtures_test.go)) laufen ohne Docker und gehören zu `go test ./...`.
 Sie prüfen die Compose-Fixtures mit dem Code des Gateways:
 
-* Beide Gateway-Konfigurationen laden mit `config.Load` (unbekannte Felder sind Fehler) und unterscheiden sich nur im
-  Session- und Engine-Timing und darin, dass nur `gateway` verwaiste Verbindungen schließt (Szenario k: eine
-  Engine-Lease von mindestens einer Minute, damit die überlebenden Clients ihre Verbindungen wiederfinden, und eine
-  Frist von höchstens zwei Minuten).
+* Alle Gateway-Konfigurationen laden mit `config.Load` (unbekannte Felder sind Fehler). `gateway` und
+  `gateway-idle` unterscheiden sich nur im Session- und Engine-Timing und darin, dass nur `gateway` verwaiste
+  Verbindungen schließt (Szenario k: eine Engine-Lease von mindestens einer Minute, damit die überlebenden Clients
+  ihre Verbindungen wiederfinden, und eine Frist von höchstens zwei Minuten). `gateway-tls` unterscheidet sich von
+  `gateway` nur durch `server.tls` mit dem gemounteten Zertifikat und das abgeschaltete Schließen; nur
+  `docker-compose.yaml` gibt ihm das Profil `tls` und das Zertifikatsverzeichnis, und `run.sh` setzt beide.
 * Das Autorisierungs-Makro des Engine-Images lehnt die Anfrage ab, mit der das Gateway die Verbindungen einer Engine
   listet, seine Variante `quackmux_authorize_listing` lässt genau sie durch; die Fälle prüfen beides, und die
   gehärtete Engine der Compose-Umgebung nutzt die Variante ([authorize_test.go](authorize_test.go)).

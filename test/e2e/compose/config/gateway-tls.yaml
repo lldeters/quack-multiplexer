@@ -1,0 +1,84 @@
+# quackmux configuration of the docker compose end-to-end test, service
+# "gateway-tls" (profile "tls"): the same as gateway.yaml, but the Quack port
+# speaks HTTPS only (scenario l, docs/tls.md), and it leaves the orphan sweep
+# off, as it never restarts. fixtures_test.go checks that the files differ
+# only in that.
+#
+# run.sh creates a self-signed certificate for the host name gateway-tls
+# with the openssl command of docs/tls.md and mounts it at
+# /etc/quackmux/tls. All tokens are test values from ../e2e.env.
+
+server:
+  listen: ":9494"
+  # The session key comes from QUACKMUX_SESSION_KEY (docker-compose.yaml).
+  tls:
+    certFile: /etc/quackmux/tls/tls.crt
+    keyFile: /etc/quackmux/tls/tls.key
+
+admin:
+  listen: ":9495"
+  tokenFile: /etc/quackmux/admin.token
+
+auth:
+  mode: static
+  static:
+    file: /etc/quackmux/users.yaml
+    reloadInterval: 5s
+
+defaults:
+  # The static provider cannot launch per-user engines, so the default share
+  # level is one that always has an engine.
+  shareLevel: SERVER
+  subdomain: default
+  profile: default
+
+session:
+  # As in gateway.yaml (scenario k).
+  checkInterval: 2s
+  maxHeartbeatTimeout: 20s
+  backendHeartbeatTimeout: 60s
+
+engine:
+  checkInterval: 2s
+  # gateway-tls never restarts; the probes of gateway leave its sessions
+  # alone, since gateway-tls keeps their engine leases alive.
+  closeOrphanedConnections: false
+
+provider:
+  type: static
+  static:
+    healthInterval: 2s
+    engines:
+      # SERVER share level: every user (the defaults).
+      - name: shared
+        url: http://engine-shared:9494
+        token: e2e-engine-shared-6b2d8f4a0c1e3957
+        shareLevel: SERVER
+        subdomain: default
+        profile: default
+      # GROUP share level of group "analytics" (scenario l: options in
+      # EXTRA_HTTP_HEADERS).
+      - name: analytics
+        url: http://engine-analytics:9494
+        token: e2e-engine-analytics-9e4a2c6b8d0f1735
+        shareLevel: GROUP
+        owner: analytics
+        subdomain: default
+        profile: default
+
+profiles:
+  default:
+    description: DuckDB 2.0 engines run by docker compose (engine-shared, engine-analytics)
+
+overrides:
+  # Scenario l: bob's queries are cancelled after 5s, which bounds the query
+  # that outlives the request timeout of a pinned client.
+  - users: [bob]
+    queryTimeout: 5s
+
+audit:
+  enabled: true
+
+log:
+  level: debug
+  format: text
