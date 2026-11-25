@@ -270,14 +270,29 @@ das Gateway keine Queries.
   das vorige beantwortet ist; der DuckDB-Client tut das nie), weiß das Gateway nicht, welches die Engine zuletzt zu
   ihrer Anweisung machte. Einen FETCH oder Upload zählt es dann vielleicht für eine andere Query der Session, die er
   bedienen kann; er läuft höchstens, bis das Gateway die neueste von ihnen an ihrem Limit abbricht.
-* **Durchsetzung:** ein Timer pro Query. Läuft er ab, während die Engine für die Query arbeitet (ein Request der
-  Query wartet auf sie, oder ihr PREPARE blieb ohne Antwort, obwohl die Engine es ganz hatte: nach einer Störung
-  zwischen Gateway und Engine, oder das Gateway ließ es ohne frische Lease los), bricht das Gateway sie sofort ab. Sonst bricht es sie beim nächsten FETCH oder Upload
-  für sie ab: Ob ein Client mit einer Query fertig ist, sieht das Gateway nicht. Eine `PREPARE_RESPONSE` kann das
-  ganze Ergebnis enthalten (`needs_more_fetch` steht hinter den Spaltentypen, die das Gateway nicht dekodiert), ein
-  INSERT aus dem Client ist nach dem FETCH seiner Zeilenzahl fertig, ein Scan mit `LIMIT` hört früher auf zu lesen.
-  Solche Queries bekommen nie ein CANCEL und zählen nicht als Timeout; das nächste PREPARE der Session ersetzt sie
-  auf der Engine.
+* **Durchsetzung:** ein Timer pro Query. Läuft er ab, während ein Request der Query auf die Engine wartet (oder ihr
+  PREPARE ohne Antwort blieb, obwohl die Engine es ganz hatte: nach einer Störung zwischen Gateway und Engine, oder
+  das Gateway ließ es ohne frische Lease los), bricht das Gateway sie sofort ab. Sonst bricht es sie beim nächsten
+  FETCH oder Upload für sie ab: Ob ein Client mit einer Query fertig ist, sieht das Gateway nicht. Eine
+  `PREPARE_RESPONSE` kann das ganze Ergebnis enthalten (`needs_more_fetch` steht hinter den Spaltentypen, die das
+  Gateway nicht dekodiert), ein INSERT aus dem Client ist nach dem FETCH seiner Zeilenzahl fertig, ein Scan mit
+  `LIMIT` hört früher auf zu lesen. Solche Queries bekommen am Limit kein CANCEL und zählen nicht als Timeout; das
+  nächste PREPARE der Session ersetzt sie auf der Engine, spätestens das Ende der Session beendet sie.
+  * Bis dahin kann die Engine an einer beantworteten Query weiterrechnen, auch wenn kein Request auf sie wartet: Sie
+    führt die Anweisung in einem eigenen Thread aus. Mit `inline_rows 0` beantwortet sie das PREPARE schon nach dem
+    Planen, und von einem PREPARE mit mehreren Anweisungen laufen die späteren erst nach der Antwort, die das Ergebnis
+    der ersten bringt (mit DuckDB 2.0 lief so ein `CREATE TABLE … AS` bei einem Limit von 3 s rund 15 s lang und
+    committete). Ein Client, der sein Ergebnis abholt, bleibt unter der Uhr: Seine FETCHes warten auf das Ende aller
+    Anweisungen (mit dem DuckDB-2.0-Client geprüft: `remote.query('SELECT * FROM range(30000); CREATE TABLE … AS …')`
+    bekam nach 3 s den Fehler, die Tabelle entstand nicht).
+  * Holt ein Client eine Query erst nach ihrem Limit ab, bekommt er den Fehler des Zeitlimits auch dann, wenn die
+    Engine sie inzwischen beendet hatte, und das Gateway zählt den Abbruch als `cancelled`: Es sieht nicht, ob sie noch
+    lief.
+  * Eine harte Grenze, die kein Client umgehen kann, setzt die Engine selbst: `SET GLOBAL max_execution_time = <ms>`
+    im `initSQL` des Profils, danach `SET lock_configuration = true`. Die Engine bricht dann jede Anweisung nach dieser
+    Zeit ab („Query exceeded maximum execution time“), auch eine beantwortete, und Sessions können den Wert nicht mehr
+    ändern (mit DuckDB 2.0 geprüft). Über `settings` gesetzt, gilt `max_execution_time` nur für die Verbindung des
+    Init-SQL, nicht für die Sessions.
 * **Abbruch:** Das Gateway sendet `CANCEL` mit der `query_uuid`. Die Engine bricht die Query ab und beantwortet die
   Requests, die auf sie warten (PREPARE, FETCH-Long-Polls), mit einem `INTERRUPT`-Fehler, Uploads mit einem Fehler.
   Das Gateway ersetzt diese Fehler durch seinen eigenen, wie jeden Fehler mit HTTP 200 als `ERROR_RESPONSE` (Typ
@@ -562,9 +577,15 @@ Weitere Provider:
 * Das Gateway prüft kein SQL. Autorisierung innerhalb geteilter Engines bleibt Sache der Engine (Init-SQL,
   Rechte der angehängten Daten) oder der Wahl des Share-Levels.
 * Query-Zeitlimit (Abschnitt 5.3): Eine Query, für die gerade kein Request wartet, bricht das Gateway erst beim
-  nächsten Request für sie ab; ein Ergebnis, das nie (zu Ende) abgeholt wird, belegt die Engine bis zur nächsten
-  Query der Session oder bis die Session endet. Scheitert das CANCEL, bekommt der Client den Fehler, die Query kann
-  aber auf der Engine weiterlaufen (`result="failed"`). Das gilt auch für eine Query mit `{0,0}`, nach der schon ein
+  nächsten Request für sie ab. Eine beantwortete Query, die der Client nicht (zu Ende) abholt, kann auf der Engine
+  so lange weiterlaufen, bis sie fertig ist, die nächste Query der Session sie ersetzt oder die Session endet; das
+  gilt auch für die späteren Anweisungen eines PREPARE mit mehreren Anweisungen, und `inline_rows 0` lässt die
+  Engine schon nach dem Planen antworten. Eine harte Grenze gibt `SET GLOBAL max_execution_time` mit
+  `lock_configuration` im `initSQL`. Holt der Client nach dem Limit ab, bekommt er den Fehler und das Gateway zählt
+  `cancelled`, auch wenn die Anweisung schon fertig war. Überlappen sich PREPAREs einer Session (nur Clients, die sie
+  parallel schicken), kann ein FETCH oder Upload bis zum Limit einer anderen Query laufen, die er bedienen kann.
+  Scheitert das CANCEL, bekommt der Client den Fehler, die Query kann aber auf der Engine weiterlaufen
+  (`result="failed"`). Das gilt auch für eine Query mit `{0,0}`, nach der schon ein
   weiteres PREPARE der Session kam (nur Clients, die PREPAREs parallel schicken). Queries und Uploads, die vor einem
   Gateway-Neustart begannen, zählen erst ab dem ersten FETCH danach. Mit `auth.mode: jwt` gelten für Sessions, die
   nach einem Neustart übernommen wurden, keine Overrides nach Gruppen. Eine Session mit 64 Queries, die die Engine

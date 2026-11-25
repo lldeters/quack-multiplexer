@@ -830,6 +830,11 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   * `SET lock_configuration = true` als letzte Anweisung verhindert weitere `SET`s der Sessions, etwa
     `SET GLOBAL threads` oder ein Zurückdrehen von Einstellungen. Clients können sich weiter verbinden und
     abfragen (mit DuckDB 2.0.0 geprüft).
+  * `SET GLOBAL max_execution_time = <ms>` vor `lock_configuration` lässt die Engine jede Anweisung nach dieser
+    Zeit abbrechen („Query exceeded maximum execution time“), auch eine, deren Ergebnis kein Client abholt und die
+    das Query-Zeitlimit des Gateways deshalb nicht trifft (siehe Laufzeit); mit `lock_configuration` können
+    Sessions den Wert nicht ändern (mit DuckDB 2.0.0 geprüft). Ohne `GLOBAL`, also auch über `settings`, gilt er
+    nur für die Verbindung des Init-SQL.
   * `SET enable_external_access = false` gehört **nicht** ins `initSQL`: Die Engine startet dann nicht, weil
     der Entrypoint das Token danach per `getenv()` liest und `quack_serve` selbst Dateizugriff braucht. Nach dem
     Serverstart gesetzt, würde es Datei- und Netzwerkzugriffe und `getenv()` für alle Sessions sperren, ohne den
@@ -839,10 +844,13 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
 * **Laufzeit:** `limits.queryTimeout`, `profiles.<name>.queryTimeout` oder `overrides[].queryTimeout` begrenzen, wie
-  lange eine Query die Engine belegt; danach bricht das Gateway sie ab ([Design, 5.3](../../docs/design.md#53-query-zeitlimit)).
-  Das Abholen des Ergebnisses zählt mit; `COMMIT` und `ROLLBACK` haben kein Limit. Schließt ein Client seine Session,
-  während eine Query läuft, wartet das `DISCONNECT` an die Engine, bis das Limit mit ihr fertig ist (die Engine ließe
-  sie sonst weiterlaufen).
+  lange eine Query laufen darf; danach bricht das Gateway sie ab, sobald ein Request für sie auf die Engine wartet
+  ([Design, 5.3](../../docs/design.md#53-query-zeitlimit)). Das Abholen des Ergebnisses zählt mit; `COMMIT` und
+  `ROLLBACK` haben kein Limit. Schließt ein Client seine Session, während eine Query läuft, wartet das `DISCONNECT`
+  an die Engine, bis das Limit mit ihr fertig ist (die Engine ließe sie sonst weiterlaufen). Eine beantwortete
+  Query, deren Ergebnis kein Client abholt, kann auf der Engine weiterrechnen, bis die nächste Query der Session sie
+  ersetzt oder die Session endet; eine Grenze, die kein Client umgeht, setzt `SET GLOBAL max_execution_time` im
+  `initSQL` (siehe oben).
 * **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
   `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
   Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere

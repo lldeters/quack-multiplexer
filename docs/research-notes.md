@@ -179,4 +179,17 @@ messages against the engine image and runs of the DuckDB 2.0 CLI through the gat
   sent before the PREPARE of its uuid, with a body that arrives after that PREPARE was installed, long-polls a batch
   of that query.
 - **Engine-side alternative.** `SET max_execution_time = <ms>` makes the engine end a query with `INTERRUPT` "Query
-  exceeded maximum execution time"; a client can change it with `SET` unless the configuration is locked.
+  exceeded maximum execution time"; a client can change it with `SET` unless the configuration is locked. Checked
+  with DuckDB 2.0 on 2026-11-25: in the init SQL, a plain `SET max_execution_time = 2000` stays with the init
+  connection (sessions see `0`, a count over 10^11 rows ran 8 s), while `SET GLOBAL max_execution_time = 2000;
+  SET lock_configuration = true` holds for every session: they see `2000`, the count ends after 2.0 s, and their
+  `SET` or `SET GLOBAL` of it fails ("the configuration has been locked"). It also ends a statement that no
+  request waits for: a PREPARE with `inline_rows 0` answered at once, left alone, stopped the engine's work after
+  2 s, and the next FETCH got the engine's error.
+- **Statements that run on after their PREPARE was answered** (checked against DuckDB 2.0, 2026-11-25). The engine
+  runs a statement on a thread of its own: with `inline_rows 0` it answers the PREPARE after planning, and of a SQL
+  text with several statements the later ones run after the answer that carries the first one's rows (a
+  `CREATE TABLE ... AS` after a `SELECT` ran about 15 s with a limit of 3 s and committed, when the client fetched
+  nothing). The fetch stream ends only after the last statement: the stock client, which fetches its result, got
+  the timeout error after 3 s for `remote.query('SELECT * FROM range(30000); CREATE TABLE ... AS ...')`, and the
+  table was not created.
