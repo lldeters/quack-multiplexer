@@ -143,7 +143,9 @@ securityContext:
     drop: [ALL]
 
 # server.shutdownTimeout (30s) bounds the shutdown, plus margin; raise both
-# together.
+# together. The chart refuses a value that is not greater than
+# server.shutdownTimeout: shortly before it the gateway answers the queries
+# that still wait, and the kubelet must not kill it earlier.
 terminationGracePeriodSeconds: 45
 
 # For Prometheus setups that discover targets by annotation.

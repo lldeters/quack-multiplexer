@@ -14,6 +14,7 @@ The pod template carries a checksum of the configuration: the gateway reads
 it once at start-up, so a changed configuration rolls out.
 */ -}}
 {{- include "quackmux.checkHASwitch" . -}}
+{{- include "quackmux.checkGracePeriod" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

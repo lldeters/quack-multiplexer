@@ -256,6 +256,42 @@ spread over nodes.
 {{- end -}}
 
 {{/*
+quackmux.seconds prints a duration of the gateway configuration in whole
+seconds, rounded down, as config.Duration reads it: a Go duration such as
+"30s" or "1m30s", a number of seconds (also as a string), "" or "0" for
+none. Argument: the value; null prints nothing.
+*/}}
+{{- define "quackmux.seconds" -}}
+{{- if kindIs "string" . -}}
+{{- if or (eq . "") (eq . "0") -}}
+0
+{{- else if regexMatch "^[-+]?([0-9]+\\.?[0-9]*|\\.[0-9]+)([eE][-+]?[0-9]+)?$" . -}}
+{{- int64 (floor (float64 .)) -}}
+{{- else -}}
+{{- $t0 := toDate "2006-01-02" "2000-01-01" -}}
+{{- sub (int64 (unixEpoch (mustDateModify . $t0))) (int64 (unixEpoch $t0)) -}}
+{{- end -}}
+{{- else if not (kindIs "invalid" .) -}}
+{{- int64 (floor (float64 .)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+quackmux.checkGracePeriod: the kubelet kills the gateway
+terminationGracePeriodSeconds after SIGTERM. Shortly before
+server.shutdownTimeout the gateway answers the queries that still wait for
+their engine; killed earlier, a request it has read ends without an answer,
+and the client may send the query again. Prints nothing.
+*/}}
+{{- define "quackmux.checkGracePeriod" -}}
+{{- $cfg := fromYaml (include "quackmux.config" .) -}}
+{{- $shutdown := include "quackmux.seconds" (dig "server" "shutdownTimeout" nil $cfg) | default "30" | int64 -}}
+{{- if le (int64 .Values.terminationGracePeriodSeconds) $shutdown -}}
+{{- fail (printf "terminationGracePeriodSeconds %v must be greater than server.shutdownTimeout of the configuration (%ds), with a margin (45 for the default 30s): the kubelet would kill the gateway before it has answered every request it read" .Values.terminationGracePeriodSeconds $shutdown) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 quackmux.checkHASwitch: switching an installed release to ha.enabled must not
 start leaders next to the gateway without leader election that still runs
 (both would manage the engines). The README asks to scale it to 0 first;

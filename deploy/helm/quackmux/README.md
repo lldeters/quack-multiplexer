@@ -84,7 +84,7 @@ zurück.
 | `resources` | Requests 250m/512 MiB, Limits 2 CPU/2 GiB | wie `base` |
 | `readinessProbe`, `livenessProbe` | wie `base` | |
 | `podSecurityContext`, `securityContext` | wie `base` (Pod Security `restricted`) | |
-| `terminationGracePeriodSeconds` | 45 | `server.shutdownTimeout` (30 s) plus Reserve; beide zusammen ändern |
+| `terminationGracePeriodSeconds` | 45 | `server.shutdownTimeout` (30 s) plus Reserve; beide zusammen ändern. Einen Wert, der nicht größer ist als `server.shutdownTimeout`, lehnt das Chart ab: Kurz vorher beantwortet das Gateway die Queries, die noch warten |
 | `podAnnotations`, `podLabels` | `prometheus.io/*`, keine | am Pod-Template |
 | `extraEnv`, `extraVolumes`, `extraVolumeMounts` | keine | etwa ein TLS-Zertifikat für `server.tls` (Beispiel in `values.yaml`) |
 | `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | keine; mit `ha.enabled` eine bevorzugte `podAntiAffinity` | Scheduling des Gateways (nicht der Engines: die stehen im Profil). Die `podAntiAffinity` von `ha.enabled` bleibt neben anderen Regeln wie einer `nodeAffinity`; `affinity.podAntiAffinity` ersetzt sie, `{}` schaltet sie ab |
