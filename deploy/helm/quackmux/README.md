@@ -264,8 +264,10 @@ Ein neues Chart bringt das Gateway-Image seines Releases und dessen Konfiguratio
 ihr Image, bis sie enden; ändert sich ihr Profil, ersetzt das Gateway sie (`engine.replaceOnSpecChange`). Werden
 die neuen Pods nicht ready (eine Konfiguration, die das Gateway ablehnt, ein Image, das sich nicht ziehen lässt),
 bleibt der Rollout mit HA stehen, und die alten Pods bedienen mit ihrer Konfiguration weiter; ohne HA ist das
-Gateway bis zur Korrektur weg (`Recreate`). `helm upgrade --wait` meldet das als Fehler. `helm rollback` stellt
-Konfiguration und Image einer früheren Revision wieder her (mit HA: [Hochverfügbarkeit](#hochverfügbarkeit)).
+Gateway bis zur Korrektur weg (`Recreate`). `helm upgrade --wait` meldet das als Fehler; mit `--atomic` (Helm 3)
+bzw. `--rollback-on-failure` (Helm 4) rollt Helm dann selbst zurück, außer bei einem Wechsel von `ha.enabled`
+([Hochverfügbarkeit](#hochverfügbarkeit)). `helm rollback` stellt Konfiguration und Image einer früheren Revision
+wieder her.
 
 ## Deinstallieren
 

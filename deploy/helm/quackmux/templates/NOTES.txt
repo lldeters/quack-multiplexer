@@ -30,4 +30,6 @@ name. Development only.
 {{- end }}
 
 Engine pods and the data volumes of persistent profiles belong to the gateway,
-not to this release: "helm uninstall" leaves them (README.md, "Deinstallieren").
+not to this release: "helm uninstall" leaves them, and its NetworkPolicies no
+longer protect the engines. Before uninstalling, scale the gateway to 0 and
+delete the engine pods; the data volumes stay (README.md, "Deinstallieren").
