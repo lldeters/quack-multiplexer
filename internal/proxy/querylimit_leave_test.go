@@ -3,13 +3,16 @@ package proxy_test
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"quackmux/internal/metrics"
 	"quackmux/internal/proxy"
+	"quackmux/internal/session"
 	"quackmux/internal/wire"
 )
 
@@ -188,24 +191,48 @@ func TestAbandonedPrepareIsCancelledAtItsLimit(t *testing.T) {
 	mustType(t, h.prepare(c, "SELECT 1", uuidC), wire.TypePrepareResponse)
 }
 
-// The session closes while the gateway's CANCEL is on its way, and the
-// engine refuses the CANCEL then: the query ended with the session, which
-// is no failure to cancel it (the gateway once counted and logged one).
+// The session closes while the gateway's CANCEL is on its way. A client's
+// DISCONNECT reaches the engine only after the engine answered the CANCEL,
+// which therefore still meets the query. A close after which the engine no
+// longer has the connection (its engine is gone) ends the query with it:
+// the engine's refusal of the CANCEL then is no failure to cancel it (the
+// gateway once counted and logged one).
 func TestSessionClosingDuringTheCancel(t *testing.T) {
-	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
-	c := h.connect("tok?user=alice", nil)
-	srv := h.prov.Server(h.sessionEngine(c))
-	srv.CancelDelay = 700 * time.Millisecond
-	srv.CancelError = "something went wrong"
-	answer := make(chan []byte, 1)
-	go func() { answer <- h.prepare(c, "SLEEP 5000", uuidA) }()
-	time.Sleep(500 * time.Millisecond) // the CANCEL left at 300ms
-	mustType(t, h.disconnect(c), wire.TypeSuccessResponse)
-	wait(t, "the PREPARE", answer)
-	waitCancels(t, srv, uuidA) // the engine answered the CANCEL
-	time.Sleep(200 * time.Millisecond)
-	if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
-		t.Fatalf("%v timeouts counted for a query whose session closed", n)
+	for _, tc := range []struct {
+		name  string
+		close func(h *harness, c string)
+	}{
+		{"client disconnect", func(h *harness, c string) { mustType(h.t, h.disconnect(c), wire.TypeSuccessResponse) }},
+		{"engine gone", func(h *harness, c string) {
+			h.sessions.Close(sessionIDOf(h.t, h, c), "engine terminated", session.CloseMode{Force: true, MustInvalidate: true})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+			c := h.connect("tok?user=alice", nil)
+			srv := h.prov.Server(h.sessionEngine(c))
+			srv.CancelDelay = 700 * time.Millisecond
+			gone := tc.name == "engine gone"
+			if gone {
+				srv.CancelError = "something went wrong"
+			}
+			answer := make(chan []byte, 1)
+			go func() { answer <- h.prepare(c, "SLEEP 3000", uuidA) }()
+			time.Sleep(500 * time.Millisecond) // the CANCEL left at 300ms
+			tc.close(h, c)
+			body := wait(t, "the PREPARE", answer)
+			waitCancels(t, srv, uuidA) // the engine answered the CANCEL
+			if gone {
+				time.Sleep(200 * time.Millisecond)
+				if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
+					t.Fatalf("%v timeouts counted for a query whose engine is gone", n)
+				}
+				return
+			}
+			mustTimeout(t, body, "300ms", "limits.queryTimeout")
+			waitTimeouts(t, h.met, "cancelled", 1)
+			disconnectedAfterCancel(t, srv)
+		})
 	}
 }
 
@@ -226,5 +253,76 @@ func TestCancelForAConnectionTheEngineDropped(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
 		t.Fatalf("%v timeouts counted for a query whose engine connection is gone", n)
+	}
+}
+
+// Queries whose cancel the engine refused may still run: the gateway keeps
+// answering their later requests itself, but they do not count toward the
+// bound of the queries it follows (it can do nothing more about them), and
+// of them it keeps only the newest, as many as the bound. 64 of them once
+// made the session refuse every PREPARE until it reconnected; a CANCEL did
+// not help.
+func TestFailedCancelsDoNotFillTheSession(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 50ms}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	srv.CancelError = "the engine is overloaded"
+	n := proxy.MaxSessionQueries + 8
+	for i := 0; i < n; i++ {
+		mustTimeoutFailed(t, h.prepare(c, "SLEEP 150", wire.Hugeint{Upper: 90, Lower: uint64(i + 1)}), "50ms", "limits.queryTimeout")
+	}
+	if _, q := proxy.TrackedQueries(h.gw); q != proxy.MaxSessionQueries {
+		t.Fatalf("%d queries followed after %d failed cancels, want the newest %d", q, n, proxy.MaxSessionQueries)
+	}
+	mustTimeoutFailed(t, h.fetch(c, wire.Hugeint{Upper: 90, Lower: uint64(n)}, 1), "50ms", "limits.queryTimeout")
+	srv.CancelError = ""
+	mustType(t, h.prepare(c, "SELECT 1", uuidA), wire.TypePrepareResponse)
+	if n := requestCount(t, h.met, "too_many_queries"); n != 0 {
+		t.Fatalf("%v requests refused as too_many_queries", n)
+	}
+}
+
+// A DuckDB-like client: one query at a time, 16 read-aheads per query that
+// straggle past the end of the result, executions of prepared statements,
+// catalog queries with the zero uuid, COMMITs, and scans it stops early
+// without a CANCEL. The session never comes near the bound.
+func TestDuckDBLikeClientStaysFarFromTheBound(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 1m}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	most := 0
+	for i := 0; i < 300; i++ {
+		u := wire.Hugeint{Upper: rand.Int64(), Lower: rand.Uint64()}
+		switch i % 5 {
+		case 0: // a catalog query with the zero uuid, answered inline
+			mustType(t, h.prepare(c, "SELECT 1", wire.Hugeint{}), wire.TypePrepareResponse)
+		case 1: // a streamed result read to its end with 16 read-aheads
+			mustType(t, h.prepare(c, "STREAM 20 1", u), wire.TypePrepareResponse)
+			var wg sync.WaitGroup
+			for b := uint64(1); b <= 21; b++ {
+				wg.Add(1)
+				go func() { defer wg.Done(); h.fetch(c, u, b) }()
+				if b%16 == 0 {
+					wg.Wait()
+				}
+			}
+			wg.Wait()
+		case 2: // a scan with LIMIT: two batches, then the next query
+			mustType(t, h.prepare(c, "STREAM 50 1", u), wire.TypePrepareResponse)
+			h.fetch(c, u, 1)
+			h.fetch(c, u, 2)
+		case 3: // an execution of a prepared statement, answered inline
+			mustType(t, h.prepare(c, fmt.Sprintf("SELECT %d", i), u), wire.TypePrepareResponse)
+		case 4:
+			mustType(t, h.prepare(c, "COMMIT", wire.Hugeint{}), wire.TypePrepareResponse)
+		}
+		if _, q := proxy.TrackedQueries(h.gw); q > most {
+			most = q
+		}
+	}
+	if most > 3 {
+		t.Errorf("a client with one query at a time had %d queries followed at once", most)
+	}
+	if n := requestCount(t, h.met, "too_many_queries"); n != 0 {
+		t.Errorf("%v requests refused as too_many_queries", n)
 	}
 }

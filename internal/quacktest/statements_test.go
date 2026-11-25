@@ -145,3 +145,100 @@ func TestSupersede(t *testing.T) {
 		t.Fatal("the first query was not superseded")
 	}
 }
+
+// Like the Quack server, DISCONNECT removes the connection at once but lets
+// the requests of it that are in flight finish: their statement runs on and
+// is interrupted only when the last of them returns. Without a request in
+// flight it is interrupted at once.
+func TestDisconnectWithARequestInFlight(t *testing.T) {
+	s := NewServer("tok")
+	defer s.Close()
+	c := connect(t, s)
+	s.mu.Lock()
+	cn := s.conns[c]
+	s.mu.Unlock()
+	q1 := wire.Hugeint{Upper: 1, Lower: 1}
+	start := time.Now()
+	answer := make(chan []byte, 1)
+	go func() {
+		answer <- post(t, s, wire.PrepareRequest{SQL: "SLEEP 300", QueryUUID: q1}.Encode(wire.Header{ConnectionID: c}))
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s.mu.Lock()
+		running := cn.inFlight == 1 && cn.stmt != nil
+		s.mu.Unlock()
+		if running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the PREPARE did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if msg := errorText(t, post(t, s, wire.EncodeEmpty(wire.Header{Type: wire.TypeDisconnect, ConnectionID: c}))); msg != "" {
+		t.Fatalf("DISCONNECT: %q", msg)
+	}
+	if msg := errorText(t, post(t, s, wire.EncodeCancel(c, q1))); msg != "Invalid connection id" {
+		t.Fatalf("CANCEL after the DISCONNECT: %q", msg)
+	}
+	var b []byte
+	select {
+	case b = <-answer:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the PREPARE did not finish")
+	}
+	if msg := errorText(t, b); msg != "" {
+		t.Fatalf("the PREPARE in flight across the DISCONNECT answered %q", msg)
+	}
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Fatalf("the PREPARE answered after %s, before its statement was over", d)
+	}
+	s.mu.Lock()
+	aborted, reason := cn.stmt.aborted, cn.stmt.reason
+	s.mu.Unlock()
+	if !aborted || reason != msgDisconnected {
+		t.Fatalf("after the last request the statement is aborted=%v (%q)", aborted, reason)
+	}
+
+	c2 := connect(t, s)
+	s.mu.Lock()
+	cn2 := s.conns[c2]
+	s.mu.Unlock()
+	post(t, s, wire.PrepareRequest{SQL: "STREAM 3 60000", QueryUUID: q1}.Encode(wire.Header{ConnectionID: c2}))
+	post(t, s, wire.EncodeEmpty(wire.Header{Type: wire.TypeDisconnect, ConnectionID: c2}))
+	s.mu.Lock()
+	aborted = cn2.stmt.aborted
+	s.mu.Unlock()
+	if !aborted {
+		t.Fatal("a DISCONNECT without a request in flight left the statement running")
+	}
+}
+
+// A SEND_DATA of an UPLOAD statement waits until the statement consumed its
+// batch; a CANCEL interrupts it.
+func TestUploadStatement(t *testing.T) {
+	s := NewServer("tok")
+	defer s.Close()
+	c := connect(t, s)
+	u := wire.Hugeint{Upper: 2, Lower: 2}
+	send := wire.EncodeEmpty(wire.Header{Type: wire.TypeSendDataRequest, ConnectionID: c})
+	post(t, s, wire.PrepareRequest{SQL: "UPLOAD 200", QueryUUID: u}.Encode(wire.Header{ConnectionID: c}))
+	start := time.Now()
+	if msg := errorText(t, post(t, s, send)); msg != "" || time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("SEND_DATA answered %q after %s, want success after the batch was consumed", msg, time.Since(start))
+	}
+	post(t, s, wire.PrepareRequest{SQL: "UPLOAD 60000", QueryUUID: u}.Encode(wire.Header{ConnectionID: c}))
+	answer := make(chan []byte, 1)
+	go func() { answer <- post(t, s, send) }()
+	time.Sleep(100 * time.Millisecond)
+	post(t, s, wire.EncodeCancel(c, u))
+	select {
+	case b := <-answer:
+		if msg := errorText(t, b); msg != MsgCancelled {
+			t.Fatalf("SEND_DATA of a cancelled upload answered %q", msg)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the CANCEL did not interrupt the SEND_DATA")
+	}
+}

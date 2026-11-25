@@ -11,7 +11,9 @@ import (
 // interrupts it with Server.Supersede), CANCEL_REQUEST interrupts it, and
 // FETCH_REQUEST reads the batches of a STREAM statement. Requests that wait
 // for an interrupted statement get its error, like those of the real server
-// (quack_server.cpp, AbortStatement).
+// (quack_server.cpp, AbortStatement). DISCONNECT_MESSAGE removes the
+// connection but interrupts its statement only once no request of the
+// connection is in flight any more (see requestDone).
 
 // Texts of the server's errors around a statement.
 const (
@@ -29,8 +31,10 @@ type statement struct {
 	uuid    wire.Hugeint
 	started time.Time
 	// batches and every describe a STREAM statement: batch i (from 1) is
-	// ready at started + i*every.
+	// ready at started + i*every. An UPLOAD statement takes every to
+	// consume a SEND_DATA.
 	stream  bool
+	upload  bool
 	batches uint64
 	every   time.Duration
 	// done is closed when the statement is interrupted, with reason.
@@ -147,11 +151,38 @@ func (s *Server) fetch(c *conn, body []byte, rec *Received) []byte {
 	return append(head, 0x64, 0x00, 0x01, 0xff, 0xff)
 }
 
-// endStatement interrupts the statement of a connection that goes away.
-func (s *Server) endStatement(c *conn) {
+// sendData answers a SEND_DATA_REQUEST. The request of an UPLOAD statement
+// waits until the statement consumed its batch, as under the server's
+// backpressure; one for an interrupted statement gets its error.
+func (s *Server) sendData(c *conn) []byte {
+	s.mu.Lock()
+	st := c.stmt
+	upload := st != nil && st.upload
+	var took time.Duration
+	if upload {
+		took = st.every
+	}
+	s.mu.Unlock()
+	if upload {
+		if err := s.sleep(st, took); err != nil {
+			return err
+		}
+	}
+	// accept_budget is written with WriteProperty: an unset optional_idx.
+	return append(wire.Header{Type: wire.TypeSendDataResponse}.Encode(),
+		0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xff, 0xff)
+}
+
+// requestDone ends a request of c. The Quack server's handlers hold the
+// connection while they run, and DISCONNECT only removes it from the map of
+// connections: the statement of a connection that DISCONNECT removed runs on
+// while a request of the connection is in flight, and is interrupted when
+// the last one returns (~QuackConnection).
+func (s *Server) requestDone(c *conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if c.stmt != nil {
+	c.inFlight--
+	if c.gone && c.inFlight == 0 && c.stmt != nil {
 		abortLocked(c.stmt, msgDisconnected)
 	}
 }

@@ -886,8 +886,13 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
 * **Laufzeit:** `limits.queryTimeout`, `profiles.<name>.queryTimeout` oder `overrides[].queryTimeout` begrenzen, wie
-  lange eine Query die Engine belegt; danach bricht das Gateway sie ab ([Design, 5.3](../../docs/design.md#53-query-zeitlimit)).
-  Das Abholen des Ergebnisses zählt mit; `COMMIT` und `ROLLBACK` haben kein Limit.
+  lange eine Query laufen darf; danach bricht das Gateway sie ab, sobald ein Request für sie auf die Engine wartet
+  ([Design, 5.3](../../docs/design.md#53-query-zeitlimit)). Das Abholen des Ergebnisses zählt mit; `COMMIT` und
+  `ROLLBACK` haben kein Limit. Schließt ein Client seine Session, während eine Query läuft, wartet das `DISCONNECT`
+  an die Engine, bis das Limit mit ihr fertig ist (die Engine ließe sie sonst weiterlaufen). Eine beantwortete
+  Query, deren Ergebnis kein Client abholt, kann auf der Engine weiterrechnen, bis die nächste Query der Session sie
+  ersetzt oder die Session endet; eine Grenze, die kein Client umgeht, setzt `SET GLOBAL max_execution_time`
+  ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines), „Laufzeit der Engine begrenzen“).
 * **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
   `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
   Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere
@@ -1003,6 +1008,14 @@ Die Teile brauchen einander:
    mit `Authorization callback failed: … quackmux_authorize: not allowed on this engine: "quack_stop"` bzw.
    `… the engine is not hardened yet …; try again`.
 
+**Laufzeit der Engine begrenzen:** `SET GLOBAL max_execution_time = <ms>` vor `SET lock_configuration = true` lässt
+die Engine jede Anweisung nach dieser Zeit abbrechen („Query exceeded maximum execution time“), auch eine, deren
+Ergebnis kein Client abholt und die das Query-Zeitlimit des Gateways deshalb nicht trifft (siehe „Laufzeit“ oben).
+Mit `lock_configuration` können Sessions den Wert nicht ändern. Im gehärteten Profil gehört die Zeile ins
+`postStartSQL` vor `lock_configuration`, ohne Härtung ins `initSQL`, gefolgt von `SET lock_configuration = true`
+(im `initSQL` mit DuckDB 2.0.0 geprüft). Ohne `GLOBAL`, also auch über `settings`, gilt der Wert nur für die
+Verbindung des Init-SQL, nicht für die Sessions.
+
 Mit dem `process`-Provider gilt dasselbe Profil, nur mit dem absoluten Pfad von `images/engine/authorize.sql` im
 `.read`. Dort laufen die Engines als Benutzer des Gateways: Ohne Härtung liest und schreibt jede Session, was
 dieser Benutzer darf (die Konfiguration des Gateways, die Umgebung der anderen Engines samt Token, `~/.duckdbrc`,
@@ -1094,7 +1107,7 @@ Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nic
 | `quackmux: session closed: idle timeout (6h0m0s). DETACH and ATTACH again to reconnect.` | Die Session hat länger als `session.idleTimeout` keine Query geschickt; Heartbeats zählen nicht. `DETACH` und erneut `ATTACH`, oder `session.idleTimeout` erhöhen (`0s` schaltet ab). Verwandte Gründe: `heartbeat lease expired` (der Client war länger als Lease plus `heartbeatGrace` stumm), `max lifetime`, `engine …` (Engine beendet oder ausgefallen). |
 | `INTERRUPT Error: quackmux: the query ran longer than its time limit of 30m0s (profiles.adhoc.queryTimeout) and was cancelled` | Das Query-Zeitlimit ist abgelaufen; die Meldung nennt die Einstellung (`limits.queryTimeout`, `profiles.<name>.queryTimeout` oder `overrides[].queryTimeout`). Die Engine hat den Abbruch bestätigt, die Session bleibt nutzbar. Lief die Query in einer Transaktion (der DuckDB-Client öffnet eine für jede schreibende Anweisung), ist diese abgebrochen, und der Client rollt sie zurück. Das Abholen des Ergebnisses zählt mit, langsame Clients mit großen Ergebnissen brauchen also ein großzügiges Limit. Gateway-Log `query cancelled at its time limit` mit `cancel=cancelled`, Metrik `quackmux_query_timeouts_total{result="cancelled"}`. |
 | `INTERRUPT Error: quackmux: the query ran longer than its time limit of 30m0s (profiles.adhoc.queryTimeout); the gateway could not cancel it on the engine, so it may still be running` | Wie oben, aber das CANCEL ist gescheitert (Engine nicht erreichbar, keine frische Lease, oder die Query hatte `query_uuid {0,0}` und nach ihr kam schon ein weiteres PREPARE der Session). Die Query kann auf der Engine weiterlaufen und belegt sie, bis die nächste Query der Session sie ersetzt oder die Session endet. Gateway-Log mit `cancel=failed` und `err`, Metrik `quackmux_query_timeouts_total{result="failed"}`. Eine schreibende Anweisung erst wiederholen, wenn klar ist, ob sie geschrieben hat. |
-| `quackmux: the session has 64 queries that are not over, the most the gateway follows; it did not forward this request. Cancel those queries or reconnect.` | Nur mit Query-Zeitlimit: Die Session hat 64 Queries, die die Engine noch ausführen kann, weil der Client viele PREPAREs zugleich offen hat (der DuckDB-Client tut das nicht). Das Gateway leitet dann keine weiteren weiter, statt eine laufende Query zu vergessen und ihr Limit zu verlieren. Ein CANCEL des Clients beendet die beantworteten Queries, `DETACH` und `ATTACH` öffnet eine neue Session. Metrik `quackmux_requests_total{outcome="too_many_queries"}`. Der Request lief nicht. |
+| `quackmux: the session has 64 queries that are not over, the most the gateway follows; it did not forward this request. Cancel those queries or reconnect.` | Nur mit Query-Zeitlimit: Die Session hat 64 Queries, die die Engine noch ausführen kann, weil der Client viele PREPAREs zugleich offen hat (der DuckDB-Client tut das nicht). Das Gateway leitet dann keine weiteren weiter, statt eine laufende Query zu vergessen und ihr Limit zu verlieren. Queries, deren Abbruch scheiterte, zählen nicht mit. Ein CANCEL des Clients beendet die beantworteten Queries, die übrigen enden mit ihrer Antwort oder ihrem Limit; `DETACH` und `ATTACH` öffnet eine neue Session. Metrik `quackmux_requests_total{outcome="too_many_queries"}`. Der Request lief nicht. |
 | `quackmux: session closed: the engine no longer knows this connection. DETACH and ATTACH again to reconnect.` | Nach einem Neustart oder einer Übernahme fand das Gateway die Verbindung des Clients nicht mehr auf seiner Engine: Die Engine hat inzwischen neu gestartet, oder der Client war länger fort als die Engine-Lease seiner Verbindung (`session.backendHeartbeatTimeout`), und die Engine hat sie entfernt ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). `DETACH` und erneut `ATTACH`. |
 | Gateway-Log: `cannot list the connections of a recovered engine: its orphaned connections stay open` | Das Gateway kann die verwaisten Verbindungen dieser Engine nicht schließen; sie bleiben bis zum Ende der Engine. Mit `hint` zu 2048: Die Engine hat mehr als 2048 Verbindungen. Sonst war die Engine nicht erreichbar. |
 | Gateway-Log: `not closing orphaned connections: the authorization function of the engine refuses the listing` | Die gehärtete Engine läuft mit `quackmux_authorize` (oder einem älteren oder eigenen Makro), das das Listing ablehnt; ihre verwaisten Verbindungen bleiben bis zum Ende der Engine. Erreicht außer dem Gateway niemand ihren Port, lässt `quackmux_authorize_listing` das Listing durch ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)). |

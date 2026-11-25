@@ -45,6 +45,9 @@ overrides:
 			t.Errorf("%s: QueryTimeout(%s, %v, %s) = %s, %s, want %s, %s", tc.name, tc.user, tc.groups, tc.profile,
 				got, source, tc.want, tc.source)
 		}
+		if got := QueryTimeoutLimit(c, tc.user, tc.groups, tc.profile); got != tc.want {
+			t.Errorf("%s: QueryTimeoutLimit(%s, %v, %s) = %s, want %s", tc.name, tc.user, tc.groups, tc.profile, got, tc.want)
+		}
 	}
 }
 

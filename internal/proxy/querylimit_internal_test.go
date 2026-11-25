@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,7 +35,7 @@ func newTestLimits(t *testing.T, adopted bool) (*queryLimits, *session.Session) 
 	l := newQueryLimits(g)
 	s := &session.Session{ID: "s1", User: "alice", Adopted: adopted}
 	l.sessions[s.ID] = &sessionQueries{sess: s, adopting: adopted}
-	t.Cleanup(func() { l.sessionClosed(s) }) // stops the timers
+	t.Cleanup(func() { l.sessionClosed(s, false) }) // stops the timers
 	return l, s
 }
 
@@ -61,7 +63,7 @@ func TestEnforcementOfAQueryThatEndsMeanwhile(t *testing.T) {
 		name string
 		end  func(l *queryLimits, s *session.Session, q *trackedQuery)
 	}{
-		{"session closed", func(l *queryLimits, s *session.Session, _ *trackedQuery) { l.sessionClosed(s) }},
+		{"session closed", func(l *queryLimits, s *session.Session, _ *trackedQuery) { l.sessionClosed(s, false) }},
 		{"query ended", func(l *queryLimits, _ *session.Session, q *trackedQuery) {
 			l.mu.Lock()
 			l.endLocked(q)
@@ -246,7 +248,7 @@ func TestRunningQueryIsNeverForgotten(t *testing.T) {
 	running = l2.testPrepare(t, s2, wire.Hugeint{Upper: 1})
 	running.finish(evResult)
 	for i := 1; i < maxSessionQueries; i++ {
-		in := &countingReader{size: 100} // nothing of it sent yet
+		in := &bodyGate{size: 100} // nothing of it sent yet
 		r, err := l2.beginPrepare(context.Background(), s2, wire.OptionalIdx{}, wire.Hugeint{Upper: 2, Lower: uint64(i)}, true, false, func() {}, in)
 		if r == nil || err != nil {
 			t.Fatalf("PREPARE %d: %v, %v", i, r, err)
@@ -352,5 +354,177 @@ func TestEndsTransaction(t *testing.T) {
 		if got := endsTransaction(body[n:]); got != want {
 			t.Errorf("endsTransaction(%q) = %v, want %v", sql, got, want)
 		}
+	}
+}
+
+// FETCHes that no query claims change hands while their handlers look at
+// them: a PREPARE of their uuid takes them, and they move on when its query
+// ends. All of it happens under the lock (run with -race). At most
+// prepareSlots PREPAREs are open at once, well below maxSessionQueries:
+// more would be refused, rightly, with errTooManyQueries.
+func TestStraysChangeHandsSafely(t *testing.T) {
+	const prepareSlots = maxSessionQueries / 2
+	l, s := newTestLimits(t, false)
+	l.testPrepare(t, s, wire.Hugeint{Upper: 99}) // unanswered, so nothing replaces it: the state stays
+	slots := make(chan struct{}, prepareSlots)
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		u := wire.Hugeint{Upper: 5, Lower: uint64(i % 3)}
+		f, local, err := l.beginReading(context.Background(), s, &u, true, func() {})
+		if f == nil || local != nil || err != nil {
+			t.Fatalf("FETCH %d: %v, %v, %v", i, f, local, err)
+		}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			f.timeoutError()
+			f.outlivesClient()
+			f.finish(evBatch)
+		}()
+		go func() {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			p, err := l.beginPrepare(context.Background(), s, wire.OptionalIdx{}, u, true, false, func() {}, nil)
+			if err != nil || p == nil {
+				t.Errorf("PREPARE %d: %v, %v", i, p, err)
+				return
+			}
+			p.finish(evResult)
+			l.mu.Lock()
+			l.endLocked(p.q)
+			l.mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if sq := l.sessions[s.ID]; sq == nil || len(sq.strays) != 0 {
+		t.Fatalf("state after the FETCHes: %+v", sq)
+	}
+}
+
+// A FETCH or an upload in flight moves on to the next query it may serve
+// when its query ends. If that query passed its limit while the engine did
+// not work for it, the gateway enforces the limit then, as at a later
+// request of the query; if the gateway is done with that query at its
+// limit, it cuts the request off. The gateway once only counted the request
+// for such a query: nothing cancelled the query, and the engine served the
+// request past the limit.
+func TestRequestHandedToAQueryPastItsLimit(t *testing.T) {
+	for _, gaveUp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gaveUp=%v", gaveUp), func(t *testing.T) {
+			l, s := newTestLimits(t, false)
+			l.g.met = metrics.New()
+			var fresh atomic.Bool
+			fresh.Store(true)
+			l.g.fence = fresh.Load
+			// Two PREPAREs in flight at once: the engine may run either last,
+			// so neither result ends the other query.
+			a, b := wire.Hugeint{Upper: 1}, wire.Hugeint{Upper: 2}
+			q := l.testPrepare(t, s, a)
+			p := l.testPrepare(t, s, b)
+			p.finish(evResult)
+			q.finish(evResult)
+			aborted := make(chan struct{})
+			up, _, err := l.beginReading(context.Background(), s, nil, false, sync.OnceFunc(func() { close(aborted) }))
+			if up == nil || up.q != p.q || err != nil {
+				t.Fatalf("upload: %+v, %v; want it counted for the newest query", up, err)
+			}
+			l.expire(q.q) // no request of q waits: it rests at its limit
+			// Without a fresh lease the gateway gives up on a CANCEL at once
+			// (these tests have no engines).
+			fresh.Store(false)
+			if gaveUp {
+				// A FETCH of q after its limit: the gateway enforces it and
+				// answers the FETCH itself.
+				if f, local, err := l.beginReading(context.Background(), s, &a, true, func() {}); f != nil || local != q.q || err != nil {
+					t.Fatalf("FETCH after the limit: %+v, %v, %v; want the timeout error of the query", f, local, err)
+				}
+			}
+			// The client cancels the newest query: the upload moves to q.
+			c := l.beginCancel(s, b)
+			c.finish(evAnswered)
+			select {
+			case <-aborted:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the upload was not cut off")
+			}
+			l.mu.Lock()
+			owner, timedOut := up.q, q.q.timedOut
+			l.mu.Unlock()
+			if owner != q.q || !timedOut {
+				t.Fatalf("the upload counts for %p (want %p), the query timed out: %v", owner, q.q, timedOut)
+			}
+			// One enforcement in all: at the handover, or at the FETCH.
+			deadline := time.Now().Add(10 * time.Second)
+			for testCounter(t, l.g.met, "quackmux_query_timeouts_total") != 1 {
+				if time.Now().After(deadline) {
+					t.Fatal("the gateway did not count the timeout of the query")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if n := testCounter(t, l.g.met, "quackmux_query_timeouts_total"); n != 1 {
+				t.Fatalf("%v timeouts counted, want 1", n)
+			}
+		})
+	}
+}
+
+// At the bound the gateway forgets queries whose cancel the engine
+// confirmed. Their FETCHes and uploads in flight move on to the queries
+// they may serve, as those of a query that ends: the engine may serve them
+// for a later statement. The gateway once left them with the forgotten
+// query, so the query that the engine served them for did not count them.
+func TestRequestsOfAForgottenQueryMoveOn(t *testing.T) {
+	l, s := newTestLimits(t, false)
+	u := wire.Hugeint{Upper: 1}
+	old := l.testPrepare(t, s, u)
+	old.finish(evResult)
+	f, _, err := l.beginReading(context.Background(), s, &u, true, func() {}) // its body comes slowly
+	if f == nil || f.q != old.q || err != nil {
+		t.Fatalf("FETCH: %+v, %v", f, err)
+	}
+	l.mu.Lock()
+	old.q.timedOut = true // as an enforcement leaves it once the engine confirmed the CANCEL
+	l.mu.Unlock()
+	for i := 1; i < maxSessionQueries; i++ {
+		r := l.testPrepare(t, s, wire.Hugeint{Upper: 2, Lower: uint64(i)})
+		r.finish(evFailed) // the engine may run it: it counts toward the bound
+	}
+	next := l.testPrepare(t, s, u) // makes room: the gateway forgets old
+	l.mu.Lock()
+	owner, forgotten := f.q, old.q.ended
+	_, waits := next.q.waiting[f]
+	l.mu.Unlock()
+	if !forgotten {
+		t.Fatal("the gateway did not forget the query whose cancel the engine confirmed")
+	}
+	if owner != next.q || !waits {
+		t.Fatalf("the FETCH counts for %p (waits %v), want the next query with its uuid %p", owner, waits, next.q)
+	}
+}
+
+// In a session adopted after a restart, the gateway follows a query from
+// before the restart from its first FETCH on. An upload in flight may serve
+// that query, so it takes the upload, as any query takes the strays it may
+// serve.
+func TestAdoptedQueryTakesStrays(t *testing.T) {
+	l, s := newTestLimits(t, true)
+	up, _, err := l.beginReading(context.Background(), s, nil, false, func() {})
+	if up == nil || up.q != nil || err != nil {
+		t.Fatalf("upload: %+v, %v; want a stray", up, err)
+	}
+	u := wire.Hugeint{Upper: 1}
+	f, _, err := l.beginReading(context.Background(), s, &u, true, func() {})
+	if f == nil || f.q == nil || !f.q.adopted || err != nil {
+		t.Fatalf("FETCH: %+v, %v; want it to adopt a query", f, err)
+	}
+	l.mu.Lock()
+	owner := up.q
+	l.mu.Unlock()
+	if owner != f.q {
+		t.Fatalf("the upload counts for %p, want the adopted query %p", owner, f.q)
 	}
 }

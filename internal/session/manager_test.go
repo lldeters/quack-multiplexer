@@ -1,8 +1,11 @@
 package session
 
 import (
+	"context"
 	"log/slog"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,8 +39,10 @@ func (stubEngines) Exists(string) (engine.State, bool)   { return "", false }
 func (stubEngines) AttachAdopted(string, string, string) {}
 func (stubEngines) DetachSession(string)                 {}
 
-// The close hook runs once for every session that closes.
-func TestCloseHook(t *testing.T) {
+// newTestManager returns a manager for tests whose sessions are on engine
+// e1 of engines.
+func newTestManager(t *testing.T, engines Engines, backend Backend) (*Manager, func() *Session) {
+	t.Helper()
 	cfg, err := config.Parse([]byte("auth: {mode: none}\nprofiles: {default: {}}\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -46,10 +51,9 @@ func TestCloseHook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := NewManager(cfg, stubEngines{}, nil, sealer, slog.New(slog.DiscardHandler), nil)
-	var closed []string
-	m.SetCloseHook(func(s *Session) { closed = append(closed, s.ID) })
+	m := NewManager(cfg, engines, backend, sealer, slog.New(slog.DiscardHandler), nil)
 	open := func() *Session {
+		t.Helper()
 		r, err := m.Reserve("alice", 0)
 		if err != nil {
 			t.Fatal(err)
@@ -61,6 +65,20 @@ func TestCloseHook(t *testing.T) {
 		}
 		return s
 	}
+	return m, open
+}
+
+// The close hook runs once for every session that closes.
+func TestCloseHook(t *testing.T) {
+	m, open := newTestManager(t, stubEngines{}, nil)
+	var closed []string
+	m.SetCloseHook(func(s *Session, keep bool) <-chan struct{} {
+		if keep {
+			t.Errorf("close of %s: keep without an engine to disconnect", s.ID)
+		}
+		closed = append(closed, s.ID)
+		return nil
+	})
 	a, b := open(), open()
 	if !m.Close(a.ID, "admin", CloseMode{Force: true}) || m.Close(a.ID, "admin", CloseMode{Force: true}) {
 		t.Fatal("the first close must succeed, the second must not")
@@ -68,5 +86,132 @@ func TestCloseHook(t *testing.T) {
 	m.EngineGone("e1", "engine terminated")
 	if len(closed) != 2 || closed[0] != a.ID || closed[1] != b.ID {
 		t.Fatalf("hook saw %v, want [%s %s]", closed, a.ID, b.ID)
+	}
+}
+
+// liveEngines has engine e1.
+type liveEngines struct{ stubEngines }
+
+func (liveEngines) Lookup(id string) (engine.Target, bool) {
+	return engine.Target{ID: id, Endpoint: "http://e1.invalid"}, id == "e1"
+}
+
+// recordingBackend records the control messages the manager sends.
+type recordingBackend struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (b *recordingBackend) add(msg string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sent = append(b.sent, msg)
+	return nil
+}
+
+func (b *recordingBackend) messages() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.sent...)
+}
+
+func (b *recordingBackend) Disconnect(context.Context, string, string) error {
+	return b.add("DISCONNECT")
+}
+
+func (b *recordingBackend) CancelAll(context.Context, string, string) error { return b.add("CANCEL") }
+
+func (b *recordingBackend) Heartbeat(context.Context, string, string) error {
+	return b.add("HEARTBEAT")
+}
+
+func (b *recordingBackend) Connections(context.Context, string, string) ([]string, error) {
+	return nil, b.add("LIST")
+}
+
+// A close hook can hold the DISCONNECT of a closed session's engine
+// connection: the manager sends the CANCEL of the close at once, the
+// DISCONNECT once the hook's channel is closed, and renews the lease of the
+// connection meanwhile. A connection the engine no longer has is not held,
+// and Shutdown does not wait for a hold.
+func TestCloseHookHoldsTheDisconnect(t *testing.T) {
+	b := &recordingBackend{}
+	m, open := newTestManager(t, liveEngines{}, b)
+	m.cfg.Session.BackendHeartbeatTimeout.Duration = 300 * time.Millisecond // a keep-alive every 100ms
+	release := make(chan struct{})
+	var kept []bool
+	m.SetCloseHook(func(_ *Session, keep bool) <-chan struct{} {
+		kept = append(kept, keep)
+		if keep {
+			return release
+		}
+		return nil
+	})
+
+	m.Close(open().ID, "admin", CloseMode{Disconnect: true, Cancel: true, Force: true})
+	time.Sleep(500 * time.Millisecond)
+	sent := b.messages()
+	if len(sent) < 2 || sent[0] != "CANCEL" || slices.Contains(sent, "DISCONNECT") {
+		t.Fatalf("while the hook holds the session: %v, want CANCEL and keep-alives", sent)
+	}
+	for _, msg := range sent[1:] {
+		if msg != "HEARTBEAT" {
+			t.Fatalf("while the hook holds the session: %v, want CANCEL and keep-alives", sent)
+		}
+	}
+	close(release)
+	m.Wait()
+	if sent := b.messages(); sent[len(sent)-1] != "DISCONNECT" {
+		t.Fatalf("after the release: %v, want the DISCONNECT last", sent)
+	}
+
+	b.sent = nil
+	m.ClosedByBackend(open(), "Invalid connection id")
+	m.Wait()
+	if sent := b.messages(); len(kept) != 2 || kept[1] || !slices.Equal(sent, []string{"DISCONNECT"}) {
+		t.Fatalf("a connection the engine dropped: keep=%v, sent %v", kept, sent)
+	}
+
+	b.sent = nil
+	release = make(chan struct{}) // never closed
+	m.Close(open().ID, "client disconnect", CloseMode{Disconnect: true, Force: true})
+	m.Shutdown()
+	if sent := b.messages(); len(kept) != 3 || !kept[2] || len(sent) == 0 || sent[len(sent)-1] != "DISCONNECT" {
+		t.Fatalf("at shutdown: keep=%v, sent %v, want the held DISCONNECT", kept, sent)
+	}
+}
+
+// A session whose DISCONNECT the close hook holds stays closed beyond the
+// TTL of its tombstone: the engine still has its connection and would
+// confirm it to an adoption. Once the DISCONNECT went out, the tombstone
+// expires as usual.
+func TestHeldSessionStaysClosed(t *testing.T) {
+	m, _ := newTestManager(t, liveEngines{}, &recordingBackend{})
+	var mu sync.Mutex
+	now := time.Now()
+	m.SetClock(func() time.Time { mu.Lock(); defer mu.Unlock(); return now })
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	release := make(chan struct{})
+	m.SetCloseHook(func(*Session, bool) <-chan struct{} { return release })
+	r, err := m.Reserve("alice", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, id, err := r.Open(OpenParams{SessionID: NewSessionID(), User: "alice", EngineID: "e1",
+		BackendConnID: strings.Repeat("A", 32), HeartbeatTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Close(s.ID, "client disconnect", CloseMode{Disconnect: true, Force: true})
+	advance(m.cfg.Session.TombstoneTTL.Duration + time.Minute)
+	m.Reap()
+	if _, c, err := m.Resolve(id); err != nil || c == nil || c.Reason != "client disconnect" {
+		t.Fatalf("a held session past the TTL of its tombstone: %+v, %v; want it closed by the client", c, err)
+	}
+	close(release)
+	m.Wait()
+	m.Reap()
+	if _, c, err := m.Resolve(id); err != nil || c == nil || c.Reason == "client disconnect" {
+		t.Fatalf("after the DISCONNECT: %+v, %v; want the tombstone expired", c, err)
 	}
 }

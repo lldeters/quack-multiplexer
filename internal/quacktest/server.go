@@ -10,6 +10,9 @@
 //	STREAM <n> <ms> answers at once that there is more to fetch; FETCH reads
 //	                n batches, batch i is ready i*<ms> milliseconds after the
 //	                PREPARE (see statements.go)
+//	UPLOAD <ms>     answers at once that there is more to fetch, and takes
+//	                <ms> milliseconds to consume each SEND_DATA (a CANCEL or
+//	                the next PREPARE interrupts it)
 //	FAIL <message>  answers with an ERROR_RESPONSE
 //	BLOB <bytes>    answers with a PREPARE_RESPONSE followed by <bytes> filler
 //	                bytes (to exercise streaming of large bodies)
@@ -55,7 +58,12 @@ type conn struct {
 	heartbeatTimeout time.Duration
 	lastRenewed      time.Time
 	expired          bool
-	stmt             *statement // guarded by Server.mu
+	// The fields below are guarded by Server.mu.
+	stmt *statement
+	// inFlight counts the requests of the connection being handled; gone
+	// marks a connection that DISCONNECT removed (see requestDone).
+	inFlight int
+	gone     bool
 }
 
 // HeartbeatTimeouts returns the lease each live connection negotiated.
@@ -242,16 +250,21 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 		return errorResponse("Connection heartbeat lease expired"), 0
 	}
 	c.lastRenewed = now
+	c.inFlight++
 	s.mu.Unlock()
+	defer s.requestDone(c)
 	if resp, ok := s.listConnections(h, body[n:], &rec); ok {
 		return resp, 0
 	}
 
 	switch h.Type {
 	case wire.TypeDisconnect:
-		s.endStatement(c)
+		// Like the Quack server, DISCONNECT only forgets the connection:
+		// requests that are in flight go on, and the statement ends with the
+		// last of them (see requestDone).
 		s.mu.Lock()
 		delete(s.conns, h.ConnectionID)
+		c.gone = true
 		s.mu.Unlock()
 		return wire.EncodeEmpty(wire.Header{Type: wire.TypeSuccessResponse}), 0
 	case wire.TypeHeartbeatRequest, wire.TypeAcknowledgement:
@@ -259,9 +272,7 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 	case wire.TypeCancelRequest:
 		return s.cancel(c, body[n:], &rec), 0
 	case wire.TypeSendDataRequest:
-		// accept_budget is written with WriteProperty: an unset optional_idx.
-		return append(wire.Header{Type: wire.TypeSendDataResponse}.Encode(),
-			0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xff, 0xff), 0
+		return s.sendData(c), 0
 	case wire.TypeFetchRequest:
 		return s.fetch(c, body[n:], &rec), 0
 	case wire.TypePrepareRequest:
@@ -302,6 +313,11 @@ func (s *Server) runQuery(c *conn, p wire.PrepareRequest) ([]byte, int) {
 	case "STREAM":
 		s.mu.Lock()
 		st.stream, st.batches, st.every = true, uint64(max(argN(1), 0)), time.Duration(argN(2))*time.Millisecond
+		s.mu.Unlock()
+		return prepareResponse(p.QueryUUID, true), 0
+	case "UPLOAD":
+		s.mu.Lock()
+		st.upload, st.every = true, time.Duration(arg())*time.Millisecond
 		s.mu.Unlock()
 		return prepareResponse(p.QueryUUID, true), 0
 	case "FAIL":

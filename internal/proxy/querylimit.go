@@ -37,13 +37,26 @@ import (
 //     for a FETCH the engine certainly decoded, an error;
 //   - a CANCEL of the client for it (or for whatever runs) succeeds that the
 //     gateway forwarded after its PREPARE was answered;
-//   - the session closes.
+//   - the session closes, and the gateway is done with its queries (see
+//     below).
 //
 // Answers to requests that the gateway forwarded while the PREPARE still
 // waited prove nothing: the engine may not have made the query its
 // statement yet, and they may be about the statement before. The gateway
 // waits for the answer to a PREPARE also when its client goes away: the
-// engine runs the query anyway.
+// engine runs the query anyway. (Without a fresh lease it lets go of such a
+// PREPARE at the limit, and cancels the query once the lease is fresh.)
+//
+// The engine gets a request only once all of it arrived, and then serves
+// the statement the connection has. A FETCH or an upload that no query of
+// the session claims when the gateway forwards it (its body may come
+// slowly) therefore counts as a request of the first query the gateway
+// begins to follow afterwards that it may serve: a FETCH one with its uuid,
+// an upload any query. So do the requests of a query that ends while they
+// are in flight, or that the gateway forgets, for the next query they may
+// serve; if that query already passed its limit, the gateway cancels it
+// then, as at its next request. A statement without a limit (see below)
+// claims no FETCH or upload: it has no clock that could stop one.
 //
 // The gateway cannot see whether a client still wants a query that it does
 // not ask anything for: an answered PREPARE may carry the whole result
@@ -66,6 +79,15 @@ import (
 // the gateway is done with the query: a CANCEL could otherwise meet them.
 // COMMIT and ROLLBACK have no limit: DuckDB does not interrupt a commit, and
 // the engine would report it as interrupted although it committed.
+//
+// The Quack server lets the requests of a connection that are in flight
+// finish after a DISCONNECT, and their statement runs on with them, while a
+// CANCEL no longer reaches it. When a session closes while the limit may
+// still have to cancel a query of it, the gateway therefore keeps following
+// the session's queries and holds the DISCONNECT to the engine until it is
+// done with them (the client's DISCONNECT is answered at once all the same).
+// Requests of the session that it has not forwarded yet are not forwarded
+// any more.
 
 // msgCancelOther starts the engine's answer to a CANCEL for a query that is
 // not the statement of the connection (quack_server.cpp).
@@ -91,7 +113,10 @@ const (
 // that the engine may still run, or the client could stop its clock: at the
 // bound it forgets only queries whose cancel the engine confirmed, and
 // otherwise does not forward a further PREPARE (or a FETCH that would adopt
-// a query) but answers it with an error.
+// a query) but answers it with an error. Queries whose cancel failed (the
+// gateway gave up on them) do not count: it can do nothing more about them
+// and keeps them only to answer their later requests itself, at most this
+// many, the newest.
 const maxSessionQueries = 64
 
 // fenceRetry is how soon the gateway looks again at a limit that passed
@@ -109,6 +134,11 @@ var errNotFresh = errors.New("this gateway does not hold a fresh lease")
 // errTooManyQueries reports a request the gateway does not forward because
 // it follows maxSessionQueries queries of the session already.
 var errTooManyQueries = errors.New("too many queries of the session are not over")
+
+// errSessionClosed reports a request the gateway does not forward because
+// its session closed after the request arrived: forwarded now, it could keep
+// a query of the session running on the engine past the DISCONNECT.
+var errSessionClosed = errors.New("the session is closed")
 
 // tooManyQueriesMessage is the client's error for errTooManyQueries.
 var tooManyQueriesMessage = fmt.Sprintf("quackmux: the session has %d queries that are not over, the most the "+
@@ -138,6 +168,13 @@ type sessionQueries struct {
 	// a uuid the gateway does not know then starts following that query. It
 	// ends once the engine has shown what it runs.
 	adopting bool
+	// closed is set once the session closed; hold, while set, holds its
+	// DISCONNECT to the engine (see sessionClosed).
+	closed bool
+	hold   chan struct{}
+	// strays are the FETCHes and uploads in flight that no query claims
+	// (see strayLocked).
+	strays map[*queryRequest]struct{}
 }
 
 // trackedQuery is one query of a session.
@@ -176,7 +213,11 @@ type queryRequest struct {
 	l    *queryLimits
 	sess *session.Session
 	kind wire.MessageType
-	q    *trackedQuery // nil for CANCEL_REQUEST
+	q    *trackedQuery // nil for CANCEL_REQUEST and a stray; guarded by queryLimits.mu
+	// sq follows a stray (a FETCH or an upload that no query claims), uuid
+	// is the uuid of a FETCH.
+	sq   *sessionQueries
+	uuid wire.Hugeint
 	// ends are the queries a CANCEL_REQUEST of the client ends once the
 	// engine confirms it: those it names whose PREPARE had been answered when
 	// the gateway forwarded it.
@@ -188,7 +229,10 @@ type queryRequest struct {
 	// its query still waited.
 	early bool
 	abort context.CancelFunc // cancels the request to the engine
-	body  *countingReader    // the body of a PREPARE_REQUEST
+	body  *bodyGate          // the body of a PREPARE_REQUEST
+	// client is the context of the client's request of a PREPARE that
+	// outlives its client (outlivesClient).
+	client context.Context
 }
 
 // requestEvent is how the engine answered a followed request.
@@ -219,16 +263,25 @@ func newQueryLimits(g *Gateway) *queryLimits {
 }
 
 // limitFor resolves the time limit of the queries of s (0: none) and the
-// setting it comes from. A session adopted after a restart carries no
-// groups; the authenticator may know them.
+// setting it comes from.
 func (l *queryLimits) limitFor(s *session.Session) (time.Duration, string) {
-	groups := s.Groups
-	if s.Adopted && groups == nil {
+	return policy.QueryTimeout(l.g.cfg, s.User, l.groupsOf(s), s.EngineKey.Profile)
+}
+
+// limited reports whether the queries of s have a time limit.
+func (l *queryLimits) limited(s *session.Session) bool {
+	return policy.QueryTimeoutLimit(l.g.cfg, s.User, l.groupsOf(s), s.EngineKey.Profile) > 0
+}
+
+// groupsOf returns the groups of s. A session adopted after a restart
+// carries none; the authenticator may know them.
+func (l *queryLimits) groupsOf(s *session.Session) []string {
+	if s.Adopted && s.Groups == nil {
 		if gl, ok := l.g.auth.(auth.GroupLookup); ok {
-			groups = gl.GroupsOf(s.User)
+			return gl.GroupsOf(s.User)
 		}
 	}
-	return policy.QueryTimeout(l.g.cfg, s.User, groups, s.EngineKey.Profile)
+	return s.Groups
 }
 
 // fresh reports whether the gateway may act on engines (see Options.Fence).
@@ -282,75 +335,255 @@ func (l *queryLimits) endLocked(q *trackedQuery) {
 			break
 		}
 	}
+	l.rehomeWaitingLocked(q)
 	l.forgetIdleLocked(sq)
 }
 
+// rehomeWaitingLocked hands the FETCHes and uploads in flight of q, which
+// the gateway no longer follows, to the queries they may serve next: the
+// engine may serve them for a later statement.
+func (l *queryLimits) rehomeWaitingLocked(q *trackedQuery) {
+	for r := range q.waiting {
+		if r.kind != wire.TypePrepareRequest {
+			delete(q.waiting, r)
+			l.rehomeLocked(q.sq, r)
+		}
+	}
+}
+
+// rehomeLocked hands a FETCH or an upload in flight to the newest query of
+// sq that it may serve (a FETCH: one with its uuid), or makes it a stray.
+// Its answer ends nothing: it may be about another statement.
+func (l *queryLimits) rehomeLocked(sq *sessionQueries, r *queryRequest) {
+	r.early = true
+	for i := len(sq.queries) - 1; i >= 0; i-- {
+		if o := sq.queries[i]; o.mayServe(r) {
+			l.claimLocked(o, r)
+			return
+		}
+	}
+	r.q = nil
+	l.addStrayLocked(sq, r)
+}
+
+// mayServe reports whether the engine may serve r, a FETCH or an upload, for
+// q: q has a limit, and a FETCH has its uuid.
+func (q *trackedQuery) mayServe(r *queryRequest) bool {
+	return q.limit > 0 && (r.kind != wire.TypeFetchRequest || (q.uuidKnown && q.uuid == r.uuid))
+}
+
+// claimLocked makes r, a FETCH or an upload in flight that q may serve, a
+// request of q. The engine may work for q then. If the limit of q passed
+// while it did not, the gateway enforces the limit now, as at a request that
+// comes later (beginReading); once the gateway is done with q at its limit
+// (or gave up on it), it cuts r off, and r's client gets the timeout error,
+// as later requests of q do.
+func (l *queryLimits) claimLocked(q *trackedQuery, r *queryRequest) {
+	r.q, r.sq = q, nil
+	q.waiting[r] = struct{}{}
+	switch {
+	case q.expired:
+		e := l.startLocked(q)
+		go l.run(q, e)
+	case q.timedOut && (q.failed || !q.enforcing):
+		// An enforcement that runs aborts its requests itself if the CANCEL
+		// fails; one that succeeds makes the engine answer them.
+		go r.abort()
+	}
+}
+
+// addStrayLocked follows r as a stray of sq.
+func (l *queryLimits) addStrayLocked(sq *sessionQueries, r *queryRequest) {
+	r.sq = sq
+	if sq.strays == nil {
+		sq.strays = map[*queryRequest]struct{}{}
+	}
+	sq.strays[r] = struct{}{}
+}
+
+// homeLocked hands q the strays of its session that it may serve: uploads,
+// and FETCHes with its uuid (none without a limit: nothing to enforce).
+func (l *queryLimits) homeLocked(q *trackedQuery) {
+	sq := q.sq
+	for r := range sq.strays {
+		if q.mayServe(r) {
+			delete(sq.strays, r)
+			l.claimLocked(q, r)
+		}
+	}
+}
+
 // forgetIdleLocked drops the state of a session that has nothing left to
-// follow. An adopted session keeps it once it no longer adopts queries.
+// follow. An adopted session keeps it once it no longer adopts queries. A
+// closed session keeps it, and its DISCONNECT waits, only while the limit
+// may still have to cancel one of its queries.
 func (l *queryLimits) forgetIdleLocked(sq *sessionQueries) {
-	if len(sq.queries) == 0 && sq.cancels == 0 && (!sq.sess.Adopted || sq.adopting) && l.sessions[sq.sess.ID] == sq {
+	if sq.closed {
+		if !sq.holdsLocked() {
+			l.dropLocked(sq)
+		}
+		return
+	}
+	if len(sq.queries) == 0 && len(sq.strays) == 0 && sq.cancels == 0 && (!sq.sess.Adopted || sq.adopting) &&
+		l.sessions[sq.sess.ID] == sq {
 		delete(l.sessions, sq.sess.ID)
 	}
+}
+
+// holdsLocked reports whether the limit may still have to cancel a query of
+// sq on its engine: an enforcement runs, or a query with a clock that has
+// not run out of time waits for the engine, or got no answer to its PREPARE
+// although the engine got all of it (the engine may run it).
+func (sq *sessionQueries) holdsLocked() bool {
+	if sq.cancels > 0 {
+		return true
+	}
+	for _, q := range sq.queries {
+		if q.limit > 0 && !q.timedOut && (len(q.waiting) > 0 || q.unanswered) {
+			return true
+		}
+	}
+	return false
 }
 
 // roomLocked makes room for one more query of sq and reports whether there
 // is room. It forgets only queries that the engine is done with: those
 // whose cancel at their limit it confirmed, or whose PREPARE the gateway
 // cut off. Later requests of them get the engine's error then instead of
-// the gateway's.
+// the gateway's. Queries the gateway gave up on do not count.
 func (l *queryLimits) roomLocked(sq *sessionQueries) bool {
 	if len(sq.queries) < maxSessionQueries {
 		return true
 	}
 	kept := make([]*trackedQuery, 0, len(sq.queries))
+	var forgotten []*trackedQuery
+	counted := 0
 	for _, o := range sq.queries {
 		if o.timedOut && !o.enforcing && !o.failed {
-			o.ended = true
-			if o.timer != nil {
-				o.timer.Stop()
-			}
+			forgotten = append(forgotten, o)
+			continue
+		}
+		if !o.givenUp() {
+			counted++
+		}
+		kept = append(kept, o)
+	}
+	sq.queries = kept
+	l.forgetLocked(forgotten)
+	return counted < maxSessionQueries
+}
+
+// givenUp reports whether the gateway could not cancel q at its limit and
+// is done trying: q may still run, but the gateway can do nothing more
+// about it than answer its later requests itself.
+func (q *trackedQuery) givenUp() bool { return q.timedOut && q.failed && !q.enforcing }
+
+// pruneLocked forgets the oldest queries of sq that the gateway gave up on
+// beyond maxSessionQueries.
+func (l *queryLimits) pruneLocked(sq *sessionQueries) {
+	n := 0
+	for _, o := range sq.queries {
+		if o.givenUp() {
+			n++
+		}
+	}
+	if n <= maxSessionQueries {
+		return
+	}
+	kept := make([]*trackedQuery, 0, len(sq.queries))
+	var forgotten []*trackedQuery
+	for _, o := range sq.queries {
+		if n > maxSessionQueries && o.givenUp() {
+			forgotten = append(forgotten, o)
+			n--
 			continue
 		}
 		kept = append(kept, o)
 	}
 	sq.queries = kept
-	return len(kept) < maxSessionQueries
+	l.forgetLocked(forgotten)
 }
 
-// dropLocked forgets a session and its queries.
+// forgetLocked stops following queries that timed out, without evidence of
+// their end; the caller has taken them out of the session's queries. Their
+// PREPAREs in flight keep them (their answers still get the timeout error);
+// their FETCHes and uploads in flight move on, as those of a query that
+// ends: the engine may serve them for a later statement.
+func (l *queryLimits) forgetLocked(qs []*trackedQuery) {
+	for _, q := range qs {
+		q.ended = true
+		if q.timer != nil {
+			q.timer.Stop()
+		}
+		l.rehomeWaitingLocked(q)
+	}
+}
+
+// dropLocked forgets a session and its queries, and lets its DISCONNECT go
+// if it holds it. A PREPARE of the session that waits for the engine
+// although its client went away ends with its client again: nothing
+// follows its query any more.
 func (l *queryLimits) dropLocked(sq *sessionQueries) {
 	for _, q := range sq.queries {
 		q.ended, q.dropped = true, true
 		if q.timer != nil {
 			q.timer.Stop()
 		}
+		for r := range q.waiting {
+			if r.client != nil {
+				context.AfterFunc(r.client, r.abort)
+			}
+		}
 	}
-	sq.queries = nil
+	sq.queries, sq.strays = nil, nil
 	if l.sessions[sq.sess.ID] == sq {
 		delete(l.sessions, sq.sess.ID)
 	}
+	if sq.hold != nil {
+		close(sq.hold)
+		sq.hold = nil
+	}
 }
 
-// sessionClosed is the session manager's close hook.
-func (l *queryLimits) sessionClosed(s *session.Session) {
+// sessionClosed is the session manager's close hook. keep reports that the
+// engine still has the session's connection and is about to get its
+// DISCONNECT. While the limit may still have to cancel a query of the
+// session on the engine (holdsLocked), and only then, the gateway keeps
+// following the session's queries and returns a channel that holds the
+// DISCONNECT; the channel is closed once nothing holds it any more.
+func (l *queryLimits) sessionClosed(s *session.Session, keep bool) <-chan struct{} {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if sq := l.sessions[s.ID]; sq != nil && sq.sess == s {
-		l.dropLocked(sq)
+	sq := l.sessions[s.ID]
+	if sq == nil || sq.sess != s {
+		l.mu.Unlock()
+		return nil
 	}
+	sq.closed = true
+	if !keep || !sq.holdsLocked() {
+		l.dropLocked(sq)
+		l.mu.Unlock()
+		return nil
+	}
+	hold := make(chan struct{})
+	sq.hold = hold
+	l.mu.Unlock()
+	l.g.log.Debug("the DISCONNECT of a closed session waits: the query time limit may still have to cancel a query of it",
+		"session", s.ID, "engine", s.EngineID)
+	return hold
 }
 
 // track starts following a request of sess right before the gateway
 // forwards it. body is the body after the header if the gateway buffered
 // it, head the start of the body otherwise, scan watches a PREPARE body that
-// streams; abort cancels the request to the engine, and in is the body as
-// the transport reads it. The result is nil if the limit does not follow
-// the request. local is set if the gateway must answer with that query's
+// streams; abort cancels the request to the engine, and in is the body of a
+// PREPARE as the transport reads it. The result is nil if the limit does not
+// follow the request. local is set if the gateway must answer with that query's
 // timeout error instead of forwarding the request. err reports that ctx
 // ended, or that the gateway shut down, while a PREPARE waited for the
-// gateway to finish with an earlier query, or errTooManyQueries.
+// gateway to finish with an earlier query, or errTooManyQueries, or
+// errSessionClosed.
 func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Session, body, head []byte,
-	scan *prepareUUIDSink, abort context.CancelFunc, in *countingReader) (r *queryRequest, local *trackedQuery, err error) {
+	scan *prepareUUIDSink, abort context.CancelFunc, in *bodyGate) (r *queryRequest, local *trackedQuery, err error) {
 	if body != nil {
 		head = body
 	}
@@ -393,7 +626,7 @@ func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Se
 // transaction. It first waits until the gateway is done with the queries of
 // the session that reached their limit.
 func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, clientQueryID wire.OptionalIdx,
-	uuid wire.Hugeint, known, endsTxn bool, abort context.CancelFunc, in *countingReader) (*queryRequest, error) {
+	uuid wire.Hugeint, known, endsTxn bool, abort context.CancelFunc, in *bodyGate) (*queryRequest, error) {
 	limit, source := l.limitFor(sess)
 	if limit <= 0 {
 		return nil, nil
@@ -405,8 +638,8 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 	defer l.mu.Unlock()
 	for {
 		sq := l.sessionLocked(sess, true)
-		if sq == nil {
-			return nil, nil
+		if sq == nil || sq.closed {
+			return nil, errSessionClosed
 		}
 		if done := sq.cancelsDone; done != nil {
 			l.mu.Unlock()
@@ -425,34 +658,49 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 		if !l.roomLocked(sq) {
 			return nil, errTooManyQueries
 		}
+		if sq.cancelsDone != nil {
+			continue // a request of a query it forgot started an enforcement (claimLocked)
+		}
 		sq.prepares++
 		q := l.newQueryLocked(sq, uuid, known, clientQueryID, limit, source)
 		q.seq = sq.prepares
 		r := &queryRequest{l: l, sess: sess, kind: wire.TypePrepareRequest, q: q, abort: abort, body: in}
+		if limit > 0 {
+			r.client = ctx // see outlivesClient
+		}
 		q.prepare, q.prepared, q.preparing = r, make(chan struct{}), true
 		q.waiting[r] = struct{}{}
+		l.homeLocked(q)
 		return r, nil
 	}
 }
 
 // findLocked returns the query a FETCH (of the query with *uuid) or an
-// upload (uuid nil) is for: the newest one whose PREPARE was answered (a
-// result exists only then), else the newest one.
-func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) *trackedQuery {
+// upload (uuid nil) is for, among those with a limit: the newest one whose
+// PREPARE was answered (a result exists only then), else the newest one. A
+// statement without a limit claims nothing: the engine may serve the
+// request for the next query, and nothing would stop its clock. known
+// reports whether a query of the session has *uuid, also one without a
+// limit.
+func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) (q *trackedQuery, known bool) {
 	var newest *trackedQuery
 	for i := len(sq.queries) - 1; i >= 0; i-- {
 		o := sq.queries[i]
 		if uuid != nil && (!o.uuidKnown || o.uuid != *uuid) {
 			continue
 		}
+		known = true
+		if o.limit <= 0 {
+			continue
+		}
 		if !o.preparing {
-			return o
+			return o, true
 		}
 		if newest == nil {
 			newest = o
 		}
 	}
-	return newest
+	return newest, known
 }
 
 // beginReading follows a FETCH (of the query with *uuid) or an upload (uuid
@@ -462,15 +710,27 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 	l.mu.Lock()
 	for {
 		sq := l.sessionLocked(sess, false)
+		if l.closedLocked(sess, sq) {
+			l.mu.Unlock()
+			return nil, nil, errSessionClosed
+		}
 		var q *trackedQuery
+		known := false
 		if sq != nil {
-			q = sq.findLocked(uuid)
+			q, known = sq.findLocked(uuid)
 		}
 		if q == nil {
-			var err error
-			if q, err = l.adoptLocked(sess, sq, uuid); q == nil {
+			if !known {
+				var err error
+				if q, err = l.adoptLocked(sess, sq, uuid); err != nil {
+					l.mu.Unlock()
+					return nil, nil, err
+				}
+			}
+			if q == nil {
+				r, err := l.strayLocked(sess, sq, uuid, abort)
 				l.mu.Unlock()
-				return nil, nil, err
+				return r, nil, err
 			}
 		}
 		if q.timedOut {
@@ -502,11 +762,51 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 		r := &queryRequest{l: l, sess: sess, kind: wire.TypeFetchRequest, q: q, decoded: decoded, early: q.preparing, abort: abort}
 		if uuid == nil {
 			r.kind = wire.TypeSendDataRequest
+		} else {
+			r.uuid = *uuid // it moves to another query by its uuid (rehomeLocked)
 		}
 		q.waiting[r] = struct{}{}
 		l.mu.Unlock()
 		return r, nil, nil
 	}
+}
+
+// closedLocked reports whether the session sess, whose state is sq (nil:
+// none), closed while the limit applies to it: its requests are not
+// forwarded any more then. The close hook marks the state of a session
+// after the session itself, under l.mu: a session that the hook has not
+// seen yet was open when its requests began to be followed.
+func (l *queryLimits) closedLocked(sess *session.Session, sq *sessionQueries) bool {
+	if sq != nil {
+		return sq.closed
+	}
+	if _, closed := sess.Closed(); !closed {
+		return false
+	}
+	return l.limited(sess)
+}
+
+// strayLocked follows a FETCH (of the query with *uuid) or an upload (uuid
+// nil) that no query of the session claims, as a stray of the session (nil:
+// the limit does not apply to it). The gateway forwards it; a query that
+// it may serve and that the gateway begins to follow while it is in flight
+// takes it (homeLocked).
+func (l *queryLimits) strayLocked(sess *session.Session, sq *sessionQueries, uuid *wire.Hugeint,
+	abort context.CancelFunc) (*queryRequest, error) {
+	if sq == nil {
+		if !l.limited(sess) {
+			return nil, nil
+		}
+		if sq = l.sessionLocked(sess, true); sq == nil {
+			return nil, errSessionClosed
+		}
+	}
+	r := &queryRequest{l: l, sess: sess, kind: wire.TypeSendDataRequest, early: true, abort: abort}
+	if uuid != nil {
+		r.kind, r.uuid = wire.TypeFetchRequest, *uuid
+	}
+	l.addStrayLocked(sq, r)
+	return r, nil
 }
 
 // adoptLocked starts following the query that a FETCH for a uuid the gateway
@@ -540,6 +840,7 @@ func (l *queryLimits) adoptLocked(sess *session.Session, sq *sessionQueries, uui
 	}
 	q := l.newQueryLocked(sq, *uuid, true, wire.OptionalIdx{}, limit, source)
 	q.adopted = true
+	l.homeLocked(q) // uploads in flight may serve it, as for any query
 	return q, nil
 }
 
@@ -571,6 +872,7 @@ func (r *queryRequest) setUUID(uuid wire.Hugeint) {
 	defer l.mu.Unlock()
 	if q := r.q; !q.ended && !q.uuidKnown {
 		q.uuid, q.uuidKnown = uuid, true
+		l.homeLocked(q)
 	}
 }
 
@@ -581,22 +883,24 @@ func (r *queryRequest) setUUID(uuid wire.Hugeint) {
 // the query until its limit, and cancel it then whatever the engine had
 // done. The limit bounds the wait.
 func (r *queryRequest) outlivesClient() bool {
-	return r != nil && r.q != nil && r.kind == wire.TypePrepareRequest && r.q.limit > 0
+	// The query of a PREPARE never changes (others can, see rehomeLocked).
+	return r != nil && r.kind == wire.TypePrepareRequest && r.q != nil && r.q.limit > 0
 }
 
 // timeoutError returns the error the gateway answers with instead of the
 // engine's answer to r: the query of r ran out of time.
 func (r *queryRequest) timeoutError() (string, bool) {
-	if r == nil || r.q == nil {
+	if r == nil {
 		return "", false
 	}
 	r.l.mu.Lock()
 	defer r.l.mu.Unlock()
-	if !r.q.timedOut {
+	q := r.q
+	if q == nil || !q.timedOut {
 		return "", false
 	}
-	r.q.reported = true
-	return r.q.messageLocked(), true
+	q.reported = true
+	return q.messageLocked(), true
 }
 
 // finish ends a followed request with what the engine answered.
@@ -607,6 +911,14 @@ func (r *queryRequest) finish(ev requestEvent) {
 	l := r.l
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if r.q == nil && r.kind != wire.TypeCancelRequest {
+		// A stray: no query took it.
+		if sq := r.sq; sq != nil {
+			delete(sq.strays, r)
+			l.forgetIdleLocked(sq)
+		}
+		return
+	}
 	if r.q == nil {
 		// A CANCEL of the client: once the engine confirmed it, it ended the
 		// statement of the connection, so the queries it named are over, and
@@ -632,6 +944,10 @@ func (r *queryRequest) finish(ev requestEvent) {
 		return
 	}
 	sq := q.sq
+	if sq.closed {
+		// The DISCONNECT of the session may have waited for this request.
+		defer l.forgetIdleLocked(sq)
+	}
 	switch r.kind {
 	case wire.TypePrepareRequest:
 		switch ev {
@@ -710,9 +1026,21 @@ func (l *queryLimits) expire(q *trackedQuery) {
 	}
 	if !l.fresh() {
 		// Another replica may serve the session by now: leave its engine
-		// alone, and look again later.
+		// alone, and look again later. But do not hold a PREPARE of the
+		// query for the engine's answer once its client went away: the
+		// query is followed as one whose PREPARE got no answer then, and
+		// cancelled as a precaution once the lease is fresh.
+		var aborts []context.CancelFunc
+		for r := range q.waiting {
+			if r.client != nil && r.client.Err() != nil {
+				aborts = append(aborts, r.abort)
+			}
+		}
 		q.timer.Reset(fenceRetry)
 		l.mu.Unlock()
+		for _, abort := range aborts {
+			abort()
+		}
 		return
 	}
 	if len(q.waiting) == 0 && !q.unanswered {
@@ -787,6 +1115,9 @@ func (l *queryLimits) run(q *trackedQuery, e *enforcement) {
 	close(q.enforced)
 	if result == "cancelled" && q.unanswered {
 		l.endLocked(q) // no client waits for it, and the engine has ended it
+	}
+	if q.givenUp() && !q.ended {
+		l.pruneLocked(sq)
 	}
 	if sq.cancels--; sq.cancels == 0 {
 		close(sq.cancelsDone)
