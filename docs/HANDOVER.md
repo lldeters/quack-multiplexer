@@ -169,8 +169,12 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    lesen. Alles in `deploy/kubernetes/README.md`, „Härtung geteilter Engines“.
 5. **Die Schwärzung im Audit-Log ist eine Heuristik** (Schlüsselwörter wie `secret`, `passw`, `token`, URLs mit
    Passwort). Das Audit-Log bleibt vertraulich.
-6. **Spill-Platz** begrenzt nur die Konfiguration (`settings.max_temp_directory_size` plus
-   `resources.limits.ephemeral-storage`); die Beispiele setzen keine Defaults.
+6. **Spill-Platz:** Die mitgelieferten Profile begrenzen ihn (`settings.max_temp_directory_size` gleich dem Doppelten
+   von `limits.memory`, `resources.limits.ephemeral-storage` 2 GiB darüber, kleine Requests). Die Grenze von DuckDB
+   hält nur, solange keine Session sie per `SET GLOBAL` verschiebt (dagegen `lock_configuration`); darüber räumt das
+   Kubelet die ganze Engine. Die kleinen Requests überbuchen die Platte des Nodes, und ein Node mit weniger freiem
+   Platz als die Grenze läuft voll, bevor sie greift. Alles in `deploy/kubernetes/README.md`, „Plattenplatz für
+   Auslagerungen“.
 
 ## Nächste Schritte (priorisiert)
 
@@ -184,8 +188,9 @@ Aufräumen verwaister Verbindungen nach einem Neustart (`engine.closeOrphanedCon
 
 1. Optional:
    * Helm-Chart
-   * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)
-   * Spill-Defaults in den Beispielprofilen
+   * TLS-Zertifikat ohne Neustart neu laden (das Gateway liest `server.tls` nur beim Start). Gepinnte Clients
+     (`ssl_fingerprint`) haben 30 s `http_timeout` nur mit geladenem httpfs, sonst 300 s; statt eines Warm-Pools
+     hilft `SET GLOBAL http_timeout = 86400` vor dem `ATTACH` ([docs/tls.md](tls.md)).
 
 ## Arbeiten im Repo
 

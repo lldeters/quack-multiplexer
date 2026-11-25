@@ -34,6 +34,7 @@ var (
 	runScript      = filepath.Join(composeDir, "run.sh")
 	gatewayConfig  = filepath.Join(composeDir, "config", "gateway.yaml")
 	idleConfig     = filepath.Join(composeDir, "config", "gateway-idle.yaml")
+	tlsConfig      = filepath.Join(composeDir, "config", "gateway-tls.yaml")
 	usersFile      = filepath.Join(composeDir, "config", "users.yaml")
 	adminTokenFile = filepath.Join(composeDir, "config", "admin.token")
 )
@@ -43,6 +44,8 @@ const (
 	mountConfig     = "/etc/quackmux/config.yaml"
 	mountUsers      = "/etc/quackmux/users.yaml"
 	mountAdminToken = "/etc/quackmux/admin.token"
+	// mountTLS holds the certificate of gateway-tls (scenario l).
+	mountTLS = "/etc/quackmux/tls"
 )
 
 // envKeys are the variables of e2e.env.
@@ -252,10 +255,11 @@ func TestGatewayConfigs(t *testing.T) {
 	env := readEnv(t)
 	gw := loadConfig(t, gatewayConfig)
 	idle := loadConfig(t, idleConfig)
+	tlsCfg := loadConfig(t, tlsConfig)
 	for _, c := range []struct {
 		path string
 		cfg  *config.Config
-	}{{gatewayConfig, gw}, {idleConfig, idle}} {
+	}{{gatewayConfig, gw}, {idleConfig, idle}, {tlsConfig, tlsCfg}} {
 		cfg := c.cfg
 		if cfg.Server.Listen != ":9494" || cfg.Admin.Listen != ":9495" {
 			t.Errorf("%s: listeners %q and %q, want :9494 and :9495 (docker-compose.yaml publishes them)", c.path, cfg.Server.Listen, cfg.Admin.Listen)
@@ -308,7 +312,7 @@ func TestGatewayConfigs(t *testing.T) {
 	// outlast the restart, so that the living clients find their
 	// connections, and the grace must fit the run. gateway-idle never
 	// restarts.
-	if !gw.CloseOrphanedConnectionsEnabled() || idle.CloseOrphanedConnectionsEnabled() {
+	if !gw.CloseOrphanedConnectionsEnabled() || idle.CloseOrphanedConnectionsEnabled() || tlsCfg.CloseOrphanedConnectionsEnabled() {
 		t.Errorf("engine.closeOrphanedConnections must be on in %s only", gatewayConfig)
 	}
 	if l := gw.Session.BackendHeartbeatTimeout.Duration; l < time.Minute {
@@ -327,12 +331,27 @@ func TestGatewayConfigs(t *testing.T) {
 	if !reflect.DeepEqual(&adjusted, gw) {
 		t.Errorf("%s and %s differ in more than the session and engine timing and the orphan sweep", gatewayConfig, idleConfig)
 	}
+
+	// Scenario l: only gateway-tls speaks HTTPS, with the certificate that
+	// run.sh mounts; apart from that and the orphan sweep it is gateway.yaml.
+	if gw.Server.TLS != nil || idle.Server.TLS != nil {
+		t.Errorf("server.tls must be set in %s only: the other scenarios attach with DISABLE_SSL true", tlsConfig)
+	}
+	if tc := tlsCfg.Server.TLS; tc == nil || tc.CertFile != mountTLS+"/tls.crt" || tc.KeyFile != mountTLS+"/tls.key" {
+		t.Errorf("%s: server.tls %+v, want tls.crt and tls.key in %s", tlsConfig, tc, mountTLS)
+	}
+	adjustedTLS := *tlsCfg
+	adjustedTLS.Server.TLS = nil
+	adjustedTLS.Engine.CloseOrphanedConnections = gw.Engine.CloseOrphanedConnections
+	if !reflect.DeepEqual(&adjustedTLS, gw) {
+		t.Errorf("%s and %s differ in more than server.tls and the orphan sweep", gatewayConfig, tlsConfig)
+	}
 }
 
 // TestQueryTimeLimits pins the query time limits scenario h relies on: bob's
 // queries are cancelled after 5s, the other scenarios run without a limit.
 func TestQueryTimeLimits(t *testing.T) {
-	for _, path := range []string{gatewayConfig, idleConfig} {
+	for _, path := range []string{gatewayConfig, idleConfig, tlsConfig} {
 		cfg := loadConfig(t, path)
 		for user, want := range map[string]time.Duration{"bob": 5 * time.Second, "alice": 0} {
 			if got, source := policy.QueryTimeout(cfg, user, nil, cfg.Defaults.Profile); got != want {
@@ -465,7 +484,9 @@ func TestComposeFile(t *testing.T) {
 		}
 	}
 
-	for service, cfgFile := range map[string]string{"gateway": "gateway.yaml", "gateway-idle": "gateway-idle.yaml"} {
+	// gateway-tls mounts the certificate directory that run.sh creates.
+	const tlsVolume = "${E2E_TLS_DIR:-./tls}:" + mountTLS + ":ro"
+	for service, cfgFile := range map[string]string{"gateway": "gateway.yaml", "gateway-idle": "gateway-idle.yaml", "gateway-tls": "gateway-tls.yaml"} {
 		svc, ok := cf.Services[service]
 		if !ok {
 			t.Errorf("%s: service %s is missing", composeFile, service)
@@ -479,6 +500,10 @@ func TestComposeFile(t *testing.T) {
 		}
 		mounts := map[string]string{}
 		for _, v := range svc.Volumes {
+			if v == tlsVolume {
+				mounts[mountTLS] = "E2E_TLS_DIR"
+				continue
+			}
 			parts := strings.Split(v, ":")
 			if len(parts) != 3 || parts[2] != "ro" {
 				t.Errorf("%s: %s mounts %q; want SOURCE:TARGET:ro", composeFile, service, v)
@@ -497,6 +522,16 @@ func TestComposeFile(t *testing.T) {
 			if mounts[target] != src {
 				t.Errorf("%s: %s mounts %q at %s, want %q", composeFile, service, mounts[target], target, src)
 			}
+		}
+		if tls := service == "gateway-tls"; tls != (mounts[mountTLS] != "") || tls != slices.Contains(svc.Profiles, "tls") {
+			t.Errorf("%s: %s mounts %s: %v, has the profile tls: %v; want both only for gateway-tls", composeFile, service,
+				tlsVolume, mounts[mountTLS] != "", slices.Contains(svc.Profiles, "tls"))
+		}
+	}
+	// run.sh enables the profile and points E2E_TLS_DIR at the certificate.
+	for _, ref := range []string{"--profile tls)", "export E2E_TLS_DIR="} {
+		if !bytes.Contains(readFile(t, runScript), []byte(ref)) {
+			t.Errorf("%s does not contain %q", runScript, ref)
 		}
 	}
 

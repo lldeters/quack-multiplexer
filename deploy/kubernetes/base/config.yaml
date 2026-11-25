@@ -114,29 +114,44 @@ profiles:
     settings:
       memory_limit: 3GB
       threads: "2"
+      # Spill space for intermediate results beyond memory_limit, twice
+      # limits.memory. A query that needs more fails with an error; without
+      # the setting DuckDB may fill 90% of the node's free disk. The spill
+      # files live in the emptyDir at /tmp (README.md, "Plattenplatz für
+      # Auslagerungen").
+      max_temp_directory_size: 8GiB
     resources:
       requests:
         cpu: "1"
         memory: 2Gi
+        # An engine that does not spill needs hardly any disk.
+        ephemeral-storage: 1Gi
       limits:
         cpu: "2"
         memory: 4Gi
+        # max_temp_directory_size plus 2 GiB for the container log and other
+        # files in /tmp. Beyond it the kubelet evicts the engine.
+        ephemeral-storage: 10Gi
 
   large:
     description: "Large engine for heavy queries: 4 CPUs, 16 GiB memory"
     # A dedicated engine per user or per connection only: nobody shares a
     # large engine with other users.
     allowedShareLevels: [USER, CONNECTION]
+    # Spill and disk limits by the rules of the default profile.
     settings:
       memory_limit: 12GB
       threads: "4"
+      max_temp_directory_size: 32GiB
     resources:
       requests:
         cpu: "4"
         memory: 16Gi
+        ephemeral-storage: 1Gi
       limits:
         cpu: "4"
         memory: 16Gi
+        ephemeral-storage: 34Gi
     # Pre-started engines for share_level=connection (0 = none). Each warm
     # engine reserves the resources above while it waits.
     # warmPool:

@@ -34,7 +34,8 @@ CREATE SECRET (TYPE quack, TOKEN 'mein-token?share_level=connection&profile=larg
                SCOPE 'quack:quackmux.example.com:9494');
 ```
 
-Option als HTTP-Header (`EXTRA_HTTP_HEADERS` des Secrets). Das geht nicht zusammen mit `ssl_fingerprint`:
+Option als HTTP-Header (`EXTRA_HTTP_HEADERS` des Secrets). Das geht nicht zusammen mit `ssl_fingerprint`
+([TLS](docs/tls.md)):
 
 ```sql
 CREATE SECRET (TYPE quack, TOKEN 'mein-token', SCOPE 'quack:quackmux.example.com:9494',
@@ -110,7 +111,7 @@ Releases veröffentlichen Binaries und Images für amd64 und arm64 (`ghcr.io/lld
 | [deploy/kubernetes](deploy/kubernetes) | Manifeste (RBAC, NetworkPolicy, Overlays `dev`/`ha`) |
 | [examples](examples) | Beispielkonfigurationen und Client-SQL |
 | [test/e2e](test/e2e) | End-to-End-Tests mit echtem DuckDB (Docker Compose, kind) |
-| [docs](docs) | [Design](docs/design.md), [Protokoll](docs/protocol.md) |
+| [docs](docs) | [Design](docs/design.md), [Protokoll](docs/protocol.md), [TLS](docs/tls.md) (Zertifikate, `ssl_fingerprint`) |
 
 ## Tests
 
