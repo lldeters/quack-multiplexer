@@ -16,3 +16,6 @@ func TrackedQueries(g *Gateway) (sessions, queries int) {
 
 // SetFence replaces Options.Fence.
 func SetFence(g *Gateway, fence func() bool) { g.fence = fence }
+
+// MaxSessionQueries is the bound of the queries followed per session.
+const MaxSessionQueries = maxSessionQueries

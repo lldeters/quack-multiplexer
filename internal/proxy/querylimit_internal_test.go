@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -145,16 +146,16 @@ func TestEarlyFetchAnswersEndNothing(t *testing.T) {
 		l, s := newTestLimits(t, false)
 		u := wire.Hugeint{Upper: 1}
 		p := l.testPrepare(t, s, u)
-		f, local := l.beginReading(context.Background(), s, &u, true, func() {})
-		if f == nil || local != nil || !f.early {
-			t.Fatalf("FETCH while the PREPARE waits: %+v, %v", f, local)
+		f, local, err := l.beginReading(context.Background(), s, &u, true, func() {})
+		if f == nil || local != nil || err != nil || !f.early {
+			t.Fatalf("FETCH while the PREPARE waits: %+v, %v, %v", f, local, err)
 		}
 		f.finish(ev)
 		if !l.followed(p.q) {
 			t.Fatalf("an early FETCH answered with event %d ended the query", ev)
 		}
 		p.finish(evResult)
-		f, _ = l.beginReading(context.Background(), s, &u, true, func() {})
+		f, _, _ = l.beginReading(context.Background(), s, &u, true, func() {})
 		f.finish(ev)
 		if l.followed(p.q) {
 			t.Fatalf("a FETCH after the PREPARE answered with event %d did not end the query", ev)
@@ -162,14 +163,20 @@ func TestEarlyFetchAnswersEndNothing(t *testing.T) {
 	}
 }
 
-// The gateway follows a bounded number of queries per session: FETCHes of
-// an adopted session for unknown uuids stop starting new ones, and a new
-// PREPARE forgets the oldest answered query.
+// The gateway follows a bounded number of queries per session. FETCHes of
+// an adopted session for unknown uuids start following queries until the
+// bound; beyond it the gateway refuses such a FETCH and a PREPARE instead of
+// forgetting a query that may still run.
 func TestQueriesPerSessionAreBounded(t *testing.T) {
 	l, s := newTestLimits(t, true)
-	for i := 0; i < 2*maxSessionQueries; i++ {
+	var fetches []*queryRequest
+	for i := 0; i < maxSessionQueries; i++ {
 		u := wire.Hugeint{Upper: 7, Lower: uint64(i)}
-		l.beginReading(context.Background(), s, &u, true, func() {})
+		f, _, err := l.beginReading(context.Background(), s, &u, true, func() {})
+		if f == nil || err != nil {
+			t.Fatalf("FETCH %d: %v, %v", i, f, err)
+		}
+		fetches = append(fetches, f)
 	}
 	count := func() int {
 		l.mu.Lock()
@@ -179,13 +186,85 @@ func TestQueriesPerSessionAreBounded(t *testing.T) {
 	if n := count(); n != maxSessionQueries {
 		t.Fatalf("%d adopted queries followed, want %d", n, maxSessionQueries)
 	}
-	r := l.testPrepare(t, s, wire.Hugeint{Upper: 8})
-	if n := count(); n != maxSessionQueries {
-		t.Fatalf("%d queries followed after a PREPARE, want %d", n, maxSessionQueries)
+	u := wire.Hugeint{Upper: 7, Lower: maxSessionQueries}
+	if f, _, err := l.beginReading(context.Background(), s, &u, true, func() {}); f != nil || !errors.Is(err, errTooManyQueries) {
+		t.Fatalf("FETCH beyond the bound: %v, %v; want errTooManyQueries", f, err)
 	}
+	if r, err := l.beginPrepare(context.Background(), s, wire.OptionalIdx{}, wire.Hugeint{Upper: 8}, true, false, func() {}, nil); r != nil || !errors.Is(err, errTooManyQueries) {
+		t.Fatalf("PREPARE beyond the bound: %v, %v; want errTooManyQueries", r, err)
+	}
+	if n := count(); n != maxSessionQueries {
+		t.Fatalf("%d queries followed after the refusals, want %d", n, maxSessionQueries)
+	}
+	fetches[0].finish(evError) // "Result has been closed": the engine never had it
+	r := l.testPrepare(t, s, wire.Hugeint{Upper: 8})
 	r.finish(evResult) // replaces all of them
 	if n := count(); n != 1 {
 		t.Fatalf("%d queries followed after the PREPARE's result, want 1", n)
+	}
+}
+
+// A client cannot make the gateway forget the query that runs by piling up
+// PREPAREs that the engine got whole but did not answer (the engine never
+// makes a malformed one its statement): at the bound the gateway refuses
+// further PREPAREs. It forgets only queries the engine is done with, here
+// PREPAREs it cut off at their limit.
+func TestRunningQueryIsNeverForgotten(t *testing.T) {
+	l, s := newTestLimits(t, false)
+	running := l.testPrepare(t, s, wire.Hugeint{Upper: 1})
+	running.finish(evResult)
+	u := running.q.uuid
+	fetch, _, err := l.beginReading(context.Background(), s, &u, true, func() {})
+	if fetch == nil || err != nil {
+		t.Fatalf("FETCH: %v, %v", fetch, err)
+	}
+	var piled []*trackedQuery
+	for i := 1; i < maxSessionQueries; i++ {
+		r := l.testPrepare(t, s, wire.Hugeint{Upper: 2, Lower: uint64(i)})
+		r.finish(evFailed) // the client went away; the body counts as sent (testPrepare has none)
+		piled = append(piled, r.q)
+	}
+	r, err := l.beginPrepare(context.Background(), s, wire.OptionalIdx{}, wire.Hugeint{Upper: 3}, true, false, func() {}, nil)
+	if r != nil || !errors.Is(err, errTooManyQueries) {
+		t.Fatalf("PREPARE beyond the bound: %v, %v; want errTooManyQueries", r, err)
+	}
+	if !l.followed(running.q) {
+		t.Fatal("the gateway forgot the query that runs")
+	}
+	for _, q := range piled {
+		if !l.followed(q) {
+			t.Fatal("the gateway forgot a PREPARE the engine may still run")
+		}
+	}
+
+	// PREPAREs whose bodies the gateway cut off at their limit never reach
+	// the engine: they make room.
+	l2, s2 := newTestLimits(t, false)
+	running = l2.testPrepare(t, s2, wire.Hugeint{Upper: 1})
+	running.finish(evResult)
+	for i := 1; i < maxSessionQueries; i++ {
+		in := &countingReader{size: 100} // nothing of it sent yet
+		r, err := l2.beginPrepare(context.Background(), s2, wire.OptionalIdx{}, wire.Hugeint{Upper: 2, Lower: uint64(i)}, true, false, func() {}, in)
+		if r == nil || err != nil {
+			t.Fatalf("PREPARE %d: %v, %v", i, r, err)
+		}
+		l2.mu.Lock()
+		e := l2.startLocked(r.q)
+		l2.mu.Unlock()
+		if !e.cut {
+			t.Fatalf("PREPARE %d was not cut off", i)
+		}
+		l2.run(r.q, e)
+	}
+	r = l2.testPrepare(t, s2, wire.Hugeint{Upper: 3})
+	if !l2.followed(running.q) || !l2.followed(r.q) {
+		t.Fatalf("followed: the query that ran %v, the new one %v; want both", l2.followed(running.q), l2.followed(r.q))
+	}
+	l2.mu.Lock()
+	n := len(l2.sessions[s2.ID].queries)
+	l2.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d queries followed, want the two that may run", n)
 	}
 }
 

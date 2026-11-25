@@ -619,17 +619,23 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		}
 		if g.limits != nil {
 			qr, timedOut, err := g.limits.track(r.Context(), h, sess, body, queryHead, prepareScan, cancelUp, cr)
+			if err != nil || timedOut != nil {
+				stopAbort()
+			}
+			// Requests the gateway answers itself: it first reads what the
+			// client sends, so that its connection stays usable.
 			switch {
 			case errors.Is(err, errShuttingDown):
-				stopAbort()
 				writeError(w, "quackmux: the gateway is shutting down; the query did not run. Run it again.",
 					wire.ExceptionConnection, false)
 				return "shutdown"
+			case errors.Is(err, errTooManyQueries):
+				_, _ = io.Copy(io.Discard, in)
+				writeError(w, tooManyQueriesMessage, wire.ExceptionInvalidInput, false)
+				return "too_many_queries"
 			case err != nil:
 				return "client_gone"
 			case timedOut != nil:
-				// Read what the client sends before answering, so that its
-				// connection stays usable.
 				_, _ = io.Copy(io.Discard, in)
 				writeError(w, g.limits.message(timedOut), wire.ExceptionInterrupt, false)
 				return "query_timeout"

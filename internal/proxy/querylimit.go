@@ -85,9 +85,11 @@ const (
 
 // maxSessionQueries bounds the queries the gateway follows per session. A
 // DuckDB client has one query at a time on a connection; more are open only
-// for clients that abandon or race their requests. Beyond the bound the
-// gateway forgets the oldest query whose PREPARE was answered: the engine
-// has run so many PREPAREs of the session since that it replaced it.
+// for clients that race their requests. The gateway never forgets a query
+// that the engine may still run, or the client could stop its clock: at the
+// bound it forgets only queries whose cancel the engine confirmed, and
+// otherwise does not forward a further PREPARE (or a FETCH that would adopt
+// a query) but answers it with an error.
 const maxSessionQueries = 64
 
 // fenceRetry is how soon the gateway looks again at a limit that passed
@@ -101,6 +103,14 @@ var errShuttingDown = errors.New("the gateway is shutting down")
 // errNotFresh reports a CANCEL the gateway did not send because it does not
 // hold a fresh lease: another replica may serve the session by now.
 var errNotFresh = errors.New("this gateway does not hold a fresh lease")
+
+// errTooManyQueries reports a request the gateway does not forward because
+// it follows maxSessionQueries queries of the session already.
+var errTooManyQueries = errors.New("too many queries of the session are not over")
+
+// tooManyQueriesMessage is the client's error for errTooManyQueries.
+var tooManyQueriesMessage = fmt.Sprintf("quackmux: the session has %d queries that are not over, the most the "+
+	"gateway follows; it did not forward this request. Cancel those queries or reconnect.", maxSessionQueries)
 
 // queryLimits follows the queries of the sessions that have a time limit.
 type queryLimits struct {
@@ -277,6 +287,30 @@ func (l *queryLimits) forgetIdleLocked(sq *sessionQueries) {
 	}
 }
 
+// roomLocked makes room for one more query of sq and reports whether there
+// is room. It forgets only queries that the engine is done with: those
+// whose cancel at their limit it confirmed, or whose PREPARE the gateway
+// cut off. Later requests of them get the engine's error then instead of
+// the gateway's.
+func (l *queryLimits) roomLocked(sq *sessionQueries) bool {
+	if len(sq.queries) < maxSessionQueries {
+		return true
+	}
+	kept := make([]*trackedQuery, 0, len(sq.queries))
+	for _, o := range sq.queries {
+		if o.timedOut && !o.enforcing && !o.failed {
+			o.ended = true
+			if o.timer != nil {
+				o.timer.Stop()
+			}
+			continue
+		}
+		kept = append(kept, o)
+	}
+	sq.queries = kept
+	return len(kept) < maxSessionQueries
+}
+
 // dropLocked forgets a session and its queries.
 func (l *queryLimits) dropLocked(sq *sessionQueries) {
 	for _, q := range sq.queries {
@@ -308,7 +342,7 @@ func (l *queryLimits) sessionClosed(s *session.Session) {
 // the request. local is set if the gateway must answer with that query's
 // timeout error instead of forwarding the request. err reports that ctx
 // ended, or that the gateway shut down, while a PREPARE waited for the
-// gateway to finish with an earlier query.
+// gateway to finish with an earlier query, or errTooManyQueries.
 func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Session, body, head []byte,
 	scan *prepareUUIDSink, abort context.CancelFunc, in *countingReader) (r *queryRequest, local *trackedQuery, err error) {
 	if body != nil {
@@ -336,11 +370,9 @@ func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Se
 			return nil, nil, nil // the engine answers that it cannot decode it
 		}
 		f, ferr := wire.DecodeFetchRequestBody(head)
-		r, local := l.beginReading(ctx, sess, &uuid, ferr == nil && f.BatchIndex > 0, abort)
-		return r, local, nil
+		return l.beginReading(ctx, sess, &uuid, ferr == nil && f.BatchIndex > 0, abort)
 	case wire.TypeSendDataRequest:
-		r, local := l.beginReading(ctx, sess, nil, false, abort)
-		return r, local, nil
+		return l.beginReading(ctx, sess, nil, false, abort)
 	case wire.TypeCancelRequest:
 		uuid, err := wire.LeadingQueryUUID(head)
 		if err != nil {
@@ -384,13 +416,8 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 				return nil, errShuttingDown
 			}
 		}
-		if len(sq.queries) >= maxSessionQueries {
-			for _, o := range sq.queries {
-				if !o.preparing {
-					l.endLocked(o)
-					break
-				}
-			}
+		if !l.roomLocked(sq) {
+			return nil, errTooManyQueries
 		}
 		sq.prepares++
 		q := l.newQueryLocked(sq, uuid, known, clientQueryID, limit, source)
@@ -425,7 +452,7 @@ func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) *trackedQuery {
 // beginReading follows a FETCH (of the query with *uuid) or an upload (uuid
 // nil). decoded marks a FETCH the engine certainly decodes.
 func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, uuid *wire.Hugeint, decoded bool,
-	abort context.CancelFunc) (*queryRequest, *trackedQuery) {
+	abort context.CancelFunc) (*queryRequest, *trackedQuery, error) {
 	l.mu.Lock()
 	for {
 		sq := l.sessionLocked(sess, false)
@@ -434,15 +461,16 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 			q = sq.findLocked(uuid)
 		}
 		if q == nil {
-			if q = l.adoptLocked(sess, sq, uuid); q == nil {
+			var err error
+			if q, err = l.adoptLocked(sess, sq, uuid); q == nil {
 				l.mu.Unlock()
-				return nil, nil
+				return nil, nil, err
 			}
 		}
 		if q.timedOut {
 			if !q.enforcing {
 				l.mu.Unlock()
-				return nil, q
+				return nil, q, nil
 			}
 			// Answer once the gateway knows whether the engine cancelled it.
 			done := q.enforced
@@ -454,7 +482,7 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 			case <-ctx.Done():
 			case <-l.g.abortCtx.Done():
 			}
-			return nil, q
+			return nil, q, nil
 		}
 		if q.expired {
 			// The limit passed while the engine did not work for the query:
@@ -471,7 +499,7 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 		}
 		q.waiting[r] = struct{}{}
 		l.mu.Unlock()
-		return r, nil
+		return r, nil, nil
 	}
 }
 
@@ -481,27 +509,32 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 // so it follows only queries of an adopted session that began before this
 // process, and only until the engine has shown what it runs; a FETCH that
 // comes after the end of a query, or for a uuid the engine never had,
-// starts nothing. The limit of an adopted query counts from this FETCH.
-func (l *queryLimits) adoptLocked(sess *session.Session, sq *sessionQueries, uuid *wire.Hugeint) *trackedQuery {
+// starts nothing. The limit of an adopted query counts from this FETCH. It
+// returns errTooManyQueries if it would adopt a query but has no room: the
+// FETCH may be for a query from before the restart that still runs.
+func (l *queryLimits) adoptLocked(sess *session.Session, sq *sessionQueries, uuid *wire.Hugeint) (*trackedQuery, error) {
 	if uuid == nil || !sess.Adopted {
-		return nil
+		return nil, nil
 	}
 	limit, source := l.limitFor(sess)
 	if limit <= 0 {
-		return nil
+		return nil, nil
 	}
 	if sq == nil {
 		if sq = l.sessionLocked(sess, true); sq == nil {
-			return nil
+			return nil, nil
 		}
 	}
-	if !sq.adopting || len(sq.queries) >= maxSessionQueries {
+	if !sq.adopting {
 		l.forgetIdleLocked(sq)
-		return nil
+		return nil, nil
+	}
+	if !l.roomLocked(sq) {
+		return nil, errTooManyQueries
 	}
 	q := l.newQueryLocked(sq, *uuid, true, wire.OptionalIdx{}, limit, source)
 	q.adopted = true
-	return q
+	return q, nil
 }
 
 // beginCancel follows a CANCEL of the client for the query with uuid (zero:
