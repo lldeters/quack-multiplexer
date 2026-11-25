@@ -242,6 +242,10 @@ type EngineConfig struct {
 	// RecoveryGrace keeps recovered engines alive after a gateway (re)start so
 	// that their sessions can re-attach with their next heartbeat.
 	RecoveryGrace Duration `json:"recoveryGrace"`
+	// CloseOrphanedConnections closes the connections on recovered engines
+	// that no session adopted within RecoveryGrace (see
+	// CloseOrphanedConnectionsEnabled).
+	CloseOrphanedConnections *bool `json:"closeOrphanedConnections,omitempty"`
 	// CheckInterval is the reconcile period.
 	CheckInterval Duration `json:"checkInterval"`
 	// ReplaceOnSpecChange drains engines whose profile changed since launch.
