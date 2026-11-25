@@ -384,6 +384,33 @@ func TestQueryTimeoutForQueryFromBeforeARestart(t *testing.T) {
 	waitCancels(t, srv, uuidA)
 }
 
+// A held-back COMMIT with the uuid of a query from before a restart does
+// not shelter that query: the engine runs it until the COMMIT reaches it, so
+// a FETCH for the uuid adopts it and starts its limit. The gateway once took
+// the COMMIT's uuid as known and adopted nothing; the FETCH, a stray only a
+// later query of the uuid would take, got its batch past the limit.
+func TestHeldBackCommitDoesNotShelterAQueryFromBeforeARestart(t *testing.T) {
+	const cfg = "limits: {queryTimeout: 300ms}\nserver: {upstream: {maxBufferedRequestBytes: -1}}\n"
+	h1 := newHarness(t, cfg, nil)
+	c := h1.connect("tok?user=alice", nil)
+	srv := h1.prov.Server(h1.sessionEngine(c))
+	mustType(t, h1.prepare(c, "STREAM 3 3000", uuidA), wire.TypePrepareResponse)
+
+	prov2 := fake.New()
+	prov2.Adopt(h1.prov)
+	h1.cancel()
+	h2 := newHarness(t, cfg, prov2)
+	mustType(t, h2.heartbeat(c), wire.TypeSuccessResponse) // adopted
+	h2.holdBack(wire.PrepareRequest{SQL: "COMMIT", QueryUUID: uuidA}.Encode(wire.Header{ConnectionID: c}))
+	eventually(t, "the COMMIT at the gateway", func() bool { return h2.gw.InFlight() == 1 })
+	start := time.Now()
+	mustTimeout(t, h2.fetch(c, uuidA, 1), "300ms", "limits.queryTimeout")
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Fatalf("the FETCH got the error after %s, before the limit", d)
+	}
+	waitCancels(t, srv, uuidA)
+}
+
 // A PREPARE waits until the engine has answered the CANCEL for the previous
 // query: the CANCEL must not meet the next query.
 func TestPrepareWaitsForTheTimeoutCancel(t *testing.T) {

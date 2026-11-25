@@ -296,15 +296,18 @@ SELECT 'after_engine=' || engine AS result FROM remote.whoami;" || return 1
 	expect_no_output "$phase" 'long=1000000000000' "the query returned no result" || return 1
 	expect_ge 30 "$elapsed" "the error came at the limit, not at the end of the query, and the session runs the next query (after ${elapsed}s)" || return 1
 
-	# The join with a local table makes the client fetch the 5 * 10^9 rows.
+	# The join with a local table makes the client fetch the 5 * 10^10 rows.
+	# DuckDB sends the rows of range() compactly: on an idle 4-core machine
+	# the engine delivered 5 * 10^9 of them in 4 s, within the limit (the
+	# client then joined for 16 s more, which the limit does not count).
 	t0=$(now)
-	session_send h_limit "SELECT 'joined=' || CAST(count(*) AS VARCHAR) AS result FROM remote.query('SELECT range AS i FROM range(5000000000)') r JOIN h_one ON r.i % 2 = h_one.k;
+	session_send h_limit "SELECT 'joined=' || CAST(count(*) AS VARCHAR) AS result FROM remote.query('SELECT range AS i FROM range(50000000000)') r JOIN h_one ON r.i % 2 = h_one.k;
 SELECT 'after_fetch=' || engine AS result FROM remote.whoami;" || return 1
 	session_wait h_limit 'after_fetch=shared' 120 '' || return 1
 	elapsed=$(($(now) - t0))
 	session_output h_limit >"$phase"
 	expect_output "$phase" "$msg" "while the client fetches: the query fails with the gateway's error" || return 1
-	expect_no_output "$phase" 'joined=2500000000' "the query returned no result" || return 1
+	expect_no_output "$phase" 'joined=25000000000' "the query returned no result" || return 1
 	expect_ge 30 "$elapsed" "the session runs the next query (after ${elapsed}s)" || return 1
 	after=$(metric_sum "$GATEWAY_ADMIN" quackmux_requests_total 'type="FETCH_REQUEST"' 'outcome="query_timeout"')
 	expect_ge "$after" $((fetches + 1)) "the gateway answered the waiting FETCHes ($fetches -> $after)" || return 1

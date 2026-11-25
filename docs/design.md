@@ -262,10 +262,10 @@ das Gateway keine Queries.
   Weiterleiten keine Query mit Limit kennt (sein Body kann langsam kommen), zählt deshalb als Request der ersten
   Query, die das Gateway danach zu verfolgen beginnt und die er bedienen kann (ein FETCH eine mit seiner
   `query_uuid`, ein Upload jede mit Limit). Ebenso zählen die Requests einer Query, die endet oder die das Gateway
-  vergisst (siehe „Speicher“), während sie unterwegs sind, für die neueste Query, die sie bedienen können. Hat diese
-  ihr Limit schon überschritten, ohne dass ein Request auf sie wartete, bricht das Gateway sie sofort ab wie beim
-  nächsten Request für sie; ist es mit ihr am Limit schon fertig, bricht es den Request ab und beantwortet ihn mit
-  dem Fehler des Zeitlimits. `COMMIT` und `ROLLBACK` beanspruchen keinen FETCH und keinen Upload, auch keinen FETCH
+  vergisst (siehe „Speicher“), während sie unterwegs sind, für die neueste Query, die sie bedienen können, und gibt
+  es keine, für die nächste, die beginnt. Hat diese Query ihr Limit schon überschritten, ohne dass ein Request auf
+  sie wartete, bricht das Gateway sie sofort ab wie beim nächsten Request für sie; ist es mit ihr am Limit schon
+  fertig, bricht es den Request ab und beantwortet ihn mit dem Fehler des Zeitlimits. `COMMIT` und `ROLLBACK` beanspruchen keinen FETCH und keinen Upload, auch keinen FETCH
   mit ihrer `query_uuid`: Sie haben keine Uhr, die ihn begrenzen könnte. Antworten auf solche Requests beenden nichts.
   Ein Client kann die Uhr einer laufenden Query so nicht anhalten, auch nicht mit einem PREPARE derselben
   `query_uuid`, das die Engine ablehnt oder das eine frühere Query ersetzt, mit einem `COMMIT`, dessen Body er

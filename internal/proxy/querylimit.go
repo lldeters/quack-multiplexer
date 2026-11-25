@@ -680,8 +680,10 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 // PREPARE was answered (a result exists only then), else the newest one. A
 // statement without a limit claims nothing: the engine may serve the
 // request for the next query, and nothing would stop its clock. known
-// reports whether a query of the session has *uuid, also one without a
-// limit.
+// reports whether a query of the session has *uuid: one with a limit, or
+// one without a limit whose PREPARE was answered. A COMMIT or ROLLBACK that
+// still waits for its answer does not count: until it reaches the engine,
+// the engine may run a query of that uuid from before an adoption.
 func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) (q *trackedQuery, known bool) {
 	var newest *trackedQuery
 	for i := len(sq.queries) - 1; i >= 0; i-- {
@@ -689,10 +691,11 @@ func (sq *sessionQueries) findLocked(uuid *wire.Hugeint) (q *trackedQuery, known
 		if uuid != nil && (!o.uuidKnown || o.uuid != *uuid) {
 			continue
 		}
-		known = true
 		if o.limit <= 0 {
+			known = known || !o.preparing
 			continue
 		}
+		known = true
 		if !o.preparing {
 			return o, true
 		}
