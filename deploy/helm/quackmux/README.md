@@ -14,8 +14,12 @@ beschreibt [deploy/kubernetes/README.md](../../kubernetes/README.md); hier steht
   `ghcr.io/lldeters/duckdb-engine` wie bei Kustomize ([Voraussetzungen](../../kubernetes/README.md#voraussetzungen)).
   Die Chart-Version ist das quackmux-Release; das Gateway-Image hat dessen Tag, das Engine-Image steht in der
   Konfiguration (`profiles.<name>.image`).
-* Ein eigener Namespace pro Release: Die Role des Gateways darf alle Secrets darin lesen, und die NetworkPolicies
-  gelten für alle Engines des Namespaces.
+* **Ein Gateway pro Namespace**, also ein eigener Namespace pro Release. Die Gateway-Pods aller Releases tragen
+  dieselben Labels, und die mitgelieferte Konfiguration nennt dieselbe `provider.kubernetes.instance`: Zwei
+  Releases oder ein Release neben einer Kustomize-Installation teilten sich Service-Endpunkte,
+  PodDisruptionBudget, NetworkPolicies, Lease und Engines. `helm install` und `helm upgrade` brechen deshalb ab,
+  wenn im Namespace schon ein anderes Gateway-Deployment steht. Außerdem darf die Role des Gateways alle Secrets
+  des Namespaces lesen.
 
 ## Installation
 
@@ -218,17 +222,27 @@ kubectl -n quackmux rollout status deployment/quackmux
 Replikas sind ready, Quack-Traffic bekommt nur der Leader. Verhalten bei Übergabe, Ausfall, Rollout und
 Node-Wartung: [Hochverfügbarkeit](../../kubernetes/README.md#hochverfügbarkeit-overlaysha).
 
-* **Umstieg eines laufenden Releases:** zuerst das einzelne Gateway stoppen, damit nie ein Gateway ohne
-  Leader-Election neben einem Leader läuft. Das Chart prüft das und bricht sonst ab:
+* **Umstieg eines laufenden Releases:** zuerst das einzelne Gateway stoppen und warten, bis sein Pod weg ist,
+  damit nie ein Gateway ohne Leader-Election neben einem Leader läuft. `helm install` und `helm upgrade` prüfen
+  das (Replikas des Deployments, noch vorhandene Gateway-Pods) und brechen sonst ab:
 
   ```sh
   kubectl -n quackmux scale deployment/quackmux --replicas=0
-  kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/component=gateway --timeout=120s
+  kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/name=quackmux,app.kubernetes.io/component=gateway \
+    --timeout=120s
   helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --set ha.enabled=true
   ```
 
-  Zurück ohne HA genügt `helm upgrade` mit `ha.enabled=false`: Die Strategie `Recreate` beendet alle alten Pods,
-  bevor der neue startet.
+  Zurück ohne HA genügt `helm upgrade` mit `ha.enabled=false` (oder `helm rollback` auf eine Revision ohne HA):
+  Die Strategie `Recreate` beendet alle alten Pods, bevor der neue startet.
+* **`helm rollback` prüft nichts:** Es rendert das Chart nicht, sondern spielt die gespeicherte Revision ein.
+  Läuft das Gateway ohne HA, startet ein Rollback auf eine Revision mit `ha.enabled` Leader neben ihm (beim Wechsel
+  von `Recreate` auf `RollingUpdate` skaliert der Deployment-Controller sogar das alte ReplicaSet mit hoch). Davor
+  also dieselben Schritte: auf 0 skalieren, warten, bis der Pod weg ist, dann `helm rollback`. Dasselbe gilt für
+  den automatischen Rollback von `helm upgrade --atomic` (Helm 3) und `--rollback-on-failure` (Helm 4): nicht für
+  ein Upgrade verwenden, das `ha.enabled` ändert. GitOps-Werkzeuge, die mit `helm template` rendern (Argo CD),
+  prüfen ebenfalls nichts: vor dem Sync, der `ha.enabled` einschaltet, Auto-Sync aussetzen, auf 0 skalieren und
+  warten.
 * Ohne Platz für einen dritten Gateway-Pod: `ha.rollingUpdate.maxSurge=0` und `ha.rollingUpdate.maxUnavailable=1`.
 * Die Lease (`ha.leaseName`, `ha.namespace`, `provider.kubernetes.instance`) nicht per Upgrade ändern
   ([Lease nicht per Rollout ändern](../../kubernetes/README.md#hochverfügbarkeit-overlaysha)).
@@ -308,8 +322,9 @@ alles außer:
 
 Dazu kommt Verhalten, das Kustomize nicht hat: Die mitgelieferte Konfiguration folgt dem Namespace des Releases,
 und das Chart bricht ab bei mehreren Replikas ohne `ha.enabled`, bei einer Replika mit `ha.enabled`, bei
-Konfiguration und Wert `ha.enabled`, die nicht zusammenpassen, bei Engines außerhalb des Namespaces des Releases
-und beim Umstieg auf HA, solange das Gateway ohne Leader-Election läuft.
+Konfiguration und Wert `ha.enabled`, die nicht zusammenpassen, bei Engines außerhalb des Namespaces des Releases,
+bei einem zweiten Gateway im Namespace und beim Umstieg auf HA, solange das Gateway ohne Leader-Election läuft
+(die letzten beiden prüfen nur `helm install` und `helm upgrade`).
 
 Ändert sich `base/config.yaml` oder `overlays/ha/config.yaml`, schlägt `go test ./test/helm/` fehl, bis die
 Kopien in `files/` nachgezogen sind:

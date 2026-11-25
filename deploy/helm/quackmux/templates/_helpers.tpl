@@ -316,18 +316,68 @@ and the client may send the query again. Prints nothing.
 {{- end -}}
 
 {{/*
-quackmux.checkHASwitch: switching an installed release to ha.enabled must not
-start leaders next to the gateway without leader election that still runs
-(both would manage the engines). The README asks to scale it to 0 first;
-helm install and upgrade check that against the cluster (lookup). Prints
-nothing.
+quackmux.isGateway: "true" if the labels (a map) select gateway pods, those
+of quackmux.selectorLabels. Argument: the labels.
+*/}}
+{{- define "quackmux.isGateway" -}}
+{{- $labels := default dict . -}}
+{{- if and (eq (toString (get $labels "app.kubernetes.io/name")) "quackmux") (eq (toString (get $labels "app.kubernetes.io/component")) "gateway") -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+quackmux.checkOneGateway: one gateway per namespace. The gateway pods of
+every release carry the same labels (those of deploy/kubernetes; a
+Deployment's selector is immutable), and the shipped configuration names the
+same engine instance and lease: a second release, or an installation with
+kubectl apply -k, in the same namespace would share the Service endpoints,
+the PodDisruptionBudget, the lease and the engines. helm install and upgrade
+check the Deployments in the namespace (lookup); helm template, helm rollback
+and GitOps tools that render with helm template do not. Prints nothing.
+*/}}
+{{- define "quackmux.checkOneGateway" -}}
+{{- range dig "items" list (lookup "apps/v1" "Deployment" .Release.Namespace "") -}}
+{{- if include "quackmux.isGateway" (dig "spec" "selector" "matchLabels" dict .) -}}
+{{- $release := dig "metadata" "annotations" "meta.helm.sh/release-name" "" . -}}
+{{- $releaseNamespace := dig "metadata" "annotations" "meta.helm.sh/release-namespace" "" . -}}
+{{- if not $release -}}
+{{- fail (printf "namespace %s already has the gateway deployment/%s, not installed with Helm (kubectl apply -k?): one gateway per namespace, the two would share Services, PodDisruptionBudget, lease and engines; remove it first (README.md, \"Umstieg von Kustomize\") or use another namespace" $.Release.Namespace .metadata.name) -}}
+{{- else if or (ne $release $.Release.Name) (ne $releaseNamespace $.Release.Namespace) -}}
+{{- fail (printf "namespace %s already has the gateway deployment/%s of the Helm release %s: one gateway per namespace, the two would share Services, PodDisruptionBudget, lease and engines; use another namespace" $.Release.Namespace .metadata.name $release) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+quackmux.checkHASwitch: switching to ha.enabled must not start leaders next
+to a gateway without leader election that still runs (both would manage the
+engines). The README asks to scale it to 0 and to wait until its pod is gone;
+helm install and upgrade check both against the cluster (lookup): with
+ha.enabled they fail while the live Deployment has the Recreate strategy (no
+leader election) and replicas, or while it, or no Deployment at all, leaves
+gateway pods that have not ended. helm rollback renders nothing and is not
+checked (README.md, "Hochverfügbarkeit"). Prints nothing.
 */}}
 {{- define "quackmux.checkHASwitch" -}}
 {{- if .Values.ha.enabled -}}
 {{- $name := include "quackmux.fullname" . -}}
 {{- $live := lookup "apps/v1" "Deployment" .Release.Namespace $name -}}
-{{- if and $live (eq (toString (dig "spec" "strategy" "type" "" $live)) "Recreate") (gt (int (dig "spec" "replicas" 0 $live)) 0) -}}
+{{- $recreate := eq (toString (dig "spec" "strategy" "type" "" $live)) "Recreate" -}}
+{{- if and $live $recreate (gt (int (dig "spec" "replicas" 0 $live)) 0) -}}
 {{- fail (printf "ha.enabled: deployment/%s runs without leader election; scale it to 0 first (kubectl -n %s scale deployment/%s --replicas=0), wait until its pod is gone, then upgrade" $name .Release.Namespace $name) -}}
+{{- end -}}
+{{- if or (not $live) $recreate -}}
+{{- $pods := list -}}
+{{- range dig "items" list (lookup "v1" "Pod" .Release.Namespace "") -}}
+{{- if and (include "quackmux.isGateway" (dig "metadata" "labels" dict .)) (not (has (dig "status" "phase" "" .) (list "Succeeded" "Failed"))) -}}
+{{- $pods = append $pods .metadata.name -}}
+{{- end -}}
+{{- end -}}
+{{- if $pods -}}
+{{- fail (printf "ha.enabled: the gateway pods %s have not ended yet, and they may run without leader election; wait until they are gone (kubectl -n %s wait --for=delete pod -l app.kubernetes.io/name=quackmux,app.kubernetes.io/component=gateway --timeout=120s), then upgrade" (join ", " $pods) .Release.Namespace) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

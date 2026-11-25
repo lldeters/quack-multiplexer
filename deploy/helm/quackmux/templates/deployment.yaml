@@ -14,6 +14,7 @@ The gateway reads its configuration once at start-up. A changed one has a
 ConfigMap of a new name (configmap.yaml), so it rolls out, and the pods of
 earlier ReplicaSets keep theirs.
 */ -}}
+{{- include "quackmux.checkOneGateway" . -}}
 {{- include "quackmux.checkHASwitch" . -}}
 {{- include "quackmux.checkGracePeriod" . -}}
 apiVersion: apps/v1
