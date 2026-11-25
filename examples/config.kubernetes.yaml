@@ -414,10 +414,12 @@ profiles:
     #   # the node's free disk. Keep it below
     #   # resources.limits.ephemeral-storage.
     #   max_temp_directory_size: 8GiB
-    #   # Spill directory. The default is /tmp/.tmp (in the pod's emptyDir)
-    #   # with ":memory:" and <database>.tmp next to a database file, which
-    #   # with persistence is on the data volume. A path below /tmp keeps the
-    #   # spill in the emptyDir.
+    # With persistence, add the spill directory (as the profile persistent
+    # of deploy/kubernetes/overlays/dev does). The default is /tmp/.tmp (in
+    # the pod's emptyDir) with ":memory:", but <database>.tmp next to a
+    # database file, which with persistence is on the data volume and takes
+    # the space of the data. A path below /tmp keeps the spill in the
+    # emptyDir, under the same limits:
     #   temp_directory: /tmp/duckdb-spill
     # Several engines per key, sessions spread over them (Kyuubi:
     # kyuubi.engine.pool.size / selectPolicy). Every engine has its own
