@@ -514,18 +514,23 @@ func (l *queryLimits) dropLocked(sq *sessionQueries) {
 // DISCONNECT; the channel is closed once nothing holds it any more.
 func (l *queryLimits) sessionClosed(s *session.Session, keep bool) <-chan struct{} {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	sq := l.sessions[s.ID]
 	if sq == nil || sq.sess != s {
+		l.mu.Unlock()
 		return nil
 	}
 	sq.closed = true
-	if keep && sq.holdsLocked() {
-		sq.hold = make(chan struct{})
-		return sq.hold
+	if !keep || !sq.holdsLocked() {
+		l.dropLocked(sq)
+		l.mu.Unlock()
+		return nil
 	}
-	l.dropLocked(sq)
-	return nil
+	hold := make(chan struct{})
+	sq.hold = hold
+	l.mu.Unlock()
+	l.g.log.Debug("the DISCONNECT of a closed session waits: the query time limit may still have to cancel a query of it",
+		"session", s.ID, "engine", s.EngineID)
+	return hold
 }
 
 // track starts following a request of sess right before the gateway
