@@ -84,11 +84,11 @@ func ran(srv *quacktest.Server, sql string) bool {
 func TestQueryLimitWhileSessionsClose(t *testing.T) {
 	h := newHarness(t, "limits: {queryTimeout: 30ms}\n", nil)
 	var wg sync.WaitGroup
-	for w := 0; w < 32; w++ {
+	for w := 0; w < 64; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 40; i++ {
+			for i := 0; i < 100; i++ {
 				c := h.connect("tok?user=alice", nil)
 				done := make(chan struct{})
 				go func() {
