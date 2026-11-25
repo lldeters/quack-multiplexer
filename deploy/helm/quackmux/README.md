@@ -21,6 +21,10 @@ beschreibt [deploy/kubernetes/README.md](../../kubernetes/README.md); hier steht
   PodDisruptionBudget, NetworkPolicies, Lease und Engines. `helm install` und `helm upgrade` brechen deshalb ab,
   wenn im Namespace schon ein anderes Gateway-Deployment steht. Außerdem darf die Role des Gateways alle Secrets
   des Namespaces lesen.
+* **Rechte für `helm install` und `helm upgrade`:** Das Chart liest dabei im Namespace des Releases die
+  Deployments, mit `ha.enabled` auch die Pods, und seine eigenen Secrets (`lookup`). Wer installiert, braucht dort
+  außer den Rechten zum Anlegen also `get` und `list` auf Deployments, Pods und Secrets; ein Namespace-Admin hat
+  sie. Fehlt eines, bricht Helm mit der Fehlermeldung der API ab.
 
 ## Installation
 
@@ -189,10 +193,18 @@ helm template quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --ku
   ```
 
 * `secrets.users.existingSecret` ersetzt den Wert `users` durch ein Secret mit dem Schlüssel `users.yaml`.
-* **Helm behält Session-Key und Admin-Token** (`helm.sh/resource-policy: keep`), auch wenn das Chart sie nicht mehr
-  rendert: beim Wechsel auf `existingSecret` (Pods früherer ReplicaSets hängen sie noch ein) und nach
-  `helm uninstall`. Ein neues Release desselben Namens übernimmt sie samt Werten. Entfernen:
-  [Deinstallieren](#deinstallieren).
+* **Helm behält die drei Secrets** (`helm.sh/resource-policy: keep`), auch wenn das Chart sie nicht mehr rendert:
+  beim Wechsel auf `existingSecret` (Pods früherer ReplicaSets hängen sie noch ein) und nach `helm uninstall`. Ein
+  neues Release desselben Namens übernimmt Session-Key und Admin-Token samt Werten; die Benutzer schreibt es aus
+  seinen Werten neu. Nach einem Wechsel auf `existingSecret` das alte Secret löschen, sobald der Rollout fertig ist
+  (das Benutzer-Secret enthält Token-Hashes oder mit `plain` die Tokens selbst):
+
+  ```sh
+  kubectl -n quackmux rollout status deployment/quackmux
+  kubectl -n quackmux delete secret quackmux-users
+  ```
+
+  Nach `helm uninstall`: [Deinstallieren](#deinstallieren).
 * **Vom erzeugten zu einem eigenen Secret** (etwa vor dem Umstieg auf Argo CD): den Wert in ein Secret mit anderem
   Namen kopieren und dieses nennen. Den Namen eines Secrets, das das Chart erzeugt, lehnt `existingSecret` ab.
 
@@ -290,8 +302,9 @@ oder `helm rollback`.
 
 `helm uninstall` entfernt die Objekte des Charts bis auf die, die Helm behält. Es bleiben:
 
-* **Session-Key, Admin-Token und die ConfigMaps** (`helm.sh/resource-policy: keep`); ein neues Release desselben
-  Namens übernimmt sie. Entfernen:
+* **Die Secrets (Session-Key, Admin-Token, Benutzer) und die ConfigMaps** (`helm.sh/resource-policy: keep`); ein
+  neues Release desselben Namens übernimmt sie. Ein Release mit anderem Namen, aber denselben Objektnamen (etwa
+  über `fullnameOverride`), lehnt Helm ab, solange sie da sind: Sie gehören noch dem alten Release. Entfernen:
 
   ```sh
   kubectl -n quackmux delete configmap,secret -l app.kubernetes.io/name=quackmux,app.kubernetes.io/instance=quackmux

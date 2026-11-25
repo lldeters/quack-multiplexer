@@ -305,13 +305,13 @@ func TestChartSecrets(t *testing.T) {
 		if got := mountedSecrets(t, objs); !reflect.DeepEqual(got, want) {
 			t.Errorf("mounted Secrets %v, want %v", got, want)
 		}
-		// Helm keeps the session key and the admin token when the chart
-		// stops rendering them (existingSecret, helm uninstall); the users
-		// file comes from the values anyway.
-		for name, keep := range map[string]bool{"quackmux-session-key": true, "quackmux-admin-token": true, "quackmux-users": false} {
-			policy := str(mustFind(t, objs, "Secret", name), "metadata", "annotations", "helm.sh/resource-policy")
-			if (policy == "keep") != keep {
-				t.Errorf("Secret %s: helm.sh/resource-policy %q, want keep %v", name, policy, keep)
+		// Helm keeps the Secrets when the chart stops rendering them
+		// (existingSecret, helm uninstall): pods of earlier ReplicaSets still
+		// mount them, and a new release of the same name finds the session
+		// key and the admin token again.
+		for _, name := range []string{"quackmux-session-key", "quackmux-admin-token", "quackmux-users"} {
+			if policy := str(mustFind(t, objs, "Secret", name), "metadata", "annotations", "helm.sh/resource-policy"); policy != "keep" {
+				t.Errorf("Secret %s: helm.sh/resource-policy %q, want keep", name, policy)
 			}
 		}
 	})

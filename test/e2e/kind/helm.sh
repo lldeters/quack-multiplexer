@@ -522,6 +522,12 @@ restarted() {
 	[ "${n:-0}" -ge 1 ]
 }
 
+# refused_field POD succeeds once the log of the previous start of POD's
+# gateway names the field the gateway refused.
+refused_field() {
+	kctl -n "$NS" logs "$1" -c gateway --previous 2>/dev/null | grep -qF 'unknown field "maxEngine"'
+}
+
 # ready_pods_of HASH COUNT succeeds once COUNT pods of the ReplicaSet HASH
 # are ready.
 ready_pods_of() {
@@ -551,10 +557,11 @@ scenario_refused_config() {
 		return 1
 	fi
 	wait_for 120 "the new pod $new to fail" restarted "$new" || return 1
-	if kctl -n "$NS" logs "$new" --previous 2>/dev/null | grep -qF 'unknown field "maxEngine"'; then
+	# The log of the failed start may take a moment to become readable.
+	if wait_for 60 "the log of $new to name the field maxEngine" refused_field "$new"; then
 		ok "the new pod $new refuses the configuration (unknown field \"maxEngine\")"
 	else
-		warn "the log of $new does not name the field maxEngine"
+		return 1
 	fi
 	expect_leader_endpoint || return 1
 	# A drain, an eviction or an OOM kill replaces an old pod.
@@ -613,6 +620,8 @@ scenario_uninstall() {
 		"helm uninstall removed the Deployment, the NetworkPolicies, the Service and the PodDisruptionBudget" || return 1
 	expect_eq "$(kctl -n "$NS" get pods -l app.kubernetes.io/component=engine -o name)" "" "no engine pod is left" || return 1
 	expect_eq "$(secret_digest)" "$SECRETS_BEFORE" "Helm kept the session key and the admin token" || return 1
+	expect_eq "$(kctl -n "$NS" get secret quackmux-users -o name 2>/dev/null)" "secret/quackmux-users" \
+		"Helm kept the users Secret" || return 1
 	n=$(nlines "$(config_maps)")
 	expect_ge "$n" 4 "Helm kept the ConfigMaps (dev, dev changed, HA, HA changed)" || return 1
 
