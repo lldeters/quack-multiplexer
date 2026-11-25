@@ -243,8 +243,8 @@ type EngineConfig struct {
 	// that their sessions can re-attach with their next heartbeat.
 	RecoveryGrace Duration `json:"recoveryGrace"`
 	// CloseOrphanedConnections closes the connections on recovered engines
-	// that no session adopted within RecoveryGrace (see
-	// CloseOrphanedConnectionsEnabled).
+	// whose engine lease ran out after a takeover without a session (see
+	// CloseOrphanedConnectionsEnabled and OrphanGrace).
 	CloseOrphanedConnections *bool `json:"closeOrphanedConnections,omitempty"`
 	// CheckInterval is the reconcile period.
 	CheckInterval Duration `json:"checkInterval"`

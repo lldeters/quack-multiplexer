@@ -6,8 +6,8 @@ import "time"
 // a (re)start or a leader takeover, the connections on recovered engines that
 // no session adopted (engine.closeOrphanedConnections): those of clients that
 // died while no gateway ran, which the Quack server never collects. The
-// default is true, except for the static provider: its engines may serve
-// other gateways or clients as well.
+// default is true, except for the static provider: its engines are not the
+// gateway's own, other gateways or clients may use them as well.
 func (c *Config) CloseOrphanedConnectionsEnabled() bool {
 	if v := c.Engine.CloseOrphanedConnections; v != nil {
 		return *v
@@ -15,16 +15,14 @@ func (c *Config) CloseOrphanedConnectionsEnabled() bool {
 	return c.Provider.Type != "static"
 }
 
-// OrphanGrace is how long a connection that existed on a recovered engine
-// when the gateway took over must go without a session before the gateway
-// closes it: engine.recoveryGrace, but at least the longest heartbeat
-// interval of a client (DuckDB heartbeats every third of its lease, with up
-// to 20% jitter) plus session.heartbeatGrace, and at least
-// server.upstream.handshakeTimeout, so that a handshake that was under way
-// when the gateway first listed the connections has ended.
+// OrphanGrace is how long after a takeover the gateway waits before it
+// probes the connections that a recovered engine held at the takeover and
+// that no session adopted: session.backendHeartbeatTimeout plus
+// session.heartbeatGrace. The gateway asks for that lease at every handshake
+// with an engine and renews it only while a session is open, so by then the
+// lease of every connection that only the previous process kept alive has
+// run out, and the engine removes it at the probe. A connection whose lease
+// still runs, the engine renews instead.
 func (c *Config) OrphanGrace() time.Duration {
-	ss := c.Session
-	d := c.Engine.RecoveryGrace.Duration
-	d = max(d, ss.MaxHeartbeatTimeout.Duration*2/5+ss.HeartbeatGrace.Duration)
-	return max(d, c.Server.Upstream.HandshakeTimeout.Duration)
+	return c.Session.BackendHeartbeatTimeout.Duration + c.Session.HeartbeatGrace.Duration
 }

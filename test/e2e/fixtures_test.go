@@ -302,12 +302,18 @@ func TestGatewayConfigs(t *testing.T) {
 		t.Errorf("%s: session.idleTimeout %s is short enough to break scenarios", gatewayConfig, d)
 	}
 
-	// Scenario k restarts gateway and waits for the orphan grace; gateway-idle
-	// shares the engines and must not close connections of gateway.
+	// Scenario k restarts gateway, which then probes the connections that no
+	// client asks for once their engine lease has run out. The lease must
+	// outlast the restart, so that the living clients find their
+	// connections, and the grace must fit the run. gateway-idle never
+	// restarts.
 	if !gw.CloseOrphanedConnectionsEnabled() || idle.CloseOrphanedConnectionsEnabled() {
 		t.Errorf("engine.closeOrphanedConnections must be on in %s only", gatewayConfig)
 	}
-	if d := gw.OrphanGrace(); d > time.Minute {
+	if l := gw.Session.BackendHeartbeatTimeout.Duration; l < time.Minute {
+		t.Errorf("%s: session.backendHeartbeatTimeout %s is too short for the living clients of scenario k", gatewayConfig, l)
+	}
+	if d := gw.OrphanGrace(); d > 2*time.Minute {
 		t.Errorf("%s: the orphan grace %s is too long for scenario k", gatewayConfig, d)
 	}
 
@@ -316,7 +322,7 @@ func TestGatewayConfigs(t *testing.T) {
 	adjusted.Session = gw.Session
 	adjusted.Engine.CheckInterval = gw.Engine.CheckInterval
 	adjusted.Engine.CloseOrphanedConnections = gw.Engine.CloseOrphanedConnections
-	adjusted.Engine.RecoveryGrace = gw.Engine.RecoveryGrace
+	adjusted.Engine.RecoveryGrace = gw.Engine.RecoveryGrace // derived from session.maxHeartbeatTimeout
 	if !reflect.DeepEqual(&adjusted, gw) {
 		t.Errorf("%s and %s differ in more than the session and engine timing and the orphan sweep", gatewayConfig, idleConfig)
 	}

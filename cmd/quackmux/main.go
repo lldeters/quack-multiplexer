@@ -398,8 +398,9 @@ func cmdServe(args []string) error {
 			return err
 		}
 		go sessions.Run(ctx)
-		// Before the first request is served: the sweep notes from now on
-		// which connections of the recovered engines clients ask for.
+		// The connections that the recovered engines hold as this process
+		// takes over: the sweep probes those that no session adopts once
+		// their engine lease has run out.
 		sessions.SweepOrphans(ctx, engines.RecoveredTargets())
 		started.Store(true)
 		if labeler != nil {

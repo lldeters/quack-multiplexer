@@ -5,8 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,23 +51,23 @@ func (e *sweepEngines) Exists(id string) (engine.State, bool) {
 func (e *sweepEngines) AttachAdopted(string, string, string) {}
 func (e *sweepEngines) DetachSession(string)                 {}
 
-// sweepBackend is an engine's connection table behind the Backend interface.
+// sweepBackend is an engine's connection table behind the Backend interface,
+// with the lease semantics of the Quack server: a message for a connection
+// whose lease ran out removes it and fails, any other message renews it.
 type sweepBackend struct {
-	mu        sync.Mutex
-	conns     map[string]bool
-	cancelled []string
-	listErr   error
-	closeErr  error
-	// confirm, if set, blocks the confirming heartbeat of an adoption until
-	// it is closed; confirming is closed when one is waiting.
-	confirm    chan struct{}
-	confirming chan struct{}
+	mu       sync.Mutex
+	conns    map[string]bool // id -> lease expired
+	beats    map[string]int  // heartbeats per connection
+	listings int
+	closes   []string // DISCONNECT and CANCEL: the sweep sends neither
+	listErr  error
+	beatErr  error
 }
 
 func newSweepBackend(conns ...string) *sweepBackend {
-	b := &sweepBackend{conns: map[string]bool{}}
+	b := &sweepBackend{conns: map[string]bool{}, beats: map[string]int{}}
 	for _, c := range conns {
-		b.conns[c] = true
+		b.conns[c] = false
 	}
 	return b
 }
@@ -75,27 +75,48 @@ func newSweepBackend(conns ...string) *sweepBackend {
 func (b *sweepBackend) has(conn string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.conns[conn]
+	_, ok := b.conns[conn]
+	return ok
 }
 
+// add creates a connection, expire lets its lease run out.
 func (b *sweepBackend) add(conn string) {
 	b.mu.Lock()
-	b.conns[conn] = true
+	b.conns[conn] = false
 	b.mu.Unlock()
 }
 
-func gone() error {
-	return &upstream.EngineError{Response: wire.ErrorResponse{Message: upstream.MsgInvalidConnection}}
+func (b *sweepBackend) expire(conns ...string) {
+	b.mu.Lock()
+	for _, c := range conns {
+		b.conns[c] = true
+	}
+	b.mu.Unlock()
+}
+
+func engineErr(msg string) error {
+	return &upstream.EngineError{Response: wire.ErrorResponse{Message: msg}}
+}
+
+// message applies the lease check of the Quack server to a message for conn.
+func (b *sweepBackend) message(conn string) error {
+	expired, ok := b.conns[conn]
+	switch {
+	case !ok:
+		return engineErr(upstream.MsgInvalidConnection)
+	case expired:
+		delete(b.conns, conn)
+		return engineErr(upstream.MsgLeaseExpired)
+	}
+	return nil
 }
 
 func (b *sweepBackend) Disconnect(_ context.Context, _, conn string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.closeErr != nil {
-		return b.closeErr
-	}
-	if !b.conns[conn] {
-		return gone()
+	b.closes = append(b.closes, "DISCONNECT "+conn)
+	if err := b.message(conn); err != nil {
+		return err
 	}
 	delete(b.conns, conn)
 	return nil
@@ -104,24 +125,24 @@ func (b *sweepBackend) Disconnect(_ context.Context, _, conn string) error {
 func (b *sweepBackend) CancelAll(_ context.Context, _, conn string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.cancelled = append(b.cancelled, conn)
-	return nil
+	b.closes = append(b.closes, "CANCEL "+conn)
+	return b.message(conn)
 }
 
 func (b *sweepBackend) Heartbeat(_ context.Context, _, conn string) error {
-	if b.confirm != nil {
-		close(b.confirming)
-		<-b.confirm
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.beats[conn]++
+	if b.beatErr != nil {
+		return b.beatErr
 	}
-	if !b.has(conn) {
-		return gone()
-	}
-	return nil
+	return b.message(conn)
 }
 
 func (b *sweepBackend) Connections(context.Context, string, string) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.listings++
 	if b.listErr != nil {
 		return nil, b.listErr
 	}
@@ -130,6 +151,12 @@ func (b *sweepBackend) Connections(context.Context, string, string) ([]string, e
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+func (b *sweepBackend) heartbeats(conn string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.beats[conn]
 }
 
 type sweepRig struct {
@@ -141,9 +168,9 @@ type sweepRig struct {
 	sealer  *Sealer
 }
 
-func newSweepRig(t *testing.T, conns ...string) *sweepRig {
+func newSweepRig(t *testing.T, yaml string, conns ...string) *sweepRig {
 	t.Helper()
-	cfg, err := config.Parse([]byte("auth: {mode: none}\n"))
+	cfg, err := config.Parse([]byte("auth: {mode: none}\n" + yaml))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,206 +229,215 @@ func (r *sweepRig) sweeps(result string) float64 {
 }
 
 const (
-	connLive   = "A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1"
-	connDead   = "D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0"
-	connLate   = "B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2"
-	connRacing = "C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3"
+	connLive    = "A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1"
+	connDead    = "D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0"
+	connCut     = "B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2"
+	connForeign = "C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3"
+	connLate    = "E4E4E4E4E4E4E4E4E4E4E4E4E4E4E4E4"
 )
 
-// The sweep closes what no client asked for, keeps the adopted connection
-// and leaves connections created after the first listing alone; the client
-// of the closed connection learns why.
-func TestOrphanSweepClosesWhatNoClientAskedFor(t *testing.T) {
-	r := newSweepRig(t, connLive, connDead)
-	live, dead := r.id(connLive), r.id(connDead)
+// The sweep probes what no session adopted. The engine removes the dead
+// client's connection, whose lease ran out; it keeps the connection of a
+// client that was cut off for longer than any heartbeat interval but whose
+// lease still runs, and one that someone else keeps alive. The sweep sends
+// neither DISCONNECT nor CANCEL, and leaves the adopted connection and one
+// created after the takeover alone.
+func TestOrphanSweepRemovesOnlyExpiredConnections(t *testing.T) {
+	r := newSweepRig(t, "", connLive, connDead, connCut, connForeign)
+	live, dead, cut := r.id(connLive), r.id(connDead), r.id(connCut)
 	s := r.begin()
 	if s, c, err := r.m.Resolve(live); s == nil || c != nil || err != nil {
 		t.Fatalf("adoption of the live session failed: %v %v", c, err)
 	}
-	r.backend.add(connLate) // a session of this process (handshake under way)
+	r.backend.add(connLate)                       // a handshake of this process
+	r.backend.expire(connDead, connLate)          // nobody renewed them
+	beatsBefore := r.backend.heartbeats(connLive) // the confirming heartbeat
 
 	if n := s.Finish(context.Background()); n != 1 {
 		t.Fatalf("closed %d connections, want 1", n)
 	}
-	if r.backend.has(connDead) || !r.backend.has(connLive) || !r.backend.has(connLate) {
-		t.Fatalf("engine holds %v after the sweep", r.backend.conns)
+	if r.backend.has(connDead) {
+		t.Fatal("the connection of the dead client is still there")
 	}
-	if !slices.Equal(r.backend.cancelled, []string{connDead}) {
-		t.Fatalf("cancelled %v, want the orphan only (a query of a dead client may still run)", r.backend.cancelled)
+	for _, c := range []string{connLive, connCut, connForeign, connLate} {
+		if !r.backend.has(c) {
+			t.Fatalf("the sweep removed %s", c)
+		}
 	}
-	_, c, err := r.m.Resolve(dead)
-	if err != nil || c == nil || c.Reason != orphanReason || c.Transient || c.MustInvalidate {
-		t.Fatalf("the late client got %+v, %v; want the orphan reason", c, err)
+	if len(r.backend.closes) != 0 {
+		t.Fatalf("the sweep sent %v", r.backend.closes)
 	}
-	if _, c, _ = r.m.Resolve(dead); c == nil || c.Reason != orphanReason {
-		t.Fatalf("the second request got %+v", c)
+	if n := r.backend.heartbeats(connLive); n != beatsBefore {
+		t.Fatal("the sweep probed the connection of an open session")
+	}
+	if r.backend.heartbeats(connLate) != 0 {
+		t.Fatal("the sweep probed a connection created after the takeover")
+	}
+	if r.backend.heartbeats(connCut) != 1 || r.backend.heartbeats(connForeign) != 1 {
+		t.Fatal("the sweep did not probe every connection that no session adopted")
 	}
 	if got := r.counter("quackmux_orphaned_connections_closed_total", ""); got != 1 || r.sweeps("ok") != 1 {
 		t.Fatalf("metrics: %v closed, %v ok sweeps", got, r.sweeps("ok"))
 	}
-	if r.m.seen != nil {
-		t.Fatal("the sweep still notes connections after it finished")
+
+	// The client that was cut off comes back after the sweep and keeps its
+	// connection; the dead one, should it come back, learns that the engine
+	// let its connection go.
+	if s, c, err := r.m.Resolve(cut); s == nil || c != nil || err != nil {
+		t.Fatalf("the client that was cut off lost its session: %+v %v", c, err)
+	}
+	if _, c, err := r.m.Resolve(dead); err != nil || c == nil || c.Transient || c.MustInvalidate {
+		t.Fatalf("the late client got %+v, %v", c, err)
 	}
 }
 
-// A client whose first request arrives while the sweep decides is noted
-// before its adoption asks the engine, and keeps its connection.
-func TestOrphanSweepKeepsAdoptionUnderWay(t *testing.T) {
-	r := newSweepRig(t, connRacing)
-	racing := r.id(connRacing)
-	s := r.begin()
-	r.backend.confirm, r.backend.confirming = make(chan struct{}), make(chan struct{})
-	done := make(chan *Closed, 1)
-	go func() {
-		_, c, _ := r.m.Resolve(racing)
-		done <- c
-	}()
-	<-r.backend.confirming // the adoption waits for the engine
-	if n := s.Finish(context.Background()); n != 0 {
-		t.Fatalf("the sweep closed %d connections during an adoption", n)
+// SweepOrphans waits for the engine lease plus the heartbeat grace by the
+// manager's clock: ticks alone do not end the wait, whatever their values.
+func TestSweepOrphansWaitsForTheEngineLease(t *testing.T) {
+	r := newSweepRig(t, "session: {checkInterval: 5ms, backendHeartbeatTimeout: 60s, heartbeatGrace: 10s}\n", connDead)
+	var mu sync.Mutex
+	clock := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
 	}
-	close(r.backend.confirm)
-	if c := <-done; c != nil {
-		t.Fatalf("the adoption failed: %+v", c)
+	advance := func(d time.Duration) {
+		mu.Lock()
+		clock = clock.Add(d)
+		mu.Unlock()
 	}
-	if !r.backend.has(connRacing) || r.m.Count() != 1 {
-		t.Fatal("the adopted connection is gone")
+	r.m.SetClock(now)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.m.SweepOrphans(ctx, []engine.Target{r.engines.target()})
+	eventually(t, "the first listing", func() bool {
+		r.backend.mu.Lock()
+		defer r.backend.mu.Unlock()
+		return r.backend.listings == 1
+	})
+	r.backend.expire(connDead)
+	advance(69 * time.Second)
+	time.Sleep(50 * time.Millisecond) // ten ticks
+	if r.backend.heartbeats(connDead) != 0 {
+		t.Fatal("the sweep probed before the engine lease and the heartbeat grace had passed")
 	}
-}
-
-// A client whose adoption failed for a passing reason (the engine was not
-// reachable) asked for its connection all the same.
-func TestOrphanSweepKeepsConnectionOfFailedAdoption(t *testing.T) {
-	r := newSweepRig(t, connLive)
-	live := r.id(connLive)
-	s := r.begin()
-	r.engines.mu.Lock()
-	r.engines.gone = true // Lookup fails: "engine is not ready"
-	r.engines.mu.Unlock()
-	if _, c, _ := r.m.Resolve(live); c == nil {
-		t.Fatal("adoption succeeded without the engine")
-	}
-	r.engines.mu.Lock()
-	r.engines.gone = false
-	r.engines.mu.Unlock()
-	if n := s.Finish(context.Background()); n != 0 || !r.backend.has(connLive) {
-		t.Fatalf("closed %d connections of a client that came back", n)
-	}
-	if _, c, _ := r.m.Resolve(live); c != nil {
-		t.Fatalf("the retry got %+v", c)
+	advance(time.Second)
+	eventually(t, "the probe", func() bool { return !r.backend.has(connDead) })
+	if r.counter("quackmux_orphaned_connections_closed_total", "") != 1 {
+		t.Fatal("the removed connection was not counted")
 	}
 }
 
-// Without a fresh leader lease nothing is closed; an engine that is gone, or
-// a listing that fails, ends the sweep of that engine, and a close that
-// fails leaves the connection usable for a late client.
+// A sweep whose context ends while it waits probes nothing.
+func TestSweepOrphansStopsWithContext(t *testing.T) {
+	r := newSweepRig(t, "session: {checkInterval: 5ms}\n", connDead)
+	var late atomic.Bool
+	r.m.SetClock(func() time.Time {
+		if late.Load() {
+			return time.Now().Add(2 * time.Hour)
+		}
+		return time.Now()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	r.m.SweepOrphans(ctx, []engine.Target{r.engines.target()})
+	eventually(t, "the first listing", func() bool {
+		r.backend.mu.Lock()
+		defer r.backend.mu.Unlock()
+		return r.backend.listings == 1
+	})
+	cancel()
+	late.Store(true)
+	time.Sleep(50 * time.Millisecond)
+	if r.backend.heartbeats(connDead) != 0 {
+		t.Fatal("the sweep probed after its context ended")
+	}
+}
+
+// engine.closeOrphanedConnections: false keeps the gateway from even
+// listing the connections.
+func TestSweepOrphansSwitchedOff(t *testing.T) {
+	r := newSweepRig(t, "engine: {closeOrphanedConnections: false}\n", connDead)
+	r.m.SweepOrphans(context.Background(), []engine.Target{r.engines.target()})
+	time.Sleep(20 * time.Millisecond)
+	r.backend.mu.Lock()
+	defer r.backend.mu.Unlock()
+	if r.backend.listings != 0 {
+		t.Fatalf("%d listings with the sweep switched off", r.backend.listings)
+	}
+}
+
+// Without a fresh leader lease nothing is probed; an engine that is gone, or
+// a listing that fails, ends the sweep of that engine; a probe that fails
+// leaves the connection to its client, and a connection that is gone
+// meanwhile does not count as closed.
 func TestOrphanSweepRefusals(t *testing.T) {
 	t.Run("lease not fresh", func(t *testing.T) {
-		r := newSweepRig(t, connDead)
+		r := newSweepRig(t, "", connDead)
 		s := r.begin()
+		r.backend.expire(connDead)
 		r.m.SetFence(func() bool { return false })
 		if n := s.Finish(context.Background()); n != 0 || !r.backend.has(connDead) || r.sweeps("skipped") != 1 {
 			t.Fatalf("closed %d (skipped %v)", n, r.sweeps("skipped"))
 		}
 	})
 	t.Run("engine gone", func(t *testing.T) {
-		r := newSweepRig(t, connDead)
+		r := newSweepRig(t, "", connDead)
 		s := r.begin()
 		r.engines.gone = true
-		if n := s.Finish(context.Background()); n != 0 || r.sweeps("skipped") != 1 {
+		if n := s.Finish(context.Background()); n != 0 || r.backend.heartbeats(connDead) != 0 || r.sweeps("skipped") != 1 {
 			t.Fatalf("closed %d (skipped %v)", n, r.sweeps("skipped"))
 		}
 	})
-	t.Run("first listing fails", func(t *testing.T) {
-		r := newSweepRig(t, connDead)
-		r.backend.listErr = &upstream.EngineError{Response: wire.ErrorResponse{Message: "Authorization callback failed: no"}}
+	t.Run("listing refused by the authorization function", func(t *testing.T) {
+		r := newSweepRig(t, "", connDead)
+		r.backend.listErr = engineErr(`Authorization callback failed: Invalid Input Error: quackmux_authorize: not allowed on this engine: "quack_active_connections"`)
 		s := r.begin()
-		r.backend.listErr = nil
-		if n := s.Finish(context.Background()); n != 0 || !r.backend.has(connDead) || r.sweeps("failed") != 1 {
-			t.Fatalf("closed %d (failed %v)", n, r.sweeps("failed"))
+		if n := s.Finish(context.Background()); n != 0 || r.backend.heartbeats(connDead) != 0 || r.sweeps("skipped") != 1 {
+			t.Fatalf("closed %d (skipped %v)", n, r.sweeps("skipped"))
 		}
 	})
-	t.Run("second listing fails", func(t *testing.T) {
-		r := newSweepRig(t, connDead)
-		s := r.begin()
+	t.Run("listing fails", func(t *testing.T) {
+		r := newSweepRig(t, "", connDead)
 		r.backend.listErr = errors.New("connection refused")
-		if n := s.Finish(context.Background()); n != 0 || !r.backend.has(connDead) || r.sweeps("failed") != 1 {
+		s := r.begin()
+		if n := s.Finish(context.Background()); n != 0 || r.backend.heartbeats(connDead) != 0 || r.sweeps("failed") != 1 {
 			t.Fatalf("closed %d (failed %v)", n, r.sweeps("failed"))
 		}
 	})
-	t.Run("close fails", func(t *testing.T) {
-		r := newSweepRig(t, connDead)
-		dead := r.id(connDead)
+	t.Run("probe fails", func(t *testing.T) {
+		r := newSweepRig(t, "", connCut)
+		cut := r.id(connCut)
 		s := r.begin()
-		r.backend.closeErr = errors.New("connection refused")
+		r.backend.beatErr = errors.New("connection refused")
 		if n := s.Finish(context.Background()); n != 0 || r.sweeps("failed") != 1 {
 			t.Fatalf("closed %d (failed %v)", n, r.sweeps("failed"))
 		}
-		r.backend.closeErr = nil
-		if _, c, _ := r.m.Resolve(dead); c != nil {
-			t.Fatalf("the client of a connection that was not closed got %+v", c)
+		r.backend.beatErr = nil
+		if _, c, _ := r.m.Resolve(cut); c != nil {
+			t.Fatalf("the client of a connection the sweep could not probe got %+v", c)
 		}
 	})
 	t.Run("connection gone meanwhile", func(t *testing.T) {
-		r := newSweepRig(t, connDead)
+		r := newSweepRig(t, "", connDead)
 		s := r.begin()
-		r.backend.closeErr = gone()
-		if n := s.Finish(context.Background()); n != 1 || r.sweeps("ok") != 1 {
-			t.Fatalf("closed %d (ok %v): a connection the engine no longer knows counts as closed", n, r.sweeps("ok"))
+		r.backend.mu.Lock()
+		delete(r.backend.conns, connDead)
+		r.backend.mu.Unlock()
+		if n := s.Finish(context.Background()); n != 0 || r.sweeps("ok") != 1 {
+			t.Fatalf("closed %d (ok %v): a connection that went by itself was counted", n, r.sweeps("ok"))
 		}
 	})
 }
 
-// The marks of closed connections expire with the tombstones.
-func TestOrphanMarksExpire(t *testing.T) {
-	r := newSweepRig(t, connDead)
-	clock := time.Now()
-	r.m.SetClock(func() time.Time { return clock })
-	r.begin().Finish(context.Background())
-	if len(r.m.orphans) != 1 {
-		t.Fatalf("%d marks, want 1", len(r.m.orphans))
-	}
-	clock = clock.Add(r.m.cfg.Session.TombstoneTTL.Duration + time.Second)
-	r.m.Reap()
-	if len(r.m.orphans) != 0 {
-		t.Fatalf("%d marks after the tombstone TTL", len(r.m.orphans))
-	}
-}
-
-// waitRunning counts running time only: a pause of the process starts the
-// wait again.
-func TestWaitRunning(t *testing.T) {
-	const every = 5 * time.Second
-	start := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
-	// run lets the ticks come after the given gaps and returns the result
-	// and the time of the tick after which waitRunning returned.
-	run := func(gaps ...time.Duration) (bool, time.Duration) {
-		tick := make(chan time.Time)
-		done := make(chan bool, 1)
-		go func() { done <- waitRunning(context.Background(), 30*time.Second, every, tick, start) }()
-		at := start
-		for _, g := range gaps {
-			select {
-			case tick <- at.Add(g):
-				at = at.Add(g)
-			case ok := <-done:
-				return ok, at.Sub(start)
-			}
+// eventually polls cond for up to five seconds.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
 		}
-		return <-done, at.Sub(start)
-	}
-	if ok, took := run(slices.Repeat([]time.Duration{every}, 7)...); !ok || took != 30*time.Second {
-		t.Fatalf("regular ticks: %v after %s", ok, took)
-	}
-	// A pause of a minute after 25s: the wait starts again.
-	gaps := append(slices.Repeat([]time.Duration{every}, 5), time.Minute)
-	gaps = append(gaps, slices.Repeat([]time.Duration{every}, 7)...)
-	if ok, took := run(gaps...); !ok || took != 25*time.Second+time.Minute+30*time.Second {
-		t.Fatalf("with a pause: %v after %s", ok, took)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if waitRunning(ctx, time.Second, every, make(chan time.Time), start) {
-		t.Fatal("waitRunning reported true after ctx ended")
+		time.Sleep(2 * time.Millisecond)
 	}
 }

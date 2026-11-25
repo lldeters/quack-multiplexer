@@ -59,3 +59,14 @@ func (s *Server) Connect() string {
 	}
 	return h.ConnectionID
 }
+
+// Expire lets the lease of a connection run out, as if nobody had sent a
+// message for it within its heartbeat timeout: the next message for it
+// removes it and fails.
+func (s *Server) Expire(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.conns[id]; c != nil {
+		c.expired = true
+	}
+}

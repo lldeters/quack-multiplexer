@@ -29,19 +29,18 @@ func TestCloseOrphanedConnectionsDefault(t *testing.T) {
 	}
 }
 
-// The grace covers the longest heartbeat interval of a client plus the
-// heartbeat grace, and a handshake that was under way.
+// The grace is the engine lease of the gateway's connections plus the
+// heartbeat grace; the client's lease, the recovery grace and the handshake
+// timeout do not shorten or lengthen it.
 func TestOrphanGrace(t *testing.T) {
 	for name, c := range map[string]struct {
 		yaml string
 		want time.Duration
 	}{
-		// recoveryGrace defaults to maxHeartbeatTimeout/2 + 30s.
-		"defaults":                     {"", 180 * time.Second},
-		"recoveryGrace at its minimum": {"engine: {recoveryGrace: 120s}\n", 135 * time.Second},
-		"longer recoveryGrace":         {"engine: {recoveryGrace: 10m}\n", 10 * time.Minute},
-		"short leases": {"session: {minHeartbeatTimeout: 1s, maxHeartbeatTimeout: 5s, heartbeatGrace: 1s}\nengine: {recoveryGrace: 2s}\n",
-			30 * time.Second}, // server.upstream.handshakeTimeout
+		"defaults":            {"", time.Hour + 15*time.Second},
+		"short engine lease":  {"session: {backendHeartbeatTimeout: 30s, heartbeatGrace: 5s}\n", 35 * time.Second},
+		"long client leases":  {"session: {maxHeartbeatTimeout: 18h}\nengine: {recoveryGrace: 10h}\n", time.Hour + 15*time.Second},
+		"long recovery grace": {"engine: {recoveryGrace: 2h}\nserver: {upstream: {handshakeTimeout: 90m}}\n", time.Hour + 15*time.Second},
 	} {
 		cfg, err := Parse([]byte("auth: {mode: none}\n" + c.yaml))
 		if err != nil {
