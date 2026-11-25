@@ -171,7 +171,10 @@ jobs:
     name: End-to-end (kind)
     needs: checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      # helm.sh: the Helm 3 of the helm job's matrix.
+      HELM_VERSION: v3.22.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -179,9 +182,10 @@ jobs:
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
-      - name: Install kind
+      - name: Install kind and helm
         run: |
           go install "sigs.k8s.io/kind@${KIND_VERSION}"
+          go install "helm.sh/helm/${HELM_VERSION%%.*}/cmd/helm@${HELM_VERSION}"
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
       - name: Create the cluster, build and load the images, deploy the dev overlay
         run: bash test/e2e/kind/setup.sh
@@ -189,3 +193,8 @@ jobs:
       # supports ReadWriteOncePod.
       - name: Scenarios k1-k8
         run: bash test/e2e/kind/test.sh
+      # The chart's lookups of the cluster (kept secrets, the refusal of a
+      # second gateway and of an early switch to HA), which the helm job
+      # cannot reach with helm template.
+      - name: Helm chart scenarios
+        run: bash test/e2e/kind/helm.sh

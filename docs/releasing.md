@@ -4,7 +4,7 @@
 
 | Workflow | Auslöser | Inhalt |
 |---|---|---|
-| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go vet`, Tests, Tests mit Race-Detector, Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), das Helm-Chart mit Helm 3 und 4 (`helm lint`, kubeconform, Vergleich mit den Kustomize-Manifesten in `test/helm`), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind |
+| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go vet`, Tests, Tests mit Race-Detector, Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), das Helm-Chart mit Helm 3 und 4 (`helm lint`, kubeconform, Vergleich mit den Kustomize-Manifesten in `test/helm`), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind (dort auch das Helm-Chart mit `test/e2e/kind/helm.sh`) |
 | [nightly.yml](../.github/workflows/nightly.yml) | täglich 03:17 UTC auf `main`, von Hand für jeden Branch | HA-Szenarien in kind (`test/e2e/kind/ha.sh`) und die Tests fünfmal mit Race-Detector |
 | [release.yml](../.github/workflows/release.yml) | Tag `vX.Y.Z` | Release (siehe unten) |
 

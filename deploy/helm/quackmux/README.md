@@ -363,3 +363,7 @@ Die übrigen Prüfungen brauchen `helm` und `kubectl` (Helm etwa per
 helm lint --strict deploy/helm/quackmux
 QUACKMUX_HELM=helm go test -count=1 ./test/helm/
 ```
+
+Was nur mit einem Cluster geht (`lookup`: erhaltene Secrets, die Abbrüche bei einem zweiten Gateway und beim
+verfrühten Umstieg auf HA; ConfigMaps, die Helm behält, Rollback, Deinstallation), prüft
+[test/e2e/kind/helm.sh](../../../test/e2e/kind/helm.sh) in kind, in CI nach den übrigen kind-Szenarien.

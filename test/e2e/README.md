@@ -118,6 +118,7 @@ HTTP).
 bash test/e2e/kind/setup.sh      # Cluster "quackmux", Images bauen und laden, Overlay dev ausrollen
 bash test/e2e/kind/test.sh       # Szenarien k1–k8 (beliebig oft wiederholbar, etwa 6 min)
 bash test/e2e/kind/ha.sh         # Hochverfügbarkeit: Szenarien h1–h6 mit overlays/ha
+bash test/e2e/kind/helm.sh       # Helm-Chart: Szenarien i–d im Namespace quackmux-helm (etwa 2 min)
 bash test/e2e/kind/teardown.sh   # Cluster löschen
 ```
 
@@ -236,6 +237,35 @@ wird:
 | `HA_FREEZE_SECONDS` | 45 | Dauer des Einfrierens in h3: länger als die Session-Lease des zweiten Clients, kürzer als die Liveness-Probe des Gateways toleriert (etwa 60 s) |
 | `ADMIN_LOCAL_PORT` | 19696 | lokaler Port des Port-Forwards auf die Admin-API eines bestimmten Pods |
 | `KEEP_HA` | – | `1`: HA-Deployment und erzeugtes Overlay nach dem Lauf behalten |
+
+### Helm-Chart (helm.sh)
+
+**helm.sh** installiert das Chart [deploy/helm/quackmux](../../deploy/helm/quackmux) als Release `quackmux` in
+einen eigenen Namespace (`quackmux-helm`, mit Pod Security `restricted` wie im README des Charts), neben dem
+Dev-Overlay von setup.sh, das unberührt bleibt. Es nutzt die Images von setup.sh, die Konfiguration von
+`overlays/dev` (Werte [kind/helm-values-dev.yaml](kind/helm-values-dev.yaml)) und für HA die des Charts
+([kind/helm-values-ha.yaml](kind/helm-values-ha.yaml), ein statischer Benutzer). Es prüft, was `helm template` in
+CI nicht erreicht: die `lookup`-Abfragen des Charts und wie Helm mit den Objekten umgeht, die es behält. Vor und
+nach dem Lauf löscht es den Namespace. Die Szenarien bauen aufeinander auf:
+
+| | Ablauf | Was es beweist |
+|---|---|---|
+| i | `helm install` | Der Rollout gelingt, die ConfigMap heißt `quackmux-config-<hash>`, der Session-Key hat 43 Zeichen. Ein Client attacht über den Service, seine Engine läuft im Namespace des Releases. |
+| o | ein zweites Release im Namespace; ein Release im Namespace des Dev-Overlays (`--dry-run=server`) | Beide lehnt das Chart ab (ein Gateway pro Namespace), es entsteht kein zweites Deployment. |
+| u | `helm upgrade` mit geänderter Konfiguration | Das Gateway rollt mit einer neuen ConfigMap aus, die alte bleibt. Session-Key und Admin-Token bleiben gleich, der Client behält seine Session (`"adopted": true`). |
+| g | Umstieg auf `ha.enabled`, solange das Gateway läuft; dann auf 0 skaliert, mit einem Pod, der die Labels eines Gateways trägt | Beide Male lehnt das Chart ab; das Release bleibt bei `Recreate`. |
+| h | Umstieg auf `ha.enabled`, sobald kein Gateway-Pod mehr da ist; danach ein Upgrade mit geänderter Konfiguration | `kubectl rollout status` meldet Erfolg, zwei Replikas mit `RollingUpdate` 1/0, PodDisruptionBudget, der Leader ist der einzige Endpunkt des Service. Der statische Benutzer attacht; seine Session übersteht das Upgrade, die Secrets bleiben, der erzeugte Admin-Token gilt. |
+| c | Ein HA-Upgrade mit `config.limits.maxEngine` (ein Feld, das das Gateway ablehnt); dann wird der alte Follower gelöscht | Der neue Pod scheitert, die alten bedienen weiter. Der Ersatz des Followers startet mit der ConfigMap seines ReplicaSets und wird ready, statt die abgelehnte Konfiguration zu lesen. `helm rollback` beendet den hängenden Rollout. |
+| r | `helm rollback` auf die erste HA-Revision | Das Gateway hängt deren ConfigMap wieder ein (Helm hat sie behalten), die Session übersteht es. |
+| d | Deinstallieren wie im README des Charts, dann neu installieren | Keine Engine bleibt übrig; Session-Key, Admin-Token und ConfigMaps bleiben. Das neue Release übernimmt die Secrets mit ihren Werten; das Aufräumen laut README lässt nur die ConfigMap in Gebrauch übrig. |
+
+| Variable | Default | Bedeutung |
+|---|---|---|
+| `HELM` | `helm` | Helm 3 oder 4 (CI: 3.22) |
+| `HELM_NAMESPACE` | `quackmux-helm` | Namespace des Releases; das Skript löscht ihn vor und nach dem Lauf |
+| `ADMIN_LOCAL_PORT` | 19697 | lokaler Port des Port-Forwards |
+| `ATTACH_TIMEOUT` | 180 | Sekunden für ein `ATTACH` |
+| `KEEP_HELM` | – | `1`: Release und Namespace nach dem Lauf behalten |
 
 ## Konsistenz der Fixtures
 
