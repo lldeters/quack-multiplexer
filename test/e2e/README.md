@@ -4,7 +4,7 @@ Diese Tests prüfen quackmux mit **echten DuckDB-2.0-Clients und -Engines**. Es 
 
 | Umgebung | Verzeichnis | Was läuft | Dauer |
 |---|---|---|---|
-| Docker Compose | [compose](compose) | Gateway mit Provider `static` vor zwei Engine-Containern, Auth `static` | ca. 1,5 min (plus Build) |
+| Docker Compose | [compose](compose) | Gateway mit Provider `static` vor zwei Engine-Containern, Auth `static` | ca. 2,5 min (plus Build) |
 | kind | [kind](kind) | Overlay `deploy/kubernetes/overlays/dev`: Das Gateway startet Engine-Pods selbst, auch mit Volume pro Benutzer | einige Minuten |
 
 Die Unit- und Integrationstests (`go test ./...`) brauchen weder Docker noch DuckDB. Das gilt auch für die
@@ -41,9 +41,9 @@ Container-Logs. Der Exit-Status ist 0 nur, wenn alle Szenarien bestehen. Aufger�
 | Service | Image | Rolle |
 |---|---|---|
 | `engine-shared` | Engine-Image | DuckDB-2.0-Quack-Server für Share-Level `SERVER`. Das Init-SQL legt `whoami` mit `engine = 'shared'` an. |
-| `engine-analytics` | Engine-Image | Dasselbe für Share-Level `GROUP` der Gruppe `analytics` (`engine = 'analytics'`), gehärtet wie eine geteilte Engine: Autorisierungs-Makro des Images im Init-SQL, `enable_external_access = false` und `lock_configuration = true` im Post-Start-SQL. |
-| `gateway` | Gateway-Image | quackmux mit [config/gateway.yaml](compose/config/gateway.yaml): Provider `static` auf beide Engines, Auth `static` mit [config/users.yaml](compose/config/users.yaml), Admin-API mit Bearer-Token. Schließt nach einem Neustart verwaiste Verbindungen (`engine.closeOrphanedConnections: true`, kurze Frist für Szenario k). |
-| `gateway-idle` | Gateway-Image | Wie `gateway`, aber [config/gateway-idle.yaml](compose/config/gateway-idle.yaml) mit `session.idleTimeout: 15s` und Prüfintervallen von 1 s, ohne das Schließen verwaister Verbindungen (es teilt die Engines mit `gateway`). |
+| `engine-analytics` | Engine-Image | Dasselbe für Share-Level `GROUP` der Gruppe `analytics` (`engine = 'analytics'`), gehärtet wie eine geteilte Engine: Autorisierungs-Makro des Images in der Variante `quackmux_authorize_listing` im Init-SQL, `enable_external_access = false` und `lock_configuration = true` im Post-Start-SQL. |
+| `gateway` | Gateway-Image | quackmux mit [config/gateway.yaml](compose/config/gateway.yaml): Provider `static` auf beide Engines, Auth `static` mit [config/users.yaml](compose/config/users.yaml), Admin-API mit Bearer-Token. Schließt nach einem Neustart verwaiste Verbindungen (`engine.closeOrphanedConnections: true`); mit `session.backendHeartbeatTimeout: 60s` prüft es sie schon nach 75 s (Szenario k). |
+| `gateway-idle` | Gateway-Image | Wie `gateway`, aber [config/gateway-idle.yaml](compose/config/gateway-idle.yaml) mit `session.idleTimeout: 15s` und Prüfintervallen von 1 s, ohne das Schließen verwaister Verbindungen (es startet im Lauf nie neu). |
 | `client` | Engine-Image | Die DuckDB-CLI (`/usr/local/bin/duckdb` als Entrypoint, Profil `client`). Jeder Client ist ein eigener `docker compose run`. |
 
 Engines und Gateways laufen wie ihre Pods in Kubernetes mit read-only Root-Dateisystem, ohne Capabilities und mit
@@ -73,8 +73,8 @@ hängen das Gateway mit `ATTACH 'quack:gateway:9494' AS remote (DISABLE_SSL true
 | e | bob hält ein Attachment offen (der Client liest weiter von einer FIFO). Währenddessen: `GET /api/v1/sessions?user=bob`, `GET /api/v1/sessions/{id}`, ein Request ohne Token. Danach `DETACH`. | Session-Tracking und Admin-API (Session `OPEN`, Share-Level `SERVER`, Engine `READY`), Bearer-Authentifizierung (401 ohne Token), Abmelden beim `DETACH`. |
 | f | alice über `gateway-idle`: Query, 20 s Pause, Query | Der Idle-Reaper schließt die Session nach 15 s ohne Query, obwohl der Client weiter Heartbeats schickt. Die nächste Query bekommt den Grund („idle timeout“), `quackmux_sessions_closed_total{reason="idle timeout"}` zählt mit. |
 | g | `CREATE TABLE remote.e2e_range AS SELECT range FROM range(100000)` und `CREATE TABLE remote.e2e_upload AS SELECT id FROM e2e_local` (lokale Tabelle), danach `count(*)` und `sum(id)` | Der Client streamt die Zeilen mit `SEND_DATA_REQUEST` durch das Gateway (`quackmux_requests_total{type="SEND_DATA_REQUEST",outcome="ok"}` steigt). 100 000 Zeilen kommen vollständig und unverfälscht an. |
-| j | alice, `share_level=group&group=analytics` auf der gehärteten Engine: `ATTACH`, `SHOW ALL TABLES`, Upload einer lokalen Tabelle, temporäre Tabelle, `FROM _`. Danach laufen die Fälle des Autorisierungs-Makros ([images/engine/authorize-cases.tsv](../../images/engine/authorize-cases.tsv)) mit `quackmux-authorize-test` aus dem Client-Image durch das Gateway, zuletzt fragt ein Client `whoami` ab. | Das Makro lässt die Katalog-Abfragen des Clients, Queries, Uploads und Transaktionen durch und lehnt `quack_stop`, `getenv`, `COPY`, `EXPORT`/`IMPORT DATABASE` und die übrigen Fälle in jeder Schreibweise ab; Dateizugriff und `SET` scheitern an den Einstellungen des Post-Start-SQL. Das Engine-Token taucht nirgends auf, und die Engine läuft weiter. |
-| k | Auf `engine-shared` und auf der gehärteten `engine-analytics` je zwei Clients von alice; ein dritter listet vorher und nachher mit `remote.query('SELECT connection_id FROM quack_active_connections()')` die Verbindungen der Engine. Der eine Client legt eine temporäre Tabelle an. `gateway` wird gestoppt, die anderen beiden Clients werden ohne `DETACH` getötet (`docker kill`), dann startet `gateway` wieder. Nach der Frist für verwaiste Verbindungen (mit `gateway.yaml` 30 s) listet ein neuer Client erneut. | Die überlebenden Clients werden übernommen, ihre temporären Tabellen bleiben erreichbar, vor und nach der Frist. Die Verbindungen der getöteten Clients listet die Engine nicht mehr, die der überlebenden schon (`engine.closeOrphanedConnections`); `quackmux_orphaned_connections_closed_total` steigt auf 2. Das Makro der gehärteten Engine lässt das Listing durch. |
+| j | alice, `share_level=group&group=analytics` auf der gehärteten Engine: `ATTACH`, `SHOW ALL TABLES`, Upload einer lokalen Tabelle, temporäre Tabelle, `FROM _`. Danach laufen die Fälle des Autorisierungs-Makros ([images/engine/authorize-cases.tsv](../../images/engine/authorize-cases.tsv)) mit `quackmux-authorize-test` aus dem Client-Image durch das Gateway (`QUACKMUX_TEST_LISTING=1`), zuletzt fragt ein Client `whoami` ab. | Das Makro lässt die Katalog-Abfragen des Clients, Queries, Uploads, Transaktionen und genau das Listing des Gateways durch und lehnt `quack_stop`, `getenv`, `COPY`, `EXPORT`/`IMPORT DATABASE` und die übrigen Fälle in jeder Schreibweise ab; Dateizugriff und `SET` scheitern an den Einstellungen des Post-Start-SQL. Das Engine-Token taucht nirgends auf, und die Engine läuft weiter. |
+| k | Auf `engine-shared` und auf der gehärteten `engine-analytics` je drei Clients mit einer temporären Tabelle: zwei von alice über `gateway`, einer direkt an der Engine mit ihrem Token. Ein weiterer Client listet vorher und nachher mit `remote.query('SELECT connection_id FROM quack_active_connections()')` die Verbindungen der Engine. `gateway` wird gestoppt, je ein Client von alice wird ohne `DETACH` getötet (`docker kill`), dann startet `gateway` wieder. Wenn die Engine-Lease der Verbindungen abgelaufen ist (mit `gateway.yaml` nach 75 s), listet ein neuer Client erneut. | Die überlebenden Clients von alice werden übernommen. Den Heartbeat des Gateways beantwortet die Engine für die Verbindung des getöteten Clients mit abgelaufener Lease und entfernt sie: Sie wird nicht mehr gelistet, `quackmux_orphaned_connections_closed_total` steigt auf 2. Die Verbindungen der überlebenden und der direkt angehängten Clients bleiben, mit ihren temporären Tabellen, vor und nach dem Aufräumen. Die gehärtete Engine lässt das Listing mit `quackmux_authorize_listing` durch. |
 | h | Logs beider Gateways | Kein Request-Handler ist mit einem Panic abgestürzt. |
 
 ### Variablen
@@ -246,10 +246,12 @@ Die Go-Tests dieses Pakets ([fixtures_test.go](fixtures_test.go)) laufen ohne Do
 Sie prüfen die Compose-Fixtures mit dem Code des Gateways:
 
 * Beide Gateway-Konfigurationen laden mit `config.Load` (unbekannte Felder sind Fehler) und unterscheiden sich nur im
-  Session- und Engine-Timing und darin, dass nur `gateway` verwaiste Verbindungen schließt (Szenario k, mit einer
-  Frist von höchstens einer Minute).
-* Das Autorisierungs-Makro des Engine-Images lässt genau die Anfrage durch, mit der das Gateway die Verbindungen
-  einer Engine listet, und seine Fälle prüfen das ([authorize_test.go](authorize_test.go)).
+  Session- und Engine-Timing und darin, dass nur `gateway` verwaiste Verbindungen schließt (Szenario k: eine
+  Engine-Lease von mindestens einer Minute, damit die überlebenden Clients ihre Verbindungen wiederfinden, und eine
+  Frist von höchstens zwei Minuten).
+* Das Autorisierungs-Makro des Engine-Images lehnt die Anfrage ab, mit der das Gateway die Verbindungen einer Engine
+  listet, seine Variante `quackmux_authorize_listing` lässt genau sie durch; die Fälle prüfen beides, und die
+  gehärtete Engine der Compose-Umgebung nutzt die Variante ([authorize_test.go](authorize_test.go)).
 * `users.yaml` akzeptiert die Tokens aus `e2e.env` über den echten `static`-Authenticator, weist den falschen Token
   ab und enthält keine Klartext-Tokens. `admin.token` und die Engine-Tokens passen zu `e2e.env`.
 * Die Handshakes von `run.sh` (Token plus Optionen) laufen durch Authentifizierung und Policy: a, c, e und f landen
