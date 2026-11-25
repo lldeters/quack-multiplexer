@@ -235,7 +235,8 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
   geteilten Engine bis zu deren Ende offen (der Server prüft Leases nur lazy, Abschnitt 1).
   * Direkt nach der Recovery, noch bevor das Gateway Requests bedient, beginnt es mitzuschreiben, nach welchen
     Verbindungen Clients fragen. Dann listet es die Verbindungen jeder wiedergefundenen Engine der Share-Levels
-    `USER`, `GROUP` und `SERVER` (READY oder DRAINING) über eine eigene Verbindung mit dem Engine-Token:
+    `USER`, `GROUP` und `SERVER`, die READY oder DRAINING ist (eine Engine, die beim Start nicht bereit ist oder
+    erst danach auftaucht, prüft erst der nächste Neustart), über eine eigene Verbindung mit dem Engine-Token:
     `SELECT connection_id FROM quack_active_connections()`. Die Funktion listet auch die fragende Verbindung;
     die lässt das Gateway weg und schließt sie danach.
   * Nach der Frist listet es erneut und schließt jede Verbindung, die schon beim ersten Mal da war, zu keiner

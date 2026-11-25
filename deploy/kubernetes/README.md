@@ -602,8 +602,8 @@ Deshalb räumt das Gateway nach jeder Übernahme auf (`engine.closeOrphanedConne
    ein Leader mit frischer Lease.
 
 Ein lebender Client sendet in der Frist mindestens einen Heartbeat, auch wenn er gerade nichts tut: DuckDB schickt
-alle Lease/3 (± 20 %) einen. Kommt seine erste Anfrage genau, während das Gateway entscheidet, gewinnt, was zuerst
-da ist: die Anfrage, dann bleibt die Verbindung, oder die Entscheidung, dann bekommt der Client
+alle Lease/3 (± 20 %) einen. Kommt seine erste Anfrage genau in dem Moment, in dem das Gateway entscheidet, gewinnt,
+was zuerst da ist: die Anfrage, dann bleibt die Verbindung, oder die Entscheidung, dann bekommt der Client
 `quackmux: session closed: no request arrived within the recovery grace after the gateway took over, so the gateway
 closed the engine connection as orphaned. DETACH and ATTACH again to reconnect.` Die Verbindung einer Session, die
 das Gateway übernommen hat, schließt es nie.
