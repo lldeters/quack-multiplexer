@@ -34,10 +34,7 @@
     },
     "configYaml": {"type": "string"},
     "config": {"type": "object"},
-    "users": {
-      "type": "array",
-      "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}
-    },
+    "users": {"type": "array", "items": {"$ref": "#/definitions/user"}},
     "secrets": {
       "type": "object",
       "additionalProperties": false,
@@ -119,6 +116,28 @@
     "stringMap": {
       "type": "object",
       "additionalProperties": {"type": "string"}
+    },
+    "user": {
+      "description": "An entry of the users file (examples/users.yaml); quackmux.usersFile checks the rules a schema cannot express.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "groups": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "disabled": {"type": "boolean"},
+        "tokens": {"type": "array", "items": {"$ref": "#/definitions/token"}}
+      }
+    },
+    "token": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^(\\s*[0-9a-fA-F]{64}\\s*)?$"},
+        "plain": {"type": "string", "pattern": "^[^?]*$"},
+        "description": {"type": "string"},
+        "expires": {"type": "string"}
+      }
     }
   }
 }

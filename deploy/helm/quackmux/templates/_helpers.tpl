@@ -106,9 +106,67 @@ every rendering generates new values. Argument: dict "root" $ "name" NAME
 {{- end -}}
 {{- end -}}
 
-{{/* quackmux.usersFile: the users file built from the values "users". */}}
+{{/*
+quackmux.usersFile: the users file built from the values "users". It fails
+for a file the gateway would refuse (the rules of examples/users.yaml beyond
+those of values.schema.json): the gateway keeps its previous users when a
+changed file is invalid and does not start with one, so an upgrade would
+report success while the change never applies.
+*/}}
 {{- define "quackmux.usersFile" -}}
-{{- toYaml (dict "users" (default list .Values.users)) }}
+{{- $users := default list .Values.users -}}
+{{- $names := dict -}}
+{{- $tokens := dict -}}
+{{- range $i, $u := $users -}}
+{{- $where := printf "users[%d]" $i -}}
+{{- include "quackmux.checkName" (dict "where" (printf "%s.name" $where) "name" $u.name) -}}
+{{- if hasKey $names $u.name -}}
+{{- fail (printf "%s: user %q is defined twice (also %s)" $where $u.name (get $names $u.name)) -}}
+{{- end -}}
+{{- $_ := set $names $u.name $where -}}
+{{- range $j, $g := default list $u.groups -}}
+{{- include "quackmux.checkName" (dict "where" (printf "%s.groups[%d]" $where $j) "name" $g) -}}
+{{- end -}}
+{{- range $j, $t := default list $u.tokens -}}
+{{- $twhere := printf "%s.tokens[%d]" $where $j -}}
+{{- $hash := "" -}}
+{{- if and $t.sha256 $t.plain -}}
+{{- fail (printf "%s: set either sha256 or plain, not both" $twhere) -}}
+{{- else if $t.sha256 -}}
+{{- $hash = lower (trim $t.sha256) -}}
+{{- else if $t.plain -}}
+{{- $hash = sha256sum $t.plain -}}
+{{- else -}}
+{{- fail (printf "%s: needs sha256 (quackmux token, quackmux hash-token) or plain" $twhere) -}}
+{{- end -}}
+{{- if hasKey $tokens $hash -}}
+{{- fail (printf "%s: duplicate token, already used by %s" $twhere (get $tokens $hash)) -}}
+{{- end -}}
+{{- $_ := set $tokens $hash $twhere -}}
+{{- with trim (default "" $t.expires) -}}
+{{- if (toDate "2006-01-02T15:04:05Z07:00" .).IsZero -}}
+{{- fail (printf "%s: invalid expires %q (want RFC 3339 like 2027-01-01T00:00:00Z)" $twhere .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml (dict "users" $users) }}
+{{- end -}}
+
+{{/*
+quackmux.checkName fails for a user or group name that the gateway refuses:
+longer than 256 bytes, with leading or trailing white space, or with control
+characters (empty ones values.schema.json refuses). Argument: dict "where"
+WHERE "name" NAME.
+*/}}
+{{- define "quackmux.checkName" -}}
+{{- if gt (len .name) 256 -}}
+{{- fail (printf "%s: %q is longer than 256 bytes" .where .name) -}}
+{{- else if ne (trim .name) .name -}}
+{{- fail (printf "%s: %q has leading or trailing white space" .where .name) -}}
+{{- else if regexMatch "\\p{Cc}" .name -}}
+{{- fail (printf "%s: %q contains control characters" .where .name) -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

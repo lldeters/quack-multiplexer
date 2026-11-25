@@ -218,6 +218,9 @@ func TestChartRefuses(t *testing.T) {
 		{"configuration that is no map", "quackmux", []string{"--set", "configYaml=- a"}, "not a YAML map"},
 		{"service account without a name", "quackmux", []string{"--set", "serviceAccount.create=false"}, "serviceAccount.name is required"},
 		{"unknown value", "quackmux", []string{"--set", "ha.enable=true"}, "enable"},
+		// More cases, compared with the gateway's own check: TestChartUsersMatchGateway.
+		{"unknown field of a user", "quackmux", []string{"--set", "users[0].name=alice", "--set", "users[0].disable=true"}, "'disable' not allowed"},
+		{"sha256 that is not hex", "quackmux", []string{"--set", "users[0].name=alice", "--set", "users[0].tokens[0].sha256=zz"}, "/users/0/tokens/0/sha256"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := helmTemplate(t, tc.ns, tc.args...)

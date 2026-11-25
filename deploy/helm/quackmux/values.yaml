@@ -62,6 +62,9 @@ config: {}
 # here (quackmux token, quackmux hash-token); format: examples/users.yaml.
 # A change takes effect without a restart (kubelet sync plus
 # auth.static.reloadInterval, about a minute). Empty: nobody can log in.
+# The chart refuses what the gateway would refuse (unknown fields such as
+# "disable", duplicate users or tokens, a sha256 that is not 64 hex digits):
+# the gateway would keep the previous users and not start after a restart.
 users: []
 # - name: alice
 #   # The first group is the default for share_level=group.

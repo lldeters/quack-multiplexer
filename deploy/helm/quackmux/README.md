@@ -78,7 +78,7 @@ zurück.
 | `ha.rollingUpdate.maxSurge`, `…maxUnavailable` | 1, 0 | Rollout mit `ha.enabled` |
 | `configYaml` | leer: `base/config.yaml` bzw. `overlays/ha/config.yaml` | die vollständige Gateway-Konfiguration als Text |
 | `config` | `{}` | Änderungen an der Konfiguration ([Konfiguration](#konfiguration)) |
-| `users` | `[]` | Benutzer für `auth.mode: static`; leer: niemand kann sich anmelden |
+| `users` | `[]` | Benutzer für `auth.mode: static`; leer: niemand kann sich anmelden. Was das Gateway ablehnen würde (unbekannte Felder wie `disable`, doppelte Benutzer oder Tokens, ein `sha256` ohne 64 Hex-Ziffern), lehnt schon das Chart ab |
 | `secrets.sessionKey`, `secrets.adminToken`, `secrets.users` | erzeugt bzw. aus `users` | `existingSecret`: ein vorhandenes Secret |
 | `goMemLimit` | `1800MiB` | `GOMEMLIMIT`, etwa 10 % unter `resources.limits.memory` |
 | `resources` | Requests 250m/512 MiB, Limits 2 CPU/2 GiB | wie `base` |
