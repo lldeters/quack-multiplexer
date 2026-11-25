@@ -66,3 +66,6 @@ brauchen Cluster ein Pull-Secret.
 
 2. `scripts/set-version.sh <nächste quackmux-Version>` setzt auch das Engine-Tag (`<duckdb>-<version>`).
 3. Die Research-Notes und die E2E-Tests gegen die neue Version prüfen (docs/research-notes.md).
+4. docs/tls.md nennt die geprüfte DuckDB- und quack-Version. Szenario l des Compose-Tests prüft die Clients mit
+   `ssl_fingerprint` und mit `ca_cert_file` (Header, Pin-Formate, `localhost`, `http_timeout`, Fehlermeldungen);
+   die Timeouts ohne httpfs und über 30 s deckt es nicht ab: von Hand nachprüfen, dann die Version dort anpassen.
