@@ -4,7 +4,9 @@
 # (values.schema.json).
 
 image:
-  # The gateway image; its entrypoint is the quackmux binary.
+  # The gateway image; its entrypoint is the quackmux binary. The engine
+  # image is part of the gateway configuration: profiles.<name>.image (the
+  # shipped one names that of the same release; change it with "config").
   repository: ghcr.io/lldeters/quackmux
   # Default: the chart's appVersion, the release the chart belongs to.
   tag: ""
