@@ -103,3 +103,33 @@ func TestConnectionsRejectsOtherAnswers(t *testing.T) {
 		}
 	}
 }
+
+// An engine that answers the control handshake with a CONNECTION_RESPONSE
+// the gateway cannot decode (here an unknown property 5, as a newer server
+// might send) created the control connection all the same: the listing
+// fails and closes it.
+func TestConnectionsClosesUndecodableControlConnection(t *testing.T) {
+	disconnected := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		h, _, _ := wire.ParseHeader(body)
+		switch h.Type {
+		case wire.TypeConnectionRequest:
+			ok := wire.ConnectionResponse{QuackVersion: wire.ProtocolVersion, HeartbeatTimeoutSeconds: 60}.Encode(wire.Header{ConnectionID: "CTRL"})
+			// Property 5 (uvarint 1) before the end of the object.
+			_, _ = w.Write(append(append([]byte{}, ok[:len(ok)-2]...), 0x05, 0x00, 0x01, 0xff, 0xff))
+		case wire.TypeDisconnect:
+			disconnected = h.ConnectionID
+			_, _ = w.Write(wire.EncodeEmpty(wire.Header{Type: wire.TypeSuccessResponse}))
+		default:
+			_, _ = w.Write(wire.ErrorResponse{Message: "unexpected"}.Encode())
+		}
+	}))
+	defer srv.Close()
+	if ids, err := testClient().Connections(context.Background(), srv.URL, "t"); err == nil {
+		t.Fatalf("listed %v", ids)
+	}
+	if disconnected != "CTRL" {
+		t.Fatalf("disconnected %q, want the control connection CTRL", disconnected)
+	}
+}

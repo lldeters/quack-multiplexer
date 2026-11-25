@@ -39,17 +39,19 @@ func (c *Client) Connections(ctx context.Context, endpoint, token string) ([]str
 		return nil, fmt.Errorf("control connection: %w", err)
 	}
 	h, cr, err := wire.DecodeConnectionResponse(body)
+	self := h.ConnectionID
+	if h.Type == wire.TypeConnectionResponse && self != "" {
+		// The engine created the connection, even if the rest of its answer
+		// cannot be decoded. Close it also after a cancelled ctx: it would
+		// stay otherwise.
+		defer func() { _ = c.Disconnect(context.WithoutCancel(ctx), endpoint, self) }()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("control connection: undecodable engine response: %w", err)
 	}
-	if h.ConnectionID == "" {
+	if self == "" {
 		return nil, errors.New("control connection: the engine sent no connection id")
 	}
-	self := h.ConnectionID
-	defer func() {
-		// Also after a cancelled ctx: the connection would stay otherwise.
-		_ = c.Disconnect(context.WithoutCancel(ctx), endpoint, self)
-	}()
 	if cr.QuackVersion != wire.ProtocolVersion {
 		return nil, fmt.Errorf("control connection: the engine speaks Quack version %d", cr.QuackVersion)
 	}
