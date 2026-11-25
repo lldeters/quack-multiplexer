@@ -5,7 +5,9 @@
 # One case per line, four fields separated by a tab: ID, OUTCOME, KIND, SQL.
 # OUTCOME is BLOCK (rejected by the macro), PERM (refused by DuckDB: no file
 # or network access), LOCK (refused by DuckDB: configuration locked), ERR (any
-# error) or OK (no error). KIND Q sends the SQL to the engine as the text of
+# error), OK (no error) or LISTING (the listing of the gateway: OK on an
+# engine that runs quackmux_authorize_listing, QUACKMUX_TEST_LISTING=1, BLOCK
+# with quackmux_authorize). KIND Q sends the SQL to the engine as the text of
 # one query, the way a client pushes a query down (FROM r.query('...')); KIND
 # C runs it in the client on the attached database "r", so the client sends
 # its own queries (catalog, uploads). The cases run in this order in one
@@ -50,6 +52,35 @@ a25	ERR	Q	CALL qu{cyr_a}ck_stop('quack:0.0.0.0:9494')
 a26	BLOCK	Q	CALL quack_cancel('x')
 a27	BLOCK	Q	SELECT 1 FROM quack_stop  {tab}{nl} ('quack:0.0.0.0:9494')
 a28	BLOCK	Q	SELECT quack_connection_id()
+
+# The listing of the gateway (wire.ActiveConnectionsSQL): quackmux_authorize
+# rejects it, quackmux_authorize_listing lets exactly this text through and
+# nothing else.
+l01	LISTING	Q	SELECT connection_id FROM quack_active_connections()
+l02	BLOCK	Q	select connection_id from quack_active_connections()
+l03	BLOCK	Q	SELECT connection_id FROM QUACK_ACTIVE_CONNECTIONS()
+l04	BLOCK	Q	SELECT Connection_ID FROM quack_active_connections()
+l05	BLOCK	Q	SELECT connection_id FROM quack_active_connections();
+l06	BLOCK	Q	SELECT connection_id FROM quack_active_connections() 
+l07	BLOCK	Q	 SELECT connection_id FROM quack_active_connections()
+l08	BLOCK	Q	SELECT connection_id{nl}FROM quack_active_connections()
+l09	BLOCK	Q	SELECT connection_id  FROM quack_active_connections()
+l10	BLOCK	Q	SELECT connection_id FROM quack_active_connections{nbsp}()
+l11	BLOCK	Q	SELECT connection_id FROM quack_active_connections() -- x
+l12	BLOCK	Q	/* x */ SELECT connection_id FROM quack_active_connections()
+l13	BLOCK	Q	SELECT connection_id FROM quack_active_connections(); SELECT getenv('QUACK_TOKEN')
+l14	BLOCK	Q	SELECT connection_id FROM quack_active_connections(); CALL quack_stop('quack:0.0.0.0:9494')
+l15	BLOCK	Q	SELECT 1; SELECT connection_id FROM quack_active_connections()
+l16	BLOCK	Q	SELECT connection_id, query FROM quack_active_connections()
+l17	BLOCK	Q	SELECT query FROM quack_active_connections()
+l18	BLOCK	Q	SELECT client_id_hash AS connection_id FROM quack_active_connections()
+l19	BLOCK	Q	SELECT connection_id FROM quack_active_connections() WHERE state = 'active'
+l20	BLOCK	Q	SELECT connection_id FROM quack_active_connections() UNION ALL SELECT query FROM quack_active_connections()
+l21	BLOCK	Q	SELECT connection_id FROM quack_active_connections() LIMIT 1
+l22	BLOCK	Q	WITH c AS (SELECT connection_id FROM quack_active_connections()) SELECT * FROM c
+l23	BLOCK	Q	EXPLAIN SELECT connection_id FROM quack_active_connections()
+l24	BLOCK	Q	SELECT connection_id FROM system.main.quack_active_connections()
+l25	BLOCK	Q	SELECT connection_id FROM quack_active_connections(){tab}
 
 # SQL that is not in the text of the query: built at run time, read from
 # files or called by name.

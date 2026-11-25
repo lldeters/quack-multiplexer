@@ -36,6 +36,8 @@ type Backend interface {
 	Disconnect(ctx context.Context, endpoint, backendConnID string) error
 	CancelAll(ctx context.Context, endpoint, backendConnID string) error
 	Heartbeat(ctx context.Context, endpoint, backendConnID string) error
+	// Connections lists the connections an engine holds (see orphans.go).
+	Connections(ctx context.Context, endpoint, token string) ([]string, error)
 }
 
 // State of a session.

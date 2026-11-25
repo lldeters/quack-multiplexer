@@ -244,6 +244,15 @@ engine:
   # next heartbeat. Default: session.maxHeartbeatTimeout / 2 + 30s; must be
   # at least 0.4 * session.maxHeartbeatTimeout.
   recoveryGrace: 180s
+  # After a restart or a leader takeover, close the connections on the
+  # recovered USER, GROUP and SERVER engines that no session adopted once
+  # their engine lease has run out (session.backendHeartbeatTimeout +
+  # session.heartbeatGrace after the takeover): clients that died while no
+  # gateway ran, which the Quack server never collects. The gateway sends
+  # them a heartbeat, and the engine removes those whose lease ran out.
+  # Default true, false for the static provider. Older gateways reject the
+  # field: remove it before rolling the gateway back.
+  # closeOrphanedConnections: true
   # Period of the engine reconciler (timeouts, warm pools).
   checkInterval: 5s
   # Drain engines whose profile changed since their launch and start new
@@ -380,8 +389,14 @@ profiles:
     # the field: remove it before rolling the gateway back. Shared engines
     # (GROUP, SERVER) are hardened with the authorization macro of the engine
     # image in initSQL and these two settings (deploy/kubernetes/README.md,
-    # "Gehärtete geteilte Engines"):
-    # initSQL: .read /usr/local/share/quackmux/authorize.sql
+    # "Gehärtete geteilte Engines"). The macro also rejects the listing of
+    # the engine's connections, so the gateway does not close its orphaned
+    # connections. The variant quackmux_authorize_listing lets the listing
+    # through, but gives every session the connection ids, which are bearer
+    # credentials: use it only with a NetworkPolicy that the CNI enforces.
+    # initSQL: |
+    #   .read /usr/local/share/quackmux/authorize.sql
+    #   -- SET GLOBAL quack_authorization_function = 'quackmux_authorize_listing';
     # postStartSQL: |
     #   SET enable_external_access = false;
     #   SET lock_configuration = true;

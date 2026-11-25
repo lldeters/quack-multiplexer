@@ -403,6 +403,10 @@ func cmdServe(args []string) error {
 			return err
 		}
 		go sessions.Run(ctx)
+		// The connections that the recovered engines hold as this process
+		// takes over: the sweep probes those that no session adopts once
+		// their engine lease has run out.
+		sessions.SweepOrphans(ctx, engines.RecoveredTargets())
 		started.Store(true)
 		if labeler != nil {
 			labeler.Kick() // label the pod now: from then on the Service routes to it

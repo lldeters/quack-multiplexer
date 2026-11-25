@@ -64,6 +64,7 @@ Welche Kombinationen ein Benutzer wählen darf, regeln Profile (`allowedShareLev
 | `engine.maxLifetime` / `drainTimeout` | aus / 1 h | Alte Engines werden gedrained: keine neuen Sessions, alte laufen aus. |
 | `engine.replaceOnSpecChange` | an | Ändert sich ein Profil, werden Engines rollierend ersetzt. |
 | Neustart / Failover | – | Gateway-Connection-IDs sind versiegelte Routen (AES-GCM). Sessions überleben Neustarts und Leader-Wechsel, Engines werden wiedergefunden. |
+| `engine.closeOrphanedConnections` | an (`static`: aus) | Nach einem Neustart räumt das Gateway die Verbindungen von Clients ab, die in der Downtime gestorben sind: Verbindungen ohne Session, deren Engine-Lease abgelaufen ist (nach `session.backendHeartbeatTimeout` plus `session.heartbeatGrace`, 1 h 15 s). |
 
 ## Schnellstart
 

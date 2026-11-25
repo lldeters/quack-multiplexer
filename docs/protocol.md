@@ -79,6 +79,25 @@ Beispiel `CONNECTION_REQUEST`-Header: `01 00 01 03 00 ff ff ff ff ff ff ff ff ff
 | 16 | HEARTBEAT_REQUEST | C→S | – |
 | 100 | ERROR_RESPONSE | S→C | 1 message, 2 exception_type, 3 extra_info, 4 must_invalidate |
 
+### Inline-Ergebnisse (`PREPARE_RESPONSE`)
+
+Feld 4 ist eine Liste von `unique_ptr<DataChunkWrapper>`: je ein Byte „vorhanden“ und das Objekt
+`{300: DataChunk}`. Serialisiert wird mit der Storage-Version V2_0_0 (`DataChunk::Serialize`, `Vector::Serialize`
+von DuckDB v2.0.0), gegen echte Antworten geprüft (`internal/wire/testdata/duckdb-v2.0.0`):
+
+* LogicalType: `{100: id, 101: type_info}`; 101 entfällt bei Typen ohne Parameter (VARCHAR = 25).
+* DataChunk: `{100: rows, 101: Liste der LogicalTypes, 102: Liste der Vektor-Objekte}`, bis 2048 Zeilen. Chunks
+  unter 1024 Zeilen fasst der Server zu flachen zusammen, größere behalten ihre Form.
+* Flacher VARCHAR-Vektor: `100 has_validity_mask` (bool); nur wenn wahr `101 validity`, ein Blob aus
+  ⌈rows/64⌉ `uint64` (little endian, Bit `i%64` von Wort `i/64` gesetzt = Zeile gültig); `107 byte_data_length`
+  (optional_idx); `108 length_data`, ein Blob mit `rows` × `uint32` (0 für NULL); `109 byte_data`, die gültigen
+  Strings hintereinander. Ein Blob ist ULEB128-Länge plus Bytes.
+* Komprimierte Vektoren beginnen mit `90 vector_type`: CONSTANT (2) folgen die flachen Felder einer Zeile,
+  DICTIONARY (3) und SEQUENCE (4) haben eigene Felder.
+
+Das Gateway dekodiert nur die Antwort auf seine eigene Anfrage (`internal/wire/result.go`); alle anderen Ergebnisse
+reicht es byte-genau durch.
+
 ## Semantik, die das Routing bestimmt
 
 * **Handshake:** Der Server ruft `quack_authentication_function(connection_id, auth_string, server_token)` auf.
@@ -89,10 +108,10 @@ Beispiel `CONNECTION_REQUEST`-Header: `01 00 01 03 00 ff ff ff ff ff ff ff ff ff
 * **Version:** Der Server lehnt ab, wenn `[min, max]` des Clients die 3 nicht enthält. Der Client verlangt in der
   Antwort exakt `quack_version == 3` und einen Heartbeat-Timeout in `[1, INT64_MAX/1000]`.
 * **Lease:** Jede strukturell gültige Nachricht einer bestehenden Verbindung erneuert die Lease. Ist sie
-  abgelaufen, antwortet der Server mit `"Connection heartbeat lease expired"` und entfernt die Verbindung.
-  **Geprüft wird nur beim nächsten Request dieser Verbindung.** Einen Hintergrund-Sweeper gibt es nicht. Stirbt
-  ein Client, bleibt seine Verbindung samt Kontext auf der Engine liegen. Der Client schickt Heartbeats etwa alle
-  `timeout/3 · [0,8; 1,2]`.
+  abgelaufen, antwortet der Server mit `"Connection heartbeat lease expired"`, entfernt die Verbindung und bricht
+  eine Query ab, die noch auf ihr läuft (Interrupt). **Geprüft wird nur beim nächsten Request dieser
+  Verbindung.** Einen Hintergrund-Sweeper gibt es nicht. Stirbt ein Client, bleibt seine Verbindung samt Kontext
+  auf der Engine liegen. Der Client schickt Heartbeats etwa alle `timeout/3 · [0,8; 1,2]`.
 * **Unbekannte Verbindung:** `"Invalid connection id"`. Ein `DISCONNECT` auf eine bereits geschlossene Verbindung
   ergibt `"Connection does not exist / already disconnected"`.
 * **must_invalidate:** Der Server setzt das Flag, wenn seine eigene Datenbank invalidiert ist. Der Client markiert
@@ -128,7 +147,7 @@ Beispiel `CONNECTION_REQUEST`-Header: `01 00 01 03 00 ff ff ff ff ff ff ff ff ff
 | Handshake | Wird vollständig dekodiert. `auth_string` wird durch das Engine-Token ersetzt, der Heartbeat-Timeout geklemmt. Das Gateway lehnt unbekannte Felder ab. |
 | Antworten | Nur `CONNECTION_RESPONSE`-Header werden umgeschrieben. Alle anderen Antworten haben eine leere `connection_id`. |
 | Fehlertexte | „Invalid connection id“ und „Authentication failed“ sind identisch zum Server. Eigene Fehler beginnen mit `quackmux:`. |
-| Lease-Pflege | Das Gateway beobachtet `lastSeen` und schickt bei Ablauf ein `DISCONNECT`, damit die Engine aufräumt. |
+| Lease-Pflege | Das Gateway beobachtet `lastSeen` und schickt bei Ablauf ein `DISCONNECT`, damit die Engine aufräumt. Nach einem Neustart oder einer Übernahme listet es die Verbindungen der Engines (`SELECT connection_id FROM quack_active_connections()` über eine eigene Verbindung) und schickt denen ohne Session nach Ablauf ihrer Engine-Lease einen `HEARTBEAT`: Die Engine entfernt sie dann selbst ([Design, 6](design.md#6-neustart-und-hochverfügbarkeit)). |
 | Verbindungsabbrüche | Ein Request, der schon gelesen wurde, bekommt immer eine Antwort, notfalls einen Quack-Fehler. libcurl könnte den POST sonst wiederholen und eine Query doppelt ausführen. |
 | Puffern | Nachrichten bis 100 MiB (Request) bzw. 64 MiB (Response) werden vollständig gepuffert. Das Budget liegt bei 1 GiB. Ein langsamer Client bringt damit nie den 5-s-Timeout der Engine zum Auslösen. |
 | Query-Zeitlimit | Optional (`limits.queryTimeout`). Das Gateway liest die `query_uuid` aus PREPARE, FETCH und CANCEL, den Anfang des SQL-Texts eines PREPARE (`COMMIT` und `ROLLBACK` haben kein Limit) und den Kopf der `FETCH_RESPONSE`. Nach Ablauf schickt es `CANCEL` mit der `query_uuid`, schneidet ein PREPARE ab, das die Engine noch nicht ganz hat, und beantwortet die Requests der Query mit einem eigenen `ERROR_RESPONSE` (siehe [Design, 5.3](design.md#53-query-zeitlimit)). |

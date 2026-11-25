@@ -202,6 +202,7 @@ expect_sessions() {
 # metric_sum BASE_URL NAME [FILTER...] sums the samples of the Prometheus
 # metric NAME (from BASE_URL/metrics) whose labels contain every FILTER, for
 # example 'type="SEND_DATA_REQUEST"'. It prints 0 if there is no such sample.
+# A metric without labels matches without FILTER.
 metric_sum() {
 	local base=$1 name=$2 file
 	shift 2
@@ -211,9 +212,9 @@ metric_sum() {
 		echo 0
 		return 1
 	fi
-	awk -v name="$name{" -v filters="$(printf '%s\034' "$@")" '
+	awk -v name="$name" -v filters="$(printf '%s\034' "$@")" '
 		BEGIN { n = split(filters, f, "\034") }
-		index($0, name) == 1 {
+		index($0, name "{") == 1 || index($0, name " ") == 1 {
 			for (i = 1; i <= n; i++) if (f[i] != "" && index($0, f[i]) == 0) next
 			sum += $NF
 		}

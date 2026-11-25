@@ -29,7 +29,8 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 * Gegen das veröffentlichte DuckDB v2.0.0 (`d54cbbe3df`, quack `f96420ed46`):
   * Engine- und Gateway-Image gebaut (`make docker-engine docker-gateway`), der Selbsttest des Engine-Images
     besteht.
-  * `test/e2e/compose/run.sh`: alle Szenarien grün (seit 2026-11-25 a–j, darunter Query-Zeitlimit und gehärtete Engine).
+  * `test/e2e/compose/run.sh`: alle Szenarien grün (seit 2026-11-25 a–k, darunter Query-Zeitlimit, gehärtete Engine und verwaiste
+    Verbindungen).
   * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle Szenarien grün (seit
     2026-11-22 k1–k8), auch der Gateway-Neustart mit Session-Adoption und die persistenten Profile.
   * `test/e2e/kind/ha.sh` (Overlay `ha`, zwei Replikas, echte Secrets): alle Szenarien grün (seit 2026-11-22 h1–h6
@@ -143,10 +144,12 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
 
 ## Bekannte Grenzen
 
-1. **Zombie-Backend-Verbindungen nach einem Gateway-Neustart** bei geteilten Engines: Clients, die während der
-   Downtime gestorben sind, werden nie adoptiert. Der Quack-Server räumt Verbindungen nicht selbst auf (Leases
-   laufen nur beim nächsten Zugriff ab). Bis zum Ende der Engine bleiben sie offen; `engine.maxLifetime` begrenzt
-   das.
+1. **Verwaiste Backend-Verbindungen nach einem Gateway-Neustart** (`engine.closeOrphanedConnections`, Default an,
+   bei `static` aus): Das Gateway schließt Verbindungen toter Clients erst, wenn ihre Engine-Lease abgelaufen ist,
+   mit den Defaults gut eine Stunde nach der Übernahme; so trifft es nie einen lebenden Client. Gehärtete Engines
+   räumt es nur mit der Makro-Variante `quackmux_authorize_listing` auf (sie zeigt jeder Session die
+   Verbindungs-IDs, passt also nur, wenn allein das Gateway den Engine-Port erreicht). Engines mit mehr als 2048
+   Verbindungen räumt es nicht auf (`quack_active_connections()` von DuckDB v2.0.0 scheitert dann).
 2. **Persistente Daten pro Engine-Schlüssel** (`persistence` im Profil, ein PVC je Schlüssel, nie zwei Engines
    eines Schlüssels gleichzeitig): Ein erzwungenes Löschen eines Pods, ein Node-Ausfall, ein eigener Scheduler
    und mit HA ein Restfenster von Sekunden umgehen die Prüfungen des Gateways; dann schützen nur
@@ -173,15 +176,13 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
 
 Erledigt seit dem 2026-11-21: CI und Release mit GitHub Actions (`.github/workflows`, [docs/releasing.md](releasing.md)),
 der HA-Test nächtlich in CI, PVCs pro Engine-Schlüssel (`persistence`, kind-Szenarien k5–k8 und h6), HA mit
-allen Replikas ready (Leader-Label, `ha.deregistrationDelay`, kind-Szenarien h1–h5 und h4b) und die Härtung
-geteilter Engines (`postStartSQL`, Autorisierungs-Makro mit 199 Testfällen im Selbsttest des Images; dabei
-zwei Lecks im Engine-Image geschlossen: das Engine-Token über `FROM _` und Befehle über `/proc/self/fd/0`).
+allen Replikas ready (Leader-Label, `ha.deregistrationDelay`, kind-Szenarien h1–h5 und h4b), die Härtung
+geteilter Engines (`postStartSQL`, Autorisierungs-Makro mit 224 Testfällen im Selbsttest des Images; dabei
+zwei Lecks im Engine-Image geschlossen: das Engine-Token über `FROM _` und Befehle über `/proc/self/fd/0`),
+ein optionales Zeitlimit pro Query (`limits.queryTimeout`, CANCEL auf der Engine, Compose-Szenario h) und das
+Aufräumen verwaister Verbindungen nach einem Neustart (`engine.closeOrphanedConnections`, Compose-Szenario k).
 
-1. **Zombie-Verbindungen aufräumen:** nach einem Neustart `quack_active_connections()` abfragen. Das verlangt das
-   Dekodieren von DataChunks (VARCHAR) aus `PREPARE_RESPONSE`, und auf gehärteten Engines eine Ausnahme im Makro
-   für genau diesen Text (`docs/design.md`, Abschnitt 10).
-2. Optional:
-   * Query-/Request-Timeout (CANCEL nach X)
+1. Optional:
    * Helm-Chart
    * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)
    * Spill-Defaults in den Beispielprofilen
