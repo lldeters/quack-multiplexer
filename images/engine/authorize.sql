@@ -65,24 +65,32 @@
 -- are rejected as a whole. A later DuckDB version or an extension may bring
 -- new ones: check the list after every update (images/engine/README.md).
 --
--- One query passes although it names quack_*: exactly the text
+-- quackmux_authorize_listing is the same check with one exception, for an
+-- engine whose orphaned connections the gateway closes after a restart
+-- (engine.closeOrphanedConnections): it lets exactly the text
 --
 --   SELECT connection_id FROM quack_active_connections()
 --
--- byte for byte (also under another default_collation), nothing before or
--- after it. After a restart the gateway lists the connections of the engine
--- with it and closes those that no client asks for any more. The macro
--- cannot tell the gateway from a client (it sees the connection id and the
--- text only, and the gateway uses the engine token like the sessions it
--- serves), so every session may run it as well. It reads nothing but the
--- connection ids, which are of no use outside the engine: clients reach the
--- engine only through the gateway, which routes no ids but its own sealed
--- ones, and every other quack_* function stays rejected.
+-- through, byte for byte (also under another default_collation), nothing
+-- before or after it; the gateway lists the connections of the engine with
+-- it. To use it, switch to it after the .read in the init SQL:
+--
+--   SET GLOBAL quack_authorization_function = 'quackmux_authorize_listing';
+--
+-- Only where nothing but the gateway reaches the port of the engine (an
+-- enforced NetworkPolicy, a firewall): the macro cannot tell the gateway
+-- from a client (it sees the connection id and the text only, and the
+-- gateway uses the engine token like the sessions it serves), so every
+-- session may run the listing as well. The connection ids are bearer
+-- credentials: after the handshake, the Quack server serves a message by its
+-- connection id alone. Whoever reaches the port of the engine and knows the
+-- id of another session's connection can read its temporary tables, run SQL
+-- in its transaction, cancel its query or close it.
 --
 -- Every built-in function is called as system.main.<name> and no operator is
 -- used that DuckDB resolves through the catalog (such as || or LIKE): a macro
 -- of the same name in the main schema would take precedence over it. With a
--- database file, both macros are stored in it; CREATE OR REPLACE updates them
+-- database file, the macros are stored in it; CREATE OR REPLACE updates them
 -- at every start.
 
 -- quackmux_rejection returns the start of what makes a query rejected, or
@@ -103,18 +111,20 @@ CREATE OR REPLACE MACRO quackmux_rejection(sql) AS
         '|schema\b[\s\S]*[^a-z_]system\b',
         ')'), 1, 'i'), '');
 
--- quackmux_authorize is the authorization function. It returns BOOLEAN:
--- a VARCHAR result would replace the SQL of the query. The lambda evaluates
--- quackmux_rejection once: every occurrence of the regular expression is
--- compiled anew for every query (about 1 ms each).
-CREATE OR REPLACE MACRO quackmux_authorize(connection_id, sql) AS
+-- quackmux_check is the check of both authorization functions: true for a
+-- query that may run, an error for one that may not; listing lets the
+-- listing of the gateway through. It returns BOOLEAN: a VARCHAR result would
+-- replace the SQL of the query. The lambda evaluates quackmux_rejection once:
+-- every occurrence of the regular expression is compiled anew for every
+-- query (about 1 ms each).
+CREATE OR REPLACE MACRO quackmux_check(sql, listing) AS
     CASE
         WHEN system.main.current_setting('enable_external_access')
                 OR NOT system.main.current_setting('lock_configuration') THEN
             system.main.error('quackmux_authorize: the engine is not hardened yet (the post-start SQL must set enable_external_access = false and lock_configuration = true); try again')
         -- The listing of the gateway (see above). COLLATE c compares bytes,
         -- whatever default_collation says.
-        WHEN sql = ('SELECT connection_id FROM quack_active_connections()' COLLATE c) THEN
+        WHEN listing AND sql = ('SELECT connection_id FROM quack_active_connections()' COLLATE c) THEN
             true
         ELSE
             system.main.list_extract(system.main.list_transform(system.main.list_value(quackmux_rejection(sql)),
@@ -124,5 +134,10 @@ CREATE OR REPLACE MACRO quackmux_authorize(connection_id, sql) AS
                         system.main.left(rejection, 60), '"'))
                 END), 1)
     END;
+
+-- The authorization functions: quackmux_authorize, the default, and
+-- quackmux_authorize_listing (see above).
+CREATE OR REPLACE MACRO quackmux_authorize(connection_id, sql) AS quackmux_check(sql, false);
+CREATE OR REPLACE MACRO quackmux_authorize_listing(connection_id, sql) AS quackmux_check(sql, true);
 
 SET GLOBAL quack_authorization_function = 'quackmux_authorize';

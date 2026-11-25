@@ -265,14 +265,15 @@ SQL
 }
 
 # (j) engine-analytics is hardened like a shared engine (the authorization
-# macro of the image and the post-start settings). Through the gateway a
-# session attaches (catalog queries), queries, uploads and keeps a temporary
-# table as usual, and FROM _ only shows the harmless last result of the
-# engine's CLI. Then the cases of the macro run through the gateway
-# (quackmux-authorize-test of the client image, images/engine/authorize-
-# cases.tsv): what the macro and DuckDB must refuse, also in other spellings,
-# and the client's ordinary traffic. The engine token appears nowhere, and
-# the engine keeps serving.
+# macro of the image, as quackmux_authorize_listing, and the post-start
+# settings). Through the gateway a session attaches (catalog queries),
+# queries, uploads and keeps a temporary table as usual, and FROM _ only
+# shows the harmless last result of the engine's CLI. Then the cases of the
+# macro run through the gateway (quackmux-authorize-test of the client
+# image, images/engine/authorize-cases.tsv): what the macro and DuckDB must
+# refuse, also in other spellings, the client's ordinary traffic and the
+# listing of the gateway. The engine token appears nowhere, and the engine
+# keeps serving.
 scenario_hardened_engine() {
 	local log=$E2E_WORK/j.log cases=$E2E_WORK/j_cases.log
 	client j <<SQL
@@ -299,8 +300,8 @@ SQL
 	# a command line.
 	CLIENT_RC=0
 	QUACK_TOKEN="${E2E_ALICE_TOKEN}?share_level=group&group=analytics" QUACKMUX_TEST_SECRET=$E2E_ENGINE_ANALYTICS_TOKEN \
-		QUACKMUX_EXTENSION_DIR=$E2E_EXTENSION_DIR "${COMPOSE[@]}" run --rm -T --no-deps \
-		-e QUACK_TOKEN -e QUACKMUX_TEST_SECRET -e QUACKMUX_EXTENSION_DIR \
+		QUACKMUX_EXTENSION_DIR=$E2E_EXTENSION_DIR QUACKMUX_TEST_LISTING=1 "${COMPOSE[@]}" run --rm -T --no-deps \
+		-e QUACK_TOKEN -e QUACKMUX_TEST_SECRET -e QUACKMUX_EXTENSION_DIR -e QUACKMUX_TEST_LISTING \
 		--entrypoint /usr/local/bin/quackmux-authorize-test client gateway:9494 >"$cases" 2>&1 || CLIENT_RC=$?
 	if ! expect_status "$CLIENT_RC" 0 "the cases of the authorization macro pass through the gateway: $(tail -n 1 "$cases")"; then
 		indent "$cases"

@@ -5,7 +5,9 @@
 # One case per line, four fields separated by a tab: ID, OUTCOME, KIND, SQL.
 # OUTCOME is BLOCK (rejected by the macro), PERM (refused by DuckDB: no file
 # or network access), LOCK (refused by DuckDB: configuration locked), ERR (any
-# error) or OK (no error). KIND Q sends the SQL to the engine as the text of
+# error), OK (no error) or LISTING (the listing of the gateway: OK on an
+# engine that runs quackmux_authorize_listing, QUACKMUX_TEST_LISTING=1, BLOCK
+# with quackmux_authorize). KIND Q sends the SQL to the engine as the text of
 # one query, the way a client pushes a query down (FROM r.query('...')); KIND
 # C runs it in the client on the attached database "r", so the client sends
 # its own queries (catalog, uploads). The cases run in this order in one
@@ -51,9 +53,10 @@ a26	BLOCK	Q	CALL quack_cancel('x')
 a27	BLOCK	Q	SELECT 1 FROM quack_stop  {tab}{nl} ('quack:0.0.0.0:9494')
 a28	BLOCK	Q	SELECT quack_connection_id()
 
-# The one exception: the gateway's listing of the engine's connections
-# (wire.ActiveConnectionsSQL), exactly this text and nothing else.
-l01	OK	Q	SELECT connection_id FROM quack_active_connections()
+# The listing of the gateway (wire.ActiveConnectionsSQL): quackmux_authorize
+# rejects it, quackmux_authorize_listing lets exactly this text through and
+# nothing else.
+l01	LISTING	Q	SELECT connection_id FROM quack_active_connections()
 l02	BLOCK	Q	select connection_id from quack_active_connections()
 l03	BLOCK	Q	SELECT connection_id FROM QUACK_ACTIVE_CONNECTIONS()
 l04	BLOCK	Q	SELECT Connection_ID FROM quack_active_connections()
