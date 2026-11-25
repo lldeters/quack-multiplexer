@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Values of the quackmux chart",
+  "description": "Unknown keys are errors, like in the gateway configuration: a typo must not silently fall back to a default.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "global": {"type": "object"},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
+    "replicas": {"type": ["integer", "null"], "minimum": 0},
+    "ha": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "rollingUpdate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxSurge": {"type": ["integer", "string"]},
+            "maxUnavailable": {"type": ["integer", "string"]}
+          }
+        }
+      }
+    },
+    "configYaml": {"type": "string"},
+    "config": {"type": "object"},
+    "users": {
+      "type": "array",
+      "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sessionKey": {"$ref": "#/definitions/existingSecret"},
+        "adminToken": {"$ref": "#/definitions/existingSecret"},
+        "users": {"$ref": "#/definitions/existingSecret"}
+      }
+    },
+    "goMemLimit": {"type": "string"},
+    "resources": {"type": "object"},
+    "readinessProbe": {"type": "object"},
+    "livenessProbe": {"type": "object"},
+    "podSecurityContext": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 0},
+    "podAnnotations": {"$ref": "#/definitions/stringMap"},
+    "podLabels": {"$ref": "#/definitions/stringMap"},
+    "extraEnv": {"type": "array", "items": {"type": "object"}},
+    "extraVolumes": {"type": "array", "items": {"type": "object"}},
+    "extraVolumeMounts": {"type": "array", "items": {"type": "object"}},
+    "nodeSelector": {"$ref": "#/definitions/stringMap"},
+    "tolerations": {"type": "array", "items": {"type": "object"}},
+    "affinity": {"type": "object"},
+    "topologySpreadConstraints": {"type": "array", "items": {"type": "object"}},
+    "priorityClassName": {"type": "string"},
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"$ref": "#/definitions/stringMap"}
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"create": {"type": "boolean"}}
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+        "annotations": {"$ref": "#/definitions/stringMap"}
+      }
+    },
+    "externalService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+        "annotations": {"$ref": "#/definitions/stringMap"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "externalTrafficPolicy": {"enum": ["", "Cluster", "Local"]},
+        "loadBalancerSourceRanges": {"type": "array", "items": {"type": "string"}},
+        "loadBalancerClass": {"type": "string"}
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "adminFrom": {"type": "array", "items": {"type": "object"}},
+        "engineEgress": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "fullnameOverride": {"type": "string"}
+  },
+  "definitions": {
+    "existingSecret": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"existingSecret": {"type": "string"}}
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{{- /*
+Namespace-scoped permissions of the gateway (deploy/kubernetes/base/rbac.yaml).
+Keep quackmux alone in its namespace: the Role may read every Secret in it.
+*/ -}}
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "quackmux.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+rules:
+  # Engine pods: launch, watch (informer), re-label warm-pool engines when a
+  # session claims them, delete. With ha.enabled also the gateway's own pods
+  # (patch): the leader labels its pod quackmux.io/leader and removes the
+  # label from the pod of a previous leader.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete, patch]
+  # One token Secret per engine, owned by its pod; orphaned ones are cleaned
+  # up.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, delete, patch]
+  # Data volumes of profiles with persistence: one PersistentVolumeClaim per
+  # engine key, kept when the engine ends; deleted only through the admin
+  # API (DELETE /api/v1/volumes/{name}).
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, create, patch, delete]
+  # Kubernetes events about engines.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  # Leader election (ha.enabled). With it the gateway checks at start-up that
+  # it may get, create and update its lease and does not start otherwise.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "quackmux.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "quackmux.fullname" . }}-gateway
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "quackmux.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

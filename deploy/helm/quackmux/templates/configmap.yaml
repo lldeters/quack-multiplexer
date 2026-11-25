@@ -1,0 +1,14 @@
+{{- /*
+The gateway configuration, mounted at /etc/quackmux/config.yaml (see
+quackmux.config in _helpers.tpl). Check your own with
+  quackmux validate -config config.yaml
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "quackmux.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+data:
+  {{- dict "config.yaml" (include "quackmux.config" .) | toYaml | nindent 2 }}

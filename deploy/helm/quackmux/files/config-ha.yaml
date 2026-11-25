@@ -1,0 +1,127 @@
+# quackmux gateway configuration for the HA overlay (two replicas, leader
+# election). It replaces ../../base/config.yaml completely; keep both files
+# in sync - apart from the "ha" section they are identical.
+# Every option with its default: examples/config.kubernetes.yaml
+
+server:
+  listen: ":9494"
+  # Required with ha.enabled: all replicas must seal and open connection ids
+  # with the same key (Secret "quackmux-session-key").
+  sessionKeyFile: /etc/quackmux/session/key
+  # tls:
+  #   certFile: /etc/quackmux/tls/tls.crt
+  #   keyFile: /etc/quackmux/tls/tls.key
+
+admin:
+  listen: ":9495"
+  tokenFile: /etc/quackmux/admin/token
+
+auth:
+  mode: static
+  static:
+    file: /etc/quackmux/users/users.yaml
+    reloadInterval: 10s
+
+defaults:
+  shareLevel: USER
+  subdomain: default
+  profile: default
+
+session:
+  idleTimeout: 6h
+  maxLifetime: 0s
+  minHeartbeatTimeout: 5s
+  maxHeartbeatTimeout: 300s
+  heartbeatGrace: 15s
+  backendHeartbeatTimeout: 1h
+  tombstoneTTL: 1h
+  checkInterval: 5s
+
+engine:
+  startupTimeout: 180s
+  idleTimeout:
+    CONNECTION: 0s
+    USER: 30m
+    GROUP: 30m
+    SERVER: 30m
+  maxLifetime: 0s
+  drainTimeout: 1h
+  # After a failover the new leader keeps the recovered engines alive this
+  # long, so that their sessions can re-attach with the next heartbeat.
+  recoveryGrace: 180s
+  checkInterval: 5s
+  replaceOnSpecChange: true
+  failedRetention: 10m
+
+limits:
+  maxSessions: 2000
+  maxSessionsPerUser: 100
+  maxEngines: 40
+  maxEnginesPerUser: 4
+  maxStartingEngines: 10
+
+provider:
+  type: kubernetes
+  kubernetes:
+    # Engines (and the lease) live next to the gateway.
+    namespace: quackmux
+    instance: default
+
+profiles:
+  default:
+    description: "Standard engine: 1-2 CPUs, 4 GiB memory"
+    image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
+    imagePullPolicy: IfNotPresent
+    settings:
+      memory_limit: 3GB
+      threads: "2"
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+
+  large:
+    description: "Large engine for heavy queries: 4 CPUs, 16 GiB memory"
+    allowedShareLevels: [USER, CONNECTION]
+    settings:
+      memory_limit: 12GB
+      threads: "4"
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+    # warmPool:
+    #   size: 0
+    # startupTimeout: 10m
+
+audit:
+  enabled: true
+  maxQueryBytes: 4096
+
+ha:
+  enabled: true
+  # Lease "quackmux-<provider.kubernetes.instance>" (here quackmux-default)
+  # in the engine namespace; set leaseName/namespace to override.
+  # The leader renews the lease every retryPeriod and steps down (the
+  # process exits and restarts as a follower) when it could not renew it
+  # for renewDeadline. A follower takes over at the latest leaseDuration
+  # after the last renewal - at once when the leader shuts down orderly.
+  # Both replicas are ready; the leader labels its pod quackmux.io/leader,
+  # and the Service routes to that label (service-patch.yaml).
+  leaseDuration: 15s
+  renewDeadline: 10s
+  retryPeriod: 2s
+  # A leader that shuts down answers new connections this long after it
+  # removed its label, until kube-proxy has caught up (part of
+  # server.shutdownTimeout).
+  deregistrationDelay: 3s
+
+log:
+  level: info
+  format: json

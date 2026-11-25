@@ -1,0 +1,31 @@
+{{- /*
+Cluster-internal access to the gateway:
+  Quack: quack:<fullname>.<namespace>.svc.cluster.local:9494
+  Admin: http://<fullname>.<namespace>.svc.cluster.local:9495 (API, /metrics)
+Only ready gateway pods receive traffic; with ha.enabled every healthy replica
+is ready, and the selector adds the label of the leader.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "quackmux.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "quackmux.serviceSelector" . | nindent 4 }}
+  ports:
+    - name: quack
+      port: 9494
+      targetPort: quack
+      protocol: TCP
+    - name: admin
+      port: 9495
+      targetPort: admin
+      protocol: TCP
