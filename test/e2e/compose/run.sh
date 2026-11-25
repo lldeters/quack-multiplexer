@@ -742,29 +742,30 @@ SQL
 		"DISABLE_SSL false and DNS:localhost in the certificate let the CA check pass for localhost" || return 1
 
 	# bob's queries have a time limit of 5s; the engine would count for much
-	# longer. With a global http_timeout of 1s the pinned client gives up
-	# first; the session's value does not reach its HTTP client.
+	# longer. With a global http_timeout of 2s (which leaves room for the
+	# requests of the ATTACH) the pinned client gives up first; the session's
+	# value does not reach its HTTP client.
 	tls_client l_timeout <<SQL
 $(client_preamble)
-SET GLOBAL http_timeout = 1;
+SET GLOBAL http_timeout = 2;
 $(tls_secret "$E2E_BOB_TOKEN" gateway-tls "SSL_FINGERPRINT '$fp'")
 ATTACH 'quack:gateway-tls:9494' AS remote;
 SELECT 'long=' || CAST(n AS VARCHAR) AS result FROM remote.query('SELECT count(*) AS n FROM range(1000000000000)');
 SQL
-	expect_status "$CLIENT_RC" nonzero "with SET GLOBAL http_timeout = 1 the long query failed" || return 1
+	expect_status "$CLIENT_RC" nonzero "with SET GLOBAL http_timeout = 2 the long query failed" || return 1
 	expect_output "$E2E_WORK/l_timeout.log" 'Failed to read connection' \
 		"the pinned client gave up after the global http_timeout" || return 1
 	expect_no_output "$E2E_WORK/l_timeout.log" 'time limit of 5s' "it did not wait for the gateway's time limit" || return 1
 
 	tls_client l_timeout_session <<SQL
 $(client_preamble)
-SET http_timeout = 1;
+SET http_timeout = 2;
 $(tls_secret "$E2E_BOB_TOKEN" gateway-tls "SSL_FINGERPRINT '$fp'")
 ATTACH 'quack:gateway-tls:9494' AS remote;
 SELECT 'long=' || CAST(n AS VARCHAR) AS result FROM remote.query('SELECT count(*) AS n FROM range(1000000000000)');
 SQL
 	expect_output "$E2E_WORK/l_timeout_session.log" 'time limit of 5s' \
-		"with SET http_timeout = 1 (session) it waited until the gateway's time limit" || return 1
+		"with SET http_timeout = 2 (session) it waited until the gateway's time limit" || return 1
 }
 
 # (i) Nothing above may have crashed a request handler.
