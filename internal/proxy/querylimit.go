@@ -37,13 +37,15 @@ import (
 //     for a FETCH the engine certainly decoded, an error;
 //   - a CANCEL of the client for it (or for whatever runs) succeeds that the
 //     gateway forwarded after its PREPARE was answered;
-//   - the session closes.
+//   - the session closes, and the gateway is done with its queries (see
+//     below).
 //
 // Answers to requests that the gateway forwarded while the PREPARE still
 // waited prove nothing: the engine may not have made the query its
 // statement yet, and they may be about the statement before. The gateway
 // waits for the answer to a PREPARE also when its client goes away: the
-// engine runs the query anyway.
+// engine runs the query anyway. (Without a fresh lease it lets go of such a
+// PREPARE at the limit, and cancels the query once the lease is fresh.)
 //
 // The engine gets a request only once all of it arrived, and then serves
 // the statement the connection has. A FETCH or an upload that no query of
