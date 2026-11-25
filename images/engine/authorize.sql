@@ -65,6 +65,20 @@
 -- are rejected as a whole. A later DuckDB version or an extension may bring
 -- new ones: check the list after every update (images/engine/README.md).
 --
+-- One query passes although it names quack_*: exactly the text
+--
+--   SELECT connection_id FROM quack_active_connections()
+--
+-- byte for byte (also under another default_collation), nothing before or
+-- after it. After a restart the gateway lists the connections of the engine
+-- with it and closes those that no client asks for any more. The macro
+-- cannot tell the gateway from a client (it sees the connection id and the
+-- text only, and the gateway uses the engine token like the sessions it
+-- serves), so every session may run it as well. It reads nothing but the
+-- connection ids, which are of no use outside the engine: clients reach the
+-- engine only through the gateway, which routes no ids but its own sealed
+-- ones, and every other quack_* function stays rejected.
+--
 -- Every built-in function is called as system.main.<name> and no operator is
 -- used that DuckDB resolves through the catalog (such as || or LIKE): a macro
 -- of the same name in the main schema would take precedence over it. With a
@@ -98,6 +112,10 @@ CREATE OR REPLACE MACRO quackmux_authorize(connection_id, sql) AS
         WHEN system.main.current_setting('enable_external_access')
                 OR NOT system.main.current_setting('lock_configuration') THEN
             system.main.error('quackmux_authorize: the engine is not hardened yet (the post-start SQL must set enable_external_access = false and lock_configuration = true); try again')
+        -- The listing of the gateway (see above). COLLATE c compares bytes,
+        -- whatever default_collation says.
+        WHEN sql = ('SELECT connection_id FROM quack_active_connections()' COLLATE c) THEN
+            true
         ELSE
             system.main.list_extract(system.main.list_transform(system.main.list_value(quackmux_rejection(sql)),
                 lambda rejection: CASE
