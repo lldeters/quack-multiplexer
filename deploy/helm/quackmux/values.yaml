@@ -79,6 +79,9 @@ secrets:
   # that the chart generates at the first install and keeps on upgrades
   # (lookup). helm template and other renderings without a cluster, such as
   # Argo CD, generate new values every time: use existingSecret there.
+  # existingSecret must not name a Secret the chart generates
+  # (<fullname>-session-key, ...): copy the value into a Secret of your own.
+  # Helm keeps the generated session key and admin token on helm uninstall.
   sessionKey:
     # server.sessionKeyFile, key "key": seals gateway connection ids, at least
     # 16 bytes. Changing it ends all sessions.

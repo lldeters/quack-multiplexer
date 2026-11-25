@@ -219,6 +219,12 @@ func TestChartRefuses(t *testing.T) {
 		{"configuration that is no map", "quackmux", []string{"--set", "configYaml=- a"}, "not a YAML map"},
 		{"service account without a name", "quackmux", []string{"--set", "serviceAccount.create=false"}, "serviceAccount.name is required"},
 		{"unknown value", "quackmux", []string{"--set", "ha.enable=true"}, "enable"},
+		// The chart stops rendering a Secret it generates once it is named as
+		// existing: Helm would delete the users Secret and leave the others
+		// unmanaged.
+		{"own session key Secret as existing", "quackmux", []string{"--set", "secrets.sessionKey.existingSecret=quackmux-session-key"}, "the Secret that the chart generates"},
+		{"own admin token Secret as existing", "quackmux", []string{"--set", "secrets.adminToken.existingSecret=quackmux-admin-token"}, "the Secret that the chart generates"},
+		{"own users Secret as existing", "analytics", []string{"--set", "fullnameOverride=qmx", "--set", "secrets.users.existingSecret=qmx-users"}, "the Secret that the chart generates"},
 		// The API refuses externalTrafficPolicy for ClusterIP and the
 		// loadBalancer* fields for every type but LoadBalancer.
 		{"external Service of type ClusterIP", "quackmux", []string{"--set", "externalService.enabled=true", "--set", "externalService.type=ClusterIP"}, "/externalService/type"},
@@ -285,6 +291,15 @@ func TestChartSecrets(t *testing.T) {
 		want := map[string]string{"users": "quackmux-users", "admin-token": "quackmux-admin-token", "session-key": "quackmux-session-key"}
 		if got := mountedSecrets(t, objs); !reflect.DeepEqual(got, want) {
 			t.Errorf("mounted Secrets %v, want %v", got, want)
+		}
+		// Helm keeps the session key and the admin token when the chart
+		// stops rendering them (existingSecret, helm uninstall); the users
+		// file comes from the values anyway.
+		for name, keep := range map[string]bool{"quackmux-session-key": true, "quackmux-admin-token": true, "quackmux-users": false} {
+			policy := str(mustFind(t, objs, "Secret", name), "metadata", "annotations", "helm.sh/resource-policy")
+			if (policy == "keep") != keep {
+				t.Errorf("Secret %s: helm.sh/resource-policy %q, want keep %v", name, policy, keep)
+			}
 		}
 	})
 	t.Run("existing", func(t *testing.T) {

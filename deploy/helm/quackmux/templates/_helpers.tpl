@@ -86,6 +86,22 @@ quackmux.io/leader: "true"
 {{- end -}}
 
 {{/*
+quackmux.checkExistingSecrets: an existing Secret must not be one that the
+chart generates. The chart stops rendering it, so Helm takes it out of the
+release: it deletes the users Secret and leaves the others unmanaged. Prints
+nothing.
+*/}}
+{{- define "quackmux.checkExistingSecrets" -}}
+{{- $fullname := include "quackmux.fullname" . -}}
+{{- range $value, $suffix := dict "sessionKey" "session-key" "adminToken" "admin-token" "users" "users" -}}
+{{- $own := printf "%s-%s" $fullname $suffix -}}
+{{- if eq (dig $value "existingSecret" "" $.Values.secrets) $own -}}
+{{- fail (printf "secrets.%s.existingSecret: %s is the Secret that the chart generates; copy its value into a Secret of your own and name that one (README.md, \"Secrets\")" $value $own) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 quackmux.secretData prints the base64 value of the key "key" of the chart's
 Secret "name": the value the Secret in the cluster already has, else a new
 random one of 43 letters and digits (about 256 bits, like quackmux token).

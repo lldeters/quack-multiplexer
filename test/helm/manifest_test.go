@@ -162,7 +162,8 @@ func mustFind(t *testing.T, objs []object, kind, name string) object {
 // (deploy/helm/quackmux/README.md, "Unterschiede zu Kustomize"); everything
 // else must be equal:
 //
-//  1. The chart's objects carry Helm's labels in their metadata (helmLabels).
+//  1. The chart's objects carry Helm's labels in their metadata (helmLabels),
+//     and the Secrets that Helm keeps the annotation helmAnnotations.
 //  2. Its pod template carries the annotation checksum/config: the chart
 //     rolls the gateway out on a changed configuration this way.
 //  3. Kustomize appends a hash of the content to the names of the ConfigMap
@@ -174,8 +175,11 @@ func mustFind(t *testing.T, objs []object, kind, name string) object {
 //  5. Kustomize creates the Namespace (with the Pod Security labels); a Helm
 //     release goes into an existing one.
 
-// helmLabels are the labels of difference 1.
-var helmLabels = []string{"helm.sh/chart", "app.kubernetes.io/instance", "app.kubernetes.io/version", "app.kubernetes.io/managed-by"}
+// helmLabels and helmAnnotations are the metadata of difference 1.
+var (
+	helmLabels      = []string{"helm.sh/chart", "app.kubernetes.io/instance", "app.kubernetes.io/version", "app.kubernetes.io/managed-by"}
+	helmAnnotations = []string{"helm.sh/resource-policy"}
+)
 
 // checksumAnnotation is the annotation of difference 2.
 const checksumAnnotation = "checksum/config"
@@ -187,6 +191,7 @@ var kustomizeHashSuffix = regexp.MustCompile(`^(.+)-[a-z0-9]{10}$`)
 func normalizeHelm(objs []object) []object {
 	for _, o := range objs {
 		deleteKeys(mapAt(o, "metadata"), "labels", helmLabels...)
+		deleteKeys(mapAt(o, "metadata"), "annotations", helmAnnotations...)
 		deleteKeys(mapAt(o, "spec", "template", "metadata"), "annotations", checksumAnnotation)
 		redactSecret(o)
 	}
@@ -463,6 +468,8 @@ metadata:
   namespace: quackmux
   labels:
     helm.sh/chart: quackmux-0.1.0
+  annotations:
+    helm.sh/resource-policy: keep
 type: Opaque
 data:
   key: "R0VORVJBVEVE"
@@ -499,7 +506,8 @@ spec:
 	for _, tc := range []struct{ name, from, to, want string }{
 		{"configuration", "    a: 1\n", "    a: 2\n", "ConfigMap quackmux/quackmux-config differs"},
 		{"secret key", "  key: \"R0VORVJBVEVE\"", "  token: \"R0VORVJBVEVE\"", "Secret quackmux/quackmux-session-key differs"},
-		{"label", "    helm.sh/chart: quackmux-0.1.0\ntype", "    app.kubernetes.io/part-of: other\ntype", "Secret quackmux/quackmux-session-key differs"},
+		{"label", "    helm.sh/chart: quackmux-0.1.0\n  annotations", "    app.kubernetes.io/part-of: other\n  annotations", "Secret quackmux/quackmux-session-key differs"},
+		{"other annotation", "    helm.sh/resource-policy: keep", "    example.com/policy: keep", "Secret quackmux/quackmux-session-key differs"},
 		{"reference", "secretName: quackmux-session-key\n", "secretName: other\n", "Deployment quackmux/quackmux differs"},
 		{"annotation", "        prometheus.io/scrape: \"true\"", "        prometheus.io/scrape: \"false\"", "Deployment quackmux/quackmux differs"},
 		{"object only in helm", "kind: ConfigMap", "kind: Job", "ConfigMap quackmux/quackmux-config: in kustomize, missing in helm"},

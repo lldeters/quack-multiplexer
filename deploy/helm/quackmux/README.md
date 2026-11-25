@@ -169,6 +169,22 @@ helm template quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --ku
   ```
 
 * `secrets.users.existingSecret` ersetzt den Wert `users` durch ein Secret mit dem Schlüssel `users.yaml`.
+* **Helm behält Session-Key und Admin-Token** (`helm.sh/resource-policy: keep`), auch wenn das Chart sie nicht mehr
+  rendert: beim Wechsel auf `existingSecret` und nach `helm uninstall`. Ein neues Release desselben Namens
+  übernimmt sie samt Werten; die Sessions weiterlaufender Engines bleiben gültig. Entfernen:
+  [Deinstallieren](#deinstallieren).
+* **Vom erzeugten zu einem eigenen Secret** (etwa vor dem Umstieg auf Argo CD): den Wert in ein Secret mit anderem
+  Namen kopieren und dieses nennen. Den Namen eines Secrets, das das Chart erzeugt, lehnt `existingSecret` ab.
+
+  ```sh
+  kubectl -n quackmux get secret quackmux-session-key -o jsonpath='{.data.key}' | base64 -d > session-key
+  kubectl -n quackmux create secret generic quackmux-session-key-own --from-file=key=session-key
+  helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml \
+    --set secrets.sessionKey.existingSecret=quackmux-session-key-own
+  ```
+
+  Ebenso der Admin-Token (Schlüssel `token`). Der neue Name rollt das Gateway aus; der Wert ist derselbe, die
+  Sessions bleiben.
 * Änderungen: Ein neuer Session-Key beendet alle Sessions (die Clients müssen neu attachen). Session-Key und
   Admin-Token liest das Gateway beim Start; nach einer Änderung an einem vorhandenen Secret
   `kubectl -n quackmux rollout restart deployment/quackmux`. Die Benutzer übernimmt es ohne Neustart (nach etwa
