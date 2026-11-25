@@ -36,7 +36,7 @@ func (c *Config) Warnings() []string {
 				name, p.Database, ps.MountPath, path.Join(ps.MountPath, DefaultPersistentDatabase)))
 		}
 	}
-	return warnings
+	return append(warnings, c.queryTimeoutWarnings()...)
 }
 
 // defaultsContext is the routing that a session without options gets: the

@@ -27,3 +27,32 @@ func (c *Config) validateQueryTimeouts(add func(format string, args ...any)) {
 		check("profiles."+name+".queryTimeout", c.Profiles[name].QueryTimeout)
 	}
 }
+
+// queryTimeoutWarnings warns about overrides by group that decide the query
+// time limit when the gateway cannot know the groups of every session: a
+// connection id carries the user, not the groups, so after a gateway
+// restart or a leader fail-over the gateway asks the authenticator for them,
+// and the jwt authenticator cannot tell (the groups came with the token).
+// Such an override then does not match, and the limit of the next one that
+// matches applies (or the profile's, or limits.queryTimeout).
+func (c *Config) queryTimeoutWarnings() []string {
+	if c.Auth.Mode != "jwt" {
+		return nil
+	}
+	var warnings []string
+	for i, o := range c.Overrides {
+		if len(o.Groups) == 0 {
+			continue
+		}
+		decides := o.QueryTimeout != nil
+		for _, later := range c.Overrides[i+1:] {
+			decides = decides || (len(later.Users) > 0 && later.QueryTimeout != nil)
+		}
+		if decides {
+			warnings = append(warnings, fmt.Sprintf("overrides[%d] matches by groups and decides the query time limit: "+
+				"with auth.mode jwt the gateway does not know the groups of the sessions it adopts after a restart "+
+				"or a leader fail-over, so their queries get the limit as if this override did not match", i))
+		}
+	}
+	return warnings
+}
