@@ -5,7 +5,11 @@
 //
 // Query behavior is scripted through the SQL text of PREPARE_REQUEST:
 //
-//	SLEEP <ms>      blocks the request for <ms> milliseconds
+//	SLEEP <ms>      blocks the request for <ms> milliseconds (a CANCEL or the
+//	                next PREPARE interrupts it)
+//	STREAM <n> <ms> answers at once that there is more to fetch; FETCH reads
+//	                n batches, batch i is ready i*<ms> milliseconds after the
+//	                PREPARE (see statements.go)
 //	FAIL <message>  answers with an ERROR_RESPONSE
 //	BLOB <bytes>    answers with a PREPARE_RESPONSE followed by <bytes> filler
 //	                bytes (to exercise streaming of large bodies)
@@ -41,6 +45,8 @@ type Received struct {
 	SQL          string
 	Headers      http.Header
 	BodyLen      int
+	// QueryUUID is the uuid of a PREPARE, FETCH or CANCEL request.
+	QueryUUID wire.Hugeint
 }
 
 type conn struct {
@@ -49,6 +55,7 @@ type conn struct {
 	heartbeatTimeout time.Duration
 	lastRenewed      time.Time
 	expired          bool
+	stmt             *statement // guarded by Server.mu
 }
 
 // HeartbeatTimeouts returns the lease each live connection negotiated.
@@ -67,6 +74,18 @@ type Server struct {
 	Token string
 	// Now can be replaced to control lease expiry in tests.
 	Now func() time.Time
+	// CancelError, if set, answers every CANCEL_REQUEST with this error,
+	// and the statement keeps running.
+	CancelError string
+	// CancelDelay delays every CANCEL_REQUEST before the engine acts on it.
+	CancelDelay time.Duration
+	// Supersede makes a PREPARE_REQUEST interrupt the statement before it,
+	// as the Quack server does. It is off by default, so that tests can run
+	// queries side by side on one connection. Set it before the first query.
+	Supersede bool
+	// PrepareDelay delays every PREPARE_REQUEST before it becomes the
+	// connection's statement, like a slow quack_authorization_function.
+	PrepareDelay time.Duration
 
 	mu       sync.Mutex
 	conns    map[string]*conn
@@ -225,60 +244,79 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 
 	switch h.Type {
 	case wire.TypeDisconnect:
+		s.endStatement(c)
 		s.mu.Lock()
 		delete(s.conns, h.ConnectionID)
 		s.mu.Unlock()
 		return wire.EncodeEmpty(wire.Header{Type: wire.TypeSuccessResponse}), 0
-	case wire.TypeHeartbeatRequest, wire.TypeCancelRequest, wire.TypeAcknowledgement:
+	case wire.TypeHeartbeatRequest, wire.TypeAcknowledgement:
 		return wire.EncodeEmpty(wire.Header{Type: wire.TypeSuccessResponse}), 0
+	case wire.TypeCancelRequest:
+		return s.cancel(c, body[n:], &rec), 0
 	case wire.TypeSendDataRequest:
 		// accept_budget is written with WriteProperty: an unset optional_idx.
 		return append(wire.Header{Type: wire.TypeSendDataResponse}.Encode(),
 			0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xff, 0xff), 0
 	case wire.TypeFetchRequest:
-		// Terminal fetch response: no chunks.
-		return wire.EncodeEmpty(wire.Header{Type: wire.TypeFetchResponse}), 0
+		return s.fetch(c, body[n:], &rec), 0
 	case wire.TypePrepareRequest:
 		p, err := wire.DecodePrepareRequestBody(body[n:])
 		if err != nil {
 			return errorResponse("Failed to deserialize: %v", err), 0
 		}
-		rec.SQL = p.SQL
-		return s.runQuery(p)
+		rec.SQL, rec.QueryUUID = p.SQL, p.QueryUUID
+		s.mu.Lock()
+		delay := s.PrepareDelay
+		s.mu.Unlock()
+		time.Sleep(delay)
+		return s.runQuery(c, p)
 	}
 	return errorResponse("Unimplemented message type %s", h.Type), 0
 }
 
-func (s *Server) runQuery(p wire.PrepareRequest) ([]byte, int) {
+func (s *Server) runQuery(c *conn, p wire.PrepareRequest) ([]byte, int) {
+	st := s.replaceStatement(c, p.QueryUUID)
 	fields := strings.Fields(p.SQL)
 	verb := ""
 	if len(fields) > 0 {
 		verb = strings.ToUpper(fields[0])
 	}
-	arg := func() int {
-		if len(fields) < 2 {
+	argN := func(i int) int {
+		if len(fields) <= i {
 			return 0
 		}
-		v, _ := strconv.Atoi(fields[1])
+		v, _ := strconv.Atoi(fields[i])
 		return v
 	}
+	arg := func() int { return argN(1) }
 	switch verb {
 	case "SLEEP":
-		time.Sleep(time.Duration(arg()) * time.Millisecond)
+		if err := s.sleep(st, time.Duration(arg())*time.Millisecond); err != nil {
+			return err, 0
+		}
+	case "STREAM":
+		s.mu.Lock()
+		st.stream, st.batches, st.every = true, uint64(max(argN(1), 0)), time.Duration(argN(2))*time.Millisecond
+		s.mu.Unlock()
+		return prepareResponse(p.QueryUUID, true), 0
 	case "FAIL":
 		return errorResponse("%s", strings.TrimSpace(strings.TrimPrefix(p.SQL, fields[0]))), 0
 	case "INVALIDATE":
 		return wire.ErrorResponse{Message: "database invalidated", ExceptionType: "FATAL", MustInvalidate: true}.Encode(), 0
 	case "BLOB":
-		return prepareResponse(p.QueryUUID), arg()
+		return prepareResponse(p.QueryUUID, false), arg()
 	}
-	return prepareResponse(p.QueryUUID), 0
+	return prepareResponse(p.QueryUUID, false), 0
 }
 
-// prepareResponse encodes an empty PREPARE_RESPONSE (no columns, no rows):
-// fields 1-4 hold their defaults and are omitted, field 5 is mandatory.
-func prepareResponse(uuid wire.Hugeint) []byte {
+// prepareResponse encodes a PREPARE_RESPONSE without columns and rows:
+// fields 1, 2 and 4 hold their defaults and are omitted, field 3
+// (needs_more_fetch) is written when it is true, field 5 is mandatory.
+func prepareResponse(uuid wire.Hugeint, needsMoreFetch bool) []byte {
 	msg := wire.Header{Type: wire.TypePrepareResponse}.Encode()
+	if needsMoreFetch {
+		msg = append(msg, 0x03, 0x00, 0x01)
+	}
 	msg = append(msg, 0x05, 0x00)
 	msg = appendHugeint(msg, uuid)
 	return append(msg, 0xff, 0xff)

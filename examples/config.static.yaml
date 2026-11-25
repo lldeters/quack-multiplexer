@@ -55,6 +55,12 @@ overrides:
     defaults:
       shareLevel: GROUP
 
+# Engines that all users share deserve a time limit per query: the gateway
+# cancels a query that runs longer on its engine, and the client gets an
+# error (its session stays usable). Profiles and overrides can replace it.
+# limits:
+#   queryTimeout: 30m
+
 provider:
   type: static
   static:

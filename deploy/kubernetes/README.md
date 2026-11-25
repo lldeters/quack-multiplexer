@@ -376,6 +376,7 @@ spec:
 | `quackmux_requests_total{type,outcome}`, `quackmux_request_seconds{type}` | Quack-Requests nach Nachrichtentyp |
 | `quackmux_bytes_total{direction}` | durchgereichte Bytes (`in`: Client→Engine, `out`: Engine→Client) |
 | `quackmux_connect_failures_total{reason}`, `quackmux_auth_failures_total{method}` | gescheiterte Handshakes, fehlgeschlagene Authentifizierungen |
+| `quackmux_query_timeouts_total{profile,result}` | Queries, die das Query-Zeitlimit abgebrochen hat (`limits.queryTimeout`, siehe Fehlersuche). `result="failed"`: Das Gateway konnte die Query nicht auf der Engine abbrechen, sie kann dort weiterlaufen; jeder Anstieg verdient einen Alarm. Requests, die das Gateway deshalb beantwortet, zählt `quackmux_requests_total` mit `outcome="query_timeout"`. |
 | `quackmux_requests_in_flight`, `quackmux_is_leader` | laufende Requests; 1 auf der Replika, die bedient |
 | `quackmux_leader_label`, `quackmux_leader_label_updates_total{action,result}` | nur mit HA: 1, solange der eigene Pod das Label `quackmux.io/leader` trägt (von der API bestätigt); Patches des Labels (`set`, `remove`, `remove_stale`) nach Ergebnis. Alarm (über den `PodMonitor`), wenn `max(quackmux_leader_label)` länger als eine Minute 0 ist oder fehlt: Dann bedient keine Replika, und der Service hat keinen Endpunkt. Ist dabei `max(quackmux_is_leader)` 1, findet der Leader nicht in den Dienst (Label, Engine-Registry, siehe Fehlersuche); ist es 0, führt keine Replika (Lease nicht nutzbar). Quack-Requests, die bei einem Follower ankommen, zählt `quackmux_requests_total` mit `outcome="not_leader"`. |
 
@@ -383,7 +384,9 @@ Das Audit-Log (`audit.enabled`, in der Base an) schreibt jede Query als JSON-Zei
 Engine und gekürztem SQL ins Gateway-Log. Statements, die Zugangsdaten enthalten können, stehen dort ohne ihren
 Text (`"sql":"[redacted: …]"`, `"redacted":true`): `CREATE SECRET` und alles, was `secret`, `passw`, `pwd`,
 `token`, `AccountKey` oder eine SAS-Signatur (`sig=`) enthält, auch in Namen wie `s3_secret_access_key`, sowie URLs
-mit Benutzer und Passwort. Das ist eine Heuristik: Behandeln Sie das Audit-Log trotzdem als vertraulich.
+mit Benutzer und Passwort. Das ist eine Heuristik: Behandeln Sie das Audit-Log trotzdem als vertraulich. Bricht das
+Query-Zeitlimit eine Query ab, folgt eine Zeile `"msg":"query timeout"` mit derselben `clientQueryId`, dem Limit,
+seiner Quelle, der Dauer und dem Ergebnis des Abbruchs (`cancel`: `cancelled` oder `failed`).
 
 ```sh
 kubectl -n quackmux logs deployment/quackmux | grep '"component":"audit"'
@@ -567,6 +570,11 @@ müssen neu attachen). Die End-to-End-Tests in [test/e2e/kind](../../test/e2e/ki
 * Mit `overlays/ha` ändern `ha.namespace`, `ha.leaseName`, `provider.kubernetes.instance` und, ohne
   `ha.namespace`, `provider.kubernetes.namespace` die Lease: nicht per Rollout, sondern wie beim Umstieg (siehe
   „Hochverfügbarkeit“, „Lease nicht per Rollout ändern“).
+* Mit `auth.mode: jwt` kennt das Gateway nach einem Rollout (und jedem Failover) die Gruppen der übernommenen
+  Sessions nicht, sie stehen nur im Token des `ATTACH`. Overrides nach `groups`, die `queryTimeout` setzen, gelten
+  für diese Sessions dann nicht mehr, ihre Queries bekommen das Limit des nächsten passenden Overrides, des Profils
+  oder `limits.queryTimeout`; `validate` warnt davor. Mit `static` und `none` liest das Gateway die Gruppen aus der
+  aktuellen Benutzerdatei bzw. `auth.none.defaultGroups`; Änderungen dort gelten dann auch für offene Sessions.
 * Geänderte Profile: Engines mit der alten Spec gehen auf DRAINING (`engine.replaceOnSpecChange`). Neue
   Sessions bekommen neue Engines, bestehende laufen auf der alten weiter, höchstens `engine.drainTimeout`.
   Persistente Profile: Die alte Engine nimmt weiter Sessions an, bis sie keine mehr hat (spätestens
@@ -819,6 +827,9 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
 * **Gegenmittel:** ein gehärtetes Profil, siehe [unten](#gehärtete-geteilte-engines).
 * **Ressourcen:** `resources.limits` und `settings.memory_limit` je Profil begrenzen eine Engine, `limits.*`
   die Zahl der Engines und Sessions.
+* **Laufzeit:** `limits.queryTimeout`, `profiles.<name>.queryTimeout` oder `overrides[].queryTimeout` begrenzen, wie
+  lange eine Query die Engine belegt; danach bricht das Gateway sie ab ([Design, 5.3](../../docs/design.md#53-query-zeitlimit)).
+  Das Abholen des Ergebnisses zählt mit; `COMMIT` und `ROLLBACK` haben kein Limit.
 * **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
   `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
   Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere
@@ -996,6 +1007,9 @@ Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nic
 | Gateway-Pod in `CrashLoopBackOff` | `kubectl -n quackmux logs deployment/quackmux --previous` (mit `overlays/ha`: `kubectl -n quackmux logs <pod> --previous`, sonst wählt kubectl einen bereiten Pod): Konfigurationsfehler (unbekanntes Feld), fehlende oder ungültige `users.yaml`, Session-Key kürzer als 16 Bytes. |
 | `Authentication failed` | Token unbekannt (in `users.yaml` gehört das sha256 des Tokens ohne `?…`), abgelaufen (`expires`) oder der Benutzer ist `disabled`. Passt der `SCOPE` des Secrets nicht zum Ziel des `ATTACH` (anderer Host oder Port, `localhost` statt `127.0.0.1`), verwendet der Client das Secret nicht. Gateway-Log: `authentication failed` mit Grund; Metrik `quackmux_auth_failures_total`. |
 | `quackmux: session closed: idle timeout (6h0m0s). DETACH and ATTACH again to reconnect.` | Die Session hat länger als `session.idleTimeout` keine Query geschickt; Heartbeats zählen nicht. `DETACH` und erneut `ATTACH`, oder `session.idleTimeout` erhöhen (`0s` schaltet ab). Verwandte Gründe: `heartbeat lease expired` (der Client war länger als Lease plus `heartbeatGrace` stumm), `max lifetime`, `engine …` (Engine beendet oder ausgefallen). |
+| `INTERRUPT Error: quackmux: the query ran longer than its time limit of 30m0s (profiles.adhoc.queryTimeout) and was cancelled` | Das Query-Zeitlimit ist abgelaufen; die Meldung nennt die Einstellung (`limits.queryTimeout`, `profiles.<name>.queryTimeout` oder `overrides[].queryTimeout`). Die Engine hat den Abbruch bestätigt, die Session bleibt nutzbar. Lief die Query in einer Transaktion (der DuckDB-Client öffnet eine für jede schreibende Anweisung), ist diese abgebrochen, und der Client rollt sie zurück. Das Abholen des Ergebnisses zählt mit, langsame Clients mit großen Ergebnissen brauchen also ein großzügiges Limit. Gateway-Log `query cancelled at its time limit` mit `cancel=cancelled`, Metrik `quackmux_query_timeouts_total{result="cancelled"}`. |
+| `INTERRUPT Error: quackmux: the query ran longer than its time limit of 30m0s (profiles.adhoc.queryTimeout); the gateway could not cancel it on the engine, so it may still be running` | Wie oben, aber das CANCEL ist gescheitert (Engine nicht erreichbar, keine frische Lease, oder die Query hatte `query_uuid {0,0}` und nach ihr kam schon ein weiteres PREPARE der Session). Die Query kann auf der Engine weiterlaufen und belegt sie, bis die nächste Query der Session sie ersetzt oder die Session endet. Gateway-Log mit `cancel=failed` und `err`, Metrik `quackmux_query_timeouts_total{result="failed"}`. Eine schreibende Anweisung erst wiederholen, wenn klar ist, ob sie geschrieben hat. |
+| `quackmux: the session has 64 queries that are not over, the most the gateway follows; it did not forward this request. Cancel those queries or reconnect.` | Nur mit Query-Zeitlimit: Die Session hat 64 Queries, die die Engine noch ausführen kann, weil der Client viele PREPAREs zugleich offen hat (der DuckDB-Client tut das nicht). Das Gateway leitet dann keine weiteren weiter, statt eine laufende Query zu vergessen und ihr Limit zu verlieren. Ein CANCEL des Clients beendet die beantworteten Queries, `DETACH` und `ATTACH` öffnet eine neue Session. Metrik `quackmux_requests_total{outcome="too_many_queries"}`. Der Request lief nicht. |
 | `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
 | `quackmux: gateway is not ready: not the leader` | Der Request landet bei einem Follower: ein Port-Forward auf einen bestimmten Pod oder, mit `overlays/ha`, ein Service ohne `quackmux.io/leader: "true"` im Selektor. `svc/quackmux` verwenden bzw. den Selektor ergänzen; `quackmux_requests_total{outcome="not_leader"}` zählt solche Requests. Der Request lief nicht. |
 | HA: Gateway-Pod bleibt `0/1 READY`, `/readyz` meldet `label quackmux.io/leader of pod … not yet removed: …` | Der Pod kann sein Leader-Label nicht entfernen, meist weil die API nicht erreichbar ist; bis dahin bekommt er keinen Traffic. `waiting to campaign for leadership` ist in den ersten `3 × ha.retryPeriod` nach dem Start normal, `stepping down: the lease is no longer fresh` bei einem Leader, der seine Lease verloren hat, bis zu seinem Neustart als Follower. |

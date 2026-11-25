@@ -181,6 +181,10 @@ type Override struct {
 	AllowedProfiles    []string `json:"allowedProfiles,omitempty"`
 	// MaxSessions overrides limits.maxSessionsPerUser for matching users.
 	MaxSessions int `json:"maxSessions,omitempty"`
+	// QueryTimeout replaces the profile's and the global query time limit
+	// (limits.queryTimeout) for matching users; nil keeps them, 0 disables
+	// the limit.
+	QueryTimeout *Duration `json:"queryTimeout,omitempty"`
 }
 
 // Matches reports whether the override applies to the identity.
@@ -259,6 +263,12 @@ type LimitsConfig struct {
 	MaxEnginesPerUser  int `json:"maxEnginesPerUser"`
 	// MaxStartingEngines bounds concurrent launches.
 	MaxStartingEngines int `json:"maxStartingEngines"`
+	// QueryTimeout limits how long a client query may run, counted from
+	// the moment the gateway forwards its PREPARE_REQUEST until the query
+	// is over, fetches included; the gateway then cancels the query on the
+	// engine (see internal/proxy/querylimit.go). 0 (the default) disables
+	// it. Profiles and overrides can replace it.
+	QueryTimeout Duration `json:"queryTimeout"`
 }
 
 // ProviderConfig selects where engines run.
@@ -369,6 +379,9 @@ type Profile struct {
 	StartupTimeout *Duration `json:"startupTimeout,omitempty"`
 	IdleTimeout    *Duration `json:"idleTimeout,omitempty"`
 	MaxLifetime    *Duration `json:"maxLifetime,omitempty"`
+	// QueryTimeout replaces limits.queryTimeout for sessions on this profile
+	// (nil keeps it, 0 disables the limit).
+	QueryTimeout *Duration `json:"queryTimeout,omitempty"`
 	// Kubernetes pod shaping.
 	Resources          corev1.ResourceRequirements   `json:"resources,omitempty"`
 	Env                []corev1.EnvVar               `json:"env,omitempty"`
@@ -815,6 +828,8 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+
+	c.validateQueryTimeouts(add)
 
 	if c.HA.Enabled && c.Provider.Type != "kubernetes" {
 		add("ha.enabled requires provider.type=kubernetes")

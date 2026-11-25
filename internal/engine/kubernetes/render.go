@@ -671,8 +671,8 @@ func (r *renderer) secret(podName, token string, prof config.Profile) *corev1.Se
 // lifetime (activeDeadlineSeconds) and the gateway settings
 // provider.kubernetes.deleteGracePeriod and engine.drainTimeout. Profile
 // fields that do not shape the pod (description, pool and warm pool sizes,
-// access control, idle timeout) leave it alone, so that changing them never
-// replaces running engines.
+// access control, idle timeout, query time limit) leave it alone, so that
+// changing them never replaces running engines.
 func (r *renderer) specHash(profileName string, prof config.Profile) string {
 	pod := r.pod(podInput{
 		Name: placeholderName, Key: placeholderKey, User: placeholderUser,

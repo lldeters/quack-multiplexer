@@ -86,6 +86,7 @@ var scenarios = []struct {
 	{name: "d: wrong token", tokenVar: "E2E_WRONG_TOKEN", options: "share_level=server", config: gatewayConfig, unauthenticated: true},
 	{name: "e: bob, SERVER", tokenVar: "E2E_BOB_TOKEN", options: "share_level=server", config: gatewayConfig, engine: "shared"},
 	{name: "f: alice, SERVER, gateway-idle", tokenVar: "E2E_ALICE_TOKEN", options: "share_level=server", config: idleConfig, engine: "shared"},
+	{name: "h: bob, SERVER, query time limit", tokenVar: "E2E_BOB_TOKEN", options: "share_level=server", config: gatewayConfig, engine: "shared"},
 }
 
 // readEnv parses e2e.env: KEY=VALUE lines, comments and blank lines.
@@ -308,6 +309,23 @@ func TestGatewayConfigs(t *testing.T) {
 	adjusted.Engine.CheckInterval = gw.Engine.CheckInterval
 	if !reflect.DeepEqual(&adjusted, gw) {
 		t.Errorf("%s and %s differ in more than the session and engine timing", gatewayConfig, idleConfig)
+	}
+}
+
+// TestQueryTimeLimits pins the query time limits scenario h relies on: bob's
+// queries are cancelled after 5s, the other scenarios run without a limit.
+func TestQueryTimeLimits(t *testing.T) {
+	for _, path := range []string{gatewayConfig, idleConfig} {
+		cfg := loadConfig(t, path)
+		for user, want := range map[string]time.Duration{"bob": 5 * time.Second, "alice": 0} {
+			if got, source := policy.QueryTimeout(cfg, user, nil, cfg.Defaults.Profile); got != want {
+				t.Errorf("%s: %s's queries have the time limit %s (%s), want %s", path, user, got, source, want)
+			}
+		}
+	}
+	script := string(readFile(t, runScript))
+	if !strings.Contains(script, "time limit of 5s (overrides[0].queryTimeout)") {
+		t.Errorf("%s does not expect bob's limit of 5s from overrides[0]", runScript)
 	}
 }
 

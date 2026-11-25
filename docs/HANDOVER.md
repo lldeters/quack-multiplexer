@@ -29,7 +29,7 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 * Gegen das veröffentlichte DuckDB v2.0.0 (`d54cbbe3df`, quack `f96420ed46`):
   * Engine- und Gateway-Image gebaut (`make docker-engine docker-gateway`), der Selbsttest des Engine-Images
     besteht.
-  * `test/e2e/compose/run.sh`: alle 8 Szenarien grün.
+  * `test/e2e/compose/run.sh`: alle Szenarien grün (seit 2026-11-25 a–j, darunter Query-Zeitlimit und gehärtete Engine).
   * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle Szenarien grün (seit
     2026-11-22 k1–k8), auch der Gateway-Neustart mit Session-Adoption und die persistenten Profile.
   * `test/e2e/kind/ha.sh` (Overlay `ha`, zwei Replikas, echte Secrets): alle Szenarien grün (seit 2026-11-22 h1–h6
