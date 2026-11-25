@@ -585,8 +585,8 @@ Weitere Provider:
   `cancelled`, auch wenn die Anweisung schon fertig war. Überlappen sich PREPAREs einer Session (nur Clients, die sie
   parallel schicken), kann ein FETCH oder Upload bis zum Limit einer anderen Query laufen, die er bedienen kann.
   Scheitert das CANCEL, bekommt der Client den Fehler, die Query kann aber auf der Engine weiterlaufen
-  (`result="failed"`). Das gilt auch für eine Query mit `{0,0}`, nach der schon ein
-  weiteres PREPARE der Session kam (nur Clients, die PREPAREs parallel schicken). Queries und Uploads, die vor einem
+  (`result="failed"`). Das gilt auch für eine Query mit `{0,0}`, nach der schon ein weiteres PREPARE der Session kam
+  (nur Clients, die PREPAREs parallel schicken). Queries und Uploads, die vor einem
   Gateway-Neustart begannen, zählen erst ab dem ersten FETCH danach. Mit `auth.mode: jwt` gelten für Sessions, die
   nach einem Neustart übernommen wurden, keine Overrides nach Gruppen. Eine Session mit 64 Queries, die die Engine
   noch ausführen kann, bekommt für weitere PREPAREs einen Fehler (nur Clients, die viele PREPAREs zugleich offen
