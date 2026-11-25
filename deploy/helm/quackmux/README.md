@@ -51,7 +51,7 @@ beschreibt [deploy/kubernetes/README.md](../../kubernetes/README.md); hier steht
    [docs/releasing.md](../../../docs/releasing.md)); `helm install` nimmt statt des Verzeichnisses auch dessen
    URL.
 
-Session-Key und Admin-Token erzeugt das Chart selbst ([Secrets](#secrets)). Den Admin-Token liest
+Session-Key und Admin-Token erzeugt das Chart selbst ([Secrets](#secrets)). Den Admin-Token liest man so:
 
 ```sh
 kubectl -n quackmux get secret quackmux-admin-token -o jsonpath='{.data.token}' | base64 -d
@@ -126,8 +126,8 @@ Originalen abweichen. Zwei Wege, sie zu ändern:
   helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --set-file configYaml=config.yaml
   ```
 
-Vorher prüfen: Das zeigt die ConfigMap, und `quackmux validate -config config.yaml` prüft eine Datei wie das
-Gateway beim Start:
+Vorher prüfen: `helm template` zeigt die ConfigMap, `quackmux validate -config config.yaml` prüft eine eigene Datei
+wie das Gateway beim Start.
 
 ```sh
 helm template quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --kube-version 1.30.0 \
@@ -244,6 +244,7 @@ Gateway findet sie wieder (gleiche `provider.kubernetes.instance` und gleicher N
 
 ```sh
 kubectl -n quackmux scale deployment/quackmux --replicas=0
+kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/component=gateway --timeout=120s
 SESSION_KEY=$(kubectl -n quackmux get deployment quackmux \
   -o jsonpath='{.spec.template.spec.volumes[?(@.name=="session-key")].secret.secretName}')
 kubectl -n quackmux delete deployment,service,serviceaccount,role,rolebinding,networkpolicy,poddisruptionbudget,configmap \
