@@ -187,3 +187,44 @@ func TestAbandonedPrepareIsCancelledAtItsLimit(t *testing.T) {
 	eventually(t, "the PREPARE answered", func() bool { return requestsOfType(t, h.met, wire.TypePrepareRequest) == 1 })
 	mustType(t, h.prepare(c, "SELECT 1", uuidC), wire.TypePrepareResponse)
 }
+
+// The session closes while the gateway's CANCEL is on its way, and the
+// engine refuses the CANCEL then: the query ended with the session, which
+// is no failure to cancel it (the gateway once counted and logged one).
+func TestSessionClosingDuringTheCancel(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	srv.CancelDelay = 700 * time.Millisecond
+	srv.CancelError = "something went wrong"
+	answer := make(chan []byte, 1)
+	go func() { answer <- h.prepare(c, "SLEEP 5000", uuidA) }()
+	time.Sleep(500 * time.Millisecond) // the CANCEL left at 300ms
+	mustType(t, h.disconnect(c), wire.TypeSuccessResponse)
+	wait(t, "the PREPARE", answer)
+	waitCancels(t, srv, uuidA) // the engine answered the CANCEL
+	time.Sleep(200 * time.Millisecond)
+	if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
+		t.Fatalf("%v timeouts counted for a query whose session closed", n)
+	}
+}
+
+// The engine no longer has the session's connection when the CANCEL
+// arrives (its lease expired there): the query ended with it, which is no
+// failure to cancel it either.
+func TestCancelForAConnectionTheEngineDropped(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	answer := make(chan []byte, 1)
+	go func() { answer <- h.prepare(c, "SLEEP 1000", uuidA) }()
+	eventually(t, "the PREPARE at the engine", func() bool { return h.gw.InFlight() == 1 })
+	srv.ExpireAll()
+	wait(t, "the PREPARE", answer)
+	// The engine refuses the CANCEL before it reads the uuid.
+	eventually(t, "the CANCEL at the engine", func() bool { return srv.CountType(wire.TypeCancelRequest) == 1 })
+	time.Sleep(200 * time.Millisecond)
+	if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
+		t.Fatalf("%v timeouts counted for a query whose engine connection is gone", n)
+	}
+}

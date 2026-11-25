@@ -797,7 +797,7 @@ func (l *queryLimits) run(q *trackedQuery, e *enforcement) {
 
 	if result == "" {
 		// The engine runs another statement on the connection (the query was
-		// over), or the session closed.
+		// over), or the session or its engine connection is gone.
 		l.g.log.Debug("query time limit reached by a query that was already over", "session", sq.sess.ID,
 			"queryUuid", uuid.String())
 		return
@@ -831,7 +831,8 @@ func (l *queryLimits) run(q *trackedQuery, e *enforcement) {
 // cancelOnEngine sends CANCEL for a query that timed out. It returns
 // "cancelled" if the engine confirmed it, "failed" if the gateway could not
 // cancel it, and "" if the engine runs another statement on the connection
-// (then q was over, and it ends) or the session closed.
+// (then q was over, and it ends), or the session or its engine connection
+// is gone.
 func (l *queryLimits) cancelOnEngine(q *trackedQuery) (string, error) {
 	for attempt := 1; ; attempt++ {
 		l.mu.Lock()
@@ -872,7 +873,16 @@ func (l *queryLimits) cancelOnEngine(q *trackedQuery) (string, error) {
 			continue
 		}
 		var ee *upstream.EngineError
-		if !errors.As(err, &ee) || !strings.HasPrefix(ee.Response.Message, msgCancelOther) {
+		isEngineError := errors.As(err, &ee)
+		l.mu.Lock()
+		dropped = q.dropped
+		l.mu.Unlock()
+		if dropped || (isEngineError && upstream.IsSessionGone(ee.Response.Message)) {
+			// The session closed while the CANCEL was on its way, or the
+			// engine no longer has its connection: the query ended with it.
+			return "", nil
+		}
+		if !isEngineError || !strings.HasPrefix(ee.Response.Message, msgCancelOther) {
 			return "failed", err
 		}
 		if !preparing {
