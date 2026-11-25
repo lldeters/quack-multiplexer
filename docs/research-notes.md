@@ -191,13 +191,21 @@ docker compose and kind (Kubernetes v1.37). Recordings of the traffic are fixtur
     flat ones (`QuackChunkStager`), larger ones keep their vector form (a constant vector stays constant). The
     layout of the inline DataChunks (storage V2_0_0) is in `internal/wire/result.go`; recordings are in
     `internal/wire/testdata/duckdb-v2.0.0`.
-  - DISCONNECT of a connection whose lease ran out answers `Connection heartbeat lease expired` and removes it; a
-    second one answers `Invalid connection id`. DISCONNECT alone does not stop a query that runs on the
-    connection (the handler keeps the connection until the query ends); CANCEL with the wildcard uuid first
-    interrupts it at once.
+  - Every message for a connection runs `RenewConnectionLease` before its handler. For a connection whose lease
+    ran out, a HEARTBEAT (like any other message) answers `Connection heartbeat lease expired`, removes it and
+    interrupts a query that runs on it (`CleanupExpiredConnection`: checked with a CPU-bound query on a 4-second
+    lease, its PREPARE answered `connection heartbeat lease expired` (INTERRUPT) 8 ms after the HEARTBEAT, CPU
+    97 % to 0 %); the next message answers `Invalid connection id`. For a valid lease the HEARTBEAT only renews it.
+    So a probe with HEARTBEAT removes exactly the connections that nobody can use any more.
+  - DISCONNECT of a connection with a valid lease removes it, but does not stop a query that runs on it (the
+    handler keeps the connection until the query ends); CANCEL with the wildcard uuid first interrupts it at once.
   - A DuckDB client heartbeats `timeout/3 · U(0.8, 1.2)` after the previous heartbeat returned
     (`QuackPeriodicWorker`), so a live client sends at least one message within `0.4 × timeout` of the gateway
-    becoming reachable, unless its previous heartbeat hangs.
+    becoming reachable, unless its previous heartbeat hangs. It does hang: the client keeps one keep-alive HTTP
+    connection, a heartbeat waits up to `HTTP_TIMEOUT_SECONDS` (86400 s) without retries, and when the gateway's
+    node vanishes without FIN or RST, it waits until TCP gives up (`tcp_retries2`, about 15 min by default), on a
+    frozen gateway until that is killed. A review experiment (gateway A lost its network and was killed, B took
+    over under the same name, `tcp_retries2=8`) saw the first message of the client at B 107 s later.
   - In a SQL macro, `=` does not resolve through the catalog (a macro named `=` changes nothing), but
     `default_collation = 'nocase'` makes `sql = '…'` case-insensitive; `sql = ('…' COLLATE c)` compares bytes
     under any default collation. `COLLATE` on a bare macro parameter fails at `CREATE MACRO` ("collations are

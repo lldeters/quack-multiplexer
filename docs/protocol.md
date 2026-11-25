@@ -108,10 +108,10 @@ reicht es byte-genau durch.
 * **Version:** Der Server lehnt ab, wenn `[min, max]` des Clients die 3 nicht enthält. Der Client verlangt in der
   Antwort exakt `quack_version == 3` und einen Heartbeat-Timeout in `[1, INT64_MAX/1000]`.
 * **Lease:** Jede strukturell gültige Nachricht einer bestehenden Verbindung erneuert die Lease. Ist sie
-  abgelaufen, antwortet der Server mit `"Connection heartbeat lease expired"` und entfernt die Verbindung.
-  **Geprüft wird nur beim nächsten Request dieser Verbindung.** Einen Hintergrund-Sweeper gibt es nicht. Stirbt
-  ein Client, bleibt seine Verbindung samt Kontext auf der Engine liegen. Der Client schickt Heartbeats etwa alle
-  `timeout/3 · [0,8; 1,2]`.
+  abgelaufen, antwortet der Server mit `"Connection heartbeat lease expired"`, entfernt die Verbindung und bricht
+  eine Query ab, die noch auf ihr läuft (Interrupt). **Geprüft wird nur beim nächsten Request dieser
+  Verbindung.** Einen Hintergrund-Sweeper gibt es nicht. Stirbt ein Client, bleibt seine Verbindung samt Kontext
+  auf der Engine liegen. Der Client schickt Heartbeats etwa alle `timeout/3 · [0,8; 1,2]`.
 * **Unbekannte Verbindung:** `"Invalid connection id"`. Ein `DISCONNECT` auf eine bereits geschlossene Verbindung
   ergibt `"Connection does not exist / already disconnected"`.
 * **must_invalidate:** Der Server setzt das Flag, wenn seine eigene Datenbank invalidiert ist. Der Client markiert
@@ -134,6 +134,6 @@ reicht es byte-genau durch.
 | Handshake | Wird vollständig dekodiert. `auth_string` wird durch das Engine-Token ersetzt, der Heartbeat-Timeout geklemmt. Das Gateway lehnt unbekannte Felder ab. |
 | Antworten | Nur `CONNECTION_RESPONSE`-Header werden umgeschrieben. Alle anderen Antworten haben eine leere `connection_id`. |
 | Fehlertexte | „Invalid connection id“ und „Authentication failed“ sind identisch zum Server. Eigene Fehler beginnen mit `quackmux:`. |
-| Lease-Pflege | Das Gateway beobachtet `lastSeen` und schickt bei Ablauf ein `DISCONNECT`, damit die Engine aufräumt. Nach einem Neustart oder einer Übernahme listet es die Verbindungen der Engines (`SELECT connection_id FROM quack_active_connections()` über eine eigene Verbindung) und schließt die, nach denen kein Client mehr fragt ([Design, 6](design.md#6-neustart-und-hochverfügbarkeit)). |
+| Lease-Pflege | Das Gateway beobachtet `lastSeen` und schickt bei Ablauf ein `DISCONNECT`, damit die Engine aufräumt. Nach einem Neustart oder einer Übernahme listet es die Verbindungen der Engines (`SELECT connection_id FROM quack_active_connections()` über eine eigene Verbindung) und schickt denen ohne Session nach Ablauf ihrer Engine-Lease einen `HEARTBEAT`: Die Engine entfernt sie dann selbst ([Design, 6](design.md#6-neustart-und-hochverfügbarkeit)). |
 | Verbindungsabbrüche | Ein Request, der schon gelesen wurde, bekommt immer eine Antwort, notfalls einen Quack-Fehler. libcurl könnte den POST sonst wiederholen und eine Query doppelt ausführen. |
 | Puffern | Nachrichten bis 100 MiB (Request) bzw. 64 MiB (Response) werden vollständig gepuffert. Das Budget liegt bei 1 GiB. Ein langsamer Client bringt damit nie den 5-s-Timeout der Engine zum Auslösen. |

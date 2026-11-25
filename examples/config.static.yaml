@@ -56,9 +56,13 @@ overrides:
       shareLevel: GROUP
 
 # After a restart the gateway can close the connections of clients that died
-# while it was down (the Quack server never collects them). With static
-# engines this is off: switch it on only if no other gateway or client uses
-# these engines, or it would close their connections.
+# while it was down (the Quack server never collects them): once their engine
+# lease has run out, it sends them a heartbeat, and the engine removes them.
+# With static engines this is off, as they are not the gateway's own;
+# connections that other gateways or clients keep alive stay untouched also
+# when it is on. A hardened engine lets the gateway list its connections only
+# with quack_authorization_function = 'quackmux_authorize_listing'
+# (images/engine/README.md). Older gateways reject the field.
 # engine:
 #   closeOrphanedConnections: true
 

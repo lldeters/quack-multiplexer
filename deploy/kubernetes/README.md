@@ -373,7 +373,7 @@ spec:
 | `quackmux_engines{state,share_level,profile}` | Engines je Zustand (`STARTING`, `READY`, `DRAINING`, `FAILED`, `TERMINATING`, Warm-Pool: `WARM_…`) |
 | `quackmux_engine_starts_total{profile,result}`, `quackmux_engine_start_seconds{profile}` | Engine-Starts und ihre Dauer |
 | `quackmux_engines_terminated_total{reason}` | beendete Engines (`idle`, `drained`, `failed`, `admin` …) |
-| `quackmux_orphan_sweeps_total{result}`, `quackmux_orphaned_connections_closed_total` | nach einem Neustart oder einer Übernahme geprüfte Engines (`ok`; `failed`: Auflisten oder Schließen gescheitert; `skipped`: Engine beendet oder Lease nicht frisch) und die geschlossenen verwaisten Verbindungen ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)) |
+| `quackmux_orphan_sweeps_total{result}`, `quackmux_orphaned_connections_closed_total` | nach einem Neustart oder einer Übernahme geprüfte Engines (`ok`; `failed`: Listing oder Heartbeat gescheitert; `skipped`: Engine beendet, Listing vom Autorisierungs-Makro abgelehnt oder Lease nicht frisch) und die verwaisten Verbindungen, die die Engines dabei entfernt haben ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)) |
 | `quackmux_requests_total{type,outcome}`, `quackmux_request_seconds{type}` | Quack-Requests nach Nachrichtentyp |
 | `quackmux_bytes_total{direction}` | durchgereichte Bytes (`in`: Client→Engine, `out`: Engine→Client) |
 | `quackmux_connect_failures_total{reason}`, `quackmux_auth_failures_total{method}` | gescheiterte Handshakes, fehlgeschlagene Authentifizierungen |
@@ -593,36 +593,46 @@ Deshalb räumt das Gateway nach jeder Übernahme auf (`engine.closeOrphanedConne
 1. Gleich nach dem Start listet es die Verbindungen jeder wiedergefundenen Engine der Share-Levels `USER`,
    `GROUP` und `SERVER` (eine `CONNECTION`-Engine endet mit ihrer Session) über eine eigene Verbindung mit dem
    Engine-Token: `SELECT connection_id FROM quack_active_connections()`.
-2. Es wartet `engine.recoveryGrace` (Default `session.maxHeartbeatTimeout/2 + 30 s`, also 180 s), mindestens
-   aber das längste Heartbeat-Intervall eines Clients (0,4 × `session.maxHeartbeatTimeout`) plus
-   `session.heartbeatGrace` und mindestens `server.upstream.handshakeTimeout`. Steht der Prozess zwischendurch
-   still (eingefrorener Container oder Node), beginnt die Frist von vorn.
-3. Dann listet es noch einmal und schließt (`CANCEL`, dann `DISCONNECT`) jede Verbindung, die schon beim ersten
-   Mal da war, keiner offenen Session gehört und nach der in der Frist kein Client gefragt hat. Mit HA tut das nur
-   ein Leader mit frischer Lease.
+2. Es wartet, bis die Engine-Lease jeder Verbindung abgelaufen ist, die nur der vorige Prozess am Leben hielt:
+   `session.backendHeartbeatTimeout` (Default 1 h) plus `session.heartbeatGrace`, nach der Uhr. Diese Lease
+   verlangt das Gateway bei jedem Handshake mit einer Engine und erneuert sie nur, solange die Session offen ist.
+3. Dann schickt es jeder gelisteten Verbindung, die zu keiner offenen Session gehört, einen Heartbeat. Ist ihre
+   Lease abgelaufen, entfernt die Engine sie und bricht eine Query ab, die darauf noch läuft. Läuft die Lease
+   noch, verlängert die Engine sie nur. Mit HA tut das nur ein Leader mit frischer Lease.
 
-Ein lebender Client sendet in der Frist mindestens einen Heartbeat, auch wenn er gerade nichts tut: DuckDB schickt
-alle Lease/3 (± 20 %) einen. Kommt seine erste Anfrage genau in dem Moment, in dem das Gateway entscheidet, gewinnt,
-was zuerst da ist: die Anfrage, dann bleibt die Verbindung, oder die Entscheidung, dann bekommt der Client
-`quackmux: session closed: no request arrived within the recovery grace after the gateway took over, so the gateway
-closed the engine connection as orphaned. DETACH and ATTACH again to reconnect.` Die Verbindung einer Session, die
-das Gateway übernommen hat, schließt es nie.
+So nimmt das Gateway keinem Client eine Verbindung, die er noch benutzen könnte: Eine Verbindung mit abgelaufener
+Lease lehnt die Engine bei der nächsten Nachricht ohnehin ab, ob aufgeräumt wird oder nicht. Wer nach einem
+Ausfall des Gateways lange fernbleibt, wird übernommen, solange die Lease seiner Verbindung läuft (nach dem Ausfall
+noch mindestens zwei Drittel von `session.backendHeartbeatTimeout`, mit den Defaults rund 40 min), etwa wenn sein
+Heartbeat an der Keep-Alive-Verbindung zu einem verlorenen Node hängt, bis TCP aufgibt (unter Linux rund 15 min),
+oder an einem eingefrorenen Leader, bis der neu startet. Verbindungen, die andere am Leben halten (ein zweites
+Gateway an derselben Engine, ein Client, der die Engine direkt erreicht), bleiben unberührt.
 
 Grenzen:
 
-* Ein Client, der länger als die Frist nichts zum Gateway durchbringt (eine Netzwerk-Partition, Heartbeats, die
-  an einem eingefrorenen alten Leader hängen), verliert seine Verbindung und muss `DETACH` und `ATTACH`. Wer
-  solche Ausfälle erwartet, verlängert `engine.recoveryGrace`.
+* Verwaiste Verbindungen bleiben bis zum Aufräumen bestehen, mit den Defaults also gut eine Stunde lang. Ein
+  kürzerer `session.backendHeartbeatTimeout` räumt früher auf, verkürzt aber auch die Zeit, in der ein Client nach
+  einem Ausfall zurück sein muss: Kommt er nach Ablauf der Lease, lehnt die Engine seine Verbindung ab, mit oder
+  ohne Aufräumen (`quackmux: session closed: the engine no longer knows this connection. DETACH and ATTACH again
+  to reconnect.`).
+* Hat der vorige Prozess eine längere `session.backendHeartbeatTimeout` verwendet, läuft die Lease mancher
+  verwaisten Verbindung beim Heartbeat noch; die Engine verlängert sie, und sie bleibt bis zum Aufräumen nach dem
+  nächsten Neustart.
+* Startet das Gateway vor dem Aufräumen erneut, beginnt die Wartezeit von vorn.
 * DuckDB v2.0.0 listet höchstens 2048 Verbindungen je Engine; darüber scheitert `quack_active_connections()`, und
   das Gateway räumt die Engine nicht auf (Warnung im Log).
-* Eine gehärtete Engine lässt die Anfrage nur mit dem Makro eines aktuellen Engine-Images durch
-  ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)); ein älteres Makro lehnt sie ab, das Gateway warnt
-  (`cannot list the connections of a recovered engine`) und lässt die Engine, wie sie ist.
-* Engines des `static`-Providers räumt es nur mit `engine.closeOrphanedConnections: true` auf. Nutzen andere
-  Gateways oder Clients dieselben Engines, bleibt es aus, sonst schlösse das Gateway deren Verbindungen.
+* Eine gehärtete Engine mit `quackmux_authorize` lehnt das Listing ab, und ihre verwaisten Verbindungen bleiben.
+  Die Variante `quackmux_authorize_listing` lässt es durch, gibt damit aber jeder Session die Verbindungs-IDs der
+  Engine ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)).
+* Engines des `static`-Providers gehören nicht dem Gateway; dort räumt es nur mit
+  `engine.closeOrphanedConnections: true` auf. Verbindungen, die andere Gateways oder Clients am Leben halten,
+  lässt es auch dann stehen.
+* Ältere Gateways kennen `engine.closeOrphanedConnections` nicht und lehnen eine Konfiguration damit ab: Vor einem
+  Rollback des Gateways muss das Feld heraus.
 
-Das Log zeigt je Engine `closed orphaned connections` mit der Zahl der geschlossenen und der übernommenen
-Verbindungen; die Metriken stehen unter [Metriken](#metriken).
+Das Log zeigt je Engine `closed orphaned connections` mit `closed` (von der Engine entfernt), `kept` (Lease lief
+noch) und `adopted` (Verbindungen offener Sessions, nicht angefasst); die Metriken stehen unter
+[Metriken](#metriken).
 
 ## Persistente Daten
 
@@ -952,14 +962,27 @@ Die Teile brauchen einander:
    * `alter` mit später `database` (`ALTER DATABASE … SET ALIAS` benennt eine Datenbank für alle Sessions um);
    * `schema` mit später `system`.
 
-   Eine Anfrage lässt es durch, obwohl sie `quack_*` nennt: genau den Text
-   `SELECT connection_id FROM quack_active_connections()`, Byte für Byte, ohne etwas davor oder danach. Damit
-   listet das Gateway nach einem Neustart die Verbindungen der Engine und schließt die verwaisten
-   ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). Das Makro kann das Gateway nicht
-   von Clients unterscheiden (es sieht nur Verbindungs-ID und Text, und das Gateway meldet sich mit dem
-   Engine-Token an wie die Sessions, die es weiterreicht), also darf jede Session diese Anfrage stellen. Sie liest
-   nur die Verbindungs-IDs der Engine. Die nützen einer Session nichts: Clients erreichen die Engine nur über das
-   Gateway, das nur seine eigenen versiegelten IDs routet, und alle anderen `quack_*`-Funktionen bleiben gesperrt.
+   Damit lehnt es auch `SELECT connection_id FROM quack_active_connections()` ab, die Anfrage, mit der das Gateway
+   nach einem Neustart die Verbindungen der Engine listet, um verwaiste zu schließen
+   ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). Die Variante
+   `quackmux_authorize_listing` lässt genau diesen Text durch, Byte für Byte, ohne etwas davor oder danach; sie
+   gehört ins `initSQL` hinter das `.read`:
+
+   ```yaml
+       initSQL: |
+         .read /usr/local/share/quackmux/authorize.sql
+         SET GLOBAL quack_authorization_function = 'quackmux_authorize_listing';
+   ```
+
+   Das Makro kann das Gateway nicht von Clients unterscheiden (es sieht nur Verbindungs-ID und Text, und das
+   Gateway meldet sich mit dem Engine-Token an wie die Sessions, die es weiterreicht), also darf mit der Variante
+   jede Session das Listing abfragen. Die Verbindungs-IDs sind aber Bearer-Credentials: Nach dem Handshake bedient
+   der Quack-Server eine Nachricht allein anhand ihrer Verbindungs-ID. Wer Port 9494 der Engine direkt erreicht,
+   kann mit einer gelisteten ID die Verbindung einer anderen Session benutzen, am Gateway und seinem Audit-Log
+   vorbei: ihre temporären Tabellen und zwischengespeicherten Ergebnisse lesen, SQL in ihrer Transaktion ausführen,
+   ihre Query abbrechen oder sie schließen. Die Variante passt deshalb nur, wenn außer dem Gateway niemand den Port
+   erreicht: in Kubernetes mit der NetworkPolicy aus `base` und einem CNI, das sie durchsetzt, beim `static`- und
+   `process`-Provider nur hinter einer Firewall, die allein das Gateway an den Port lässt.
 
    Bis das `postStartSQL` beide Einstellungen gesetzt hat, lehnt es jede Anfrage ab: Vorher ist die Engine nicht
    gehärtet, und mit Dateizugriff ließe sich eine Textprüfung umgehen. Das `.read` gehört vor ein `USE` im
@@ -986,7 +1009,7 @@ Profils mit `"specCurrent": false` suchen und mit `DELETE /api/v1/engines/{id}` 
 
 **Was das garantiert** (geprüft mit DuckDB 2.0.0 und dem Engine-Image: die 224 Fälle in
 [images/engine/authorize-cases.tsv](../../images/engine/authorize-cases.tsv), die der Selbsttest des Images direkt
-und Szenario j des Compose-Tests durch das Gateway ausführt):
+mit beiden Varianten und Szenario j des Compose-Tests durch das Gateway mit `quackmux_authorize_listing` ausführt):
 
 * Eine Anfrage mit einem der Wörter läuft nicht, wie auch immer es geschrieben ist: in Groß- und Kleinbuchstaben,
   in `"…"` oder `` `…` ``, qualifiziert (`system.main.quack_stop`), mit Kommentaren oder Unicode-Leerzeichen vor
@@ -1001,18 +1024,20 @@ und Szenario j des Compose-Tests durch das Gateway ausführt):
   `shell_history()`, und `FROM _` (das letzte Ergebnis der CLI der Engine) zeigt nur `started`.
 * `ATTACH`, Katalog, Queries, Transaktionen, temporäre Tabellen, Views, Schemas, Uploads, Downloads und `COPY` auf
   der Seite des Clients laufen wie ohne Härtung, ebenso das Stoppen der Engine (`quack_stop`, `FORCE CHECKPOINT`).
-* Das Gateway schickt außer Handshake, Heartbeats, `DISCONNECT` und `CANCEL` nur die eine Anfrage, die das Makro
-  durchlässt; jede Abwandlung davon (andere Schreibweise oder Spalten, Leerzeichen, ein Kommentar, ein zweites
-  Statement) lehnt es ab.
+* Das Gateway schickt außer Handshake, Heartbeats, `DISCONNECT` und `CANCEL` nur das Listing der Verbindungen.
+  `quackmux_authorize` lehnt es ab; `quackmux_authorize_listing` lässt genau diesen Text durch und lehnt jede
+  Abwandlung ab (andere Schreibweise oder Spalten, Leerzeichen, ein Kommentar, ein zweites Statement).
 
 Ein eigenes Image (andere DuckDB-Version, weitere Extensions) prüft `docker run --rm --entrypoint
 quackmux-engine-selftest <image>` mit denselben Fällen; eine laufende gehärtete Engine oder ein Gateway davor
-prüft `QUACK_TOKEN=<token> quackmux-authorize-test <host>:<port>` aus dem Image.
+prüft `QUACK_TOKEN=<token> quackmux-authorize-test <host>:<port>` aus dem Image, mit `QUACKMUX_TEST_LISTING=1`
+für eine Engine mit `quackmux_authorize_listing`.
 
 **Was es nicht garantiert:**
 
-* Jede Session kann die Verbindungs-IDs der Engine lesen (die Ausnahme für das Gateway, siehe oben), nicht aber,
-  was auf den Verbindungen läuft.
+* Mit `quackmux_authorize_listing` kann jede Session die Verbindungs-IDs der Engine lesen; wer zusätzlich den
+  Port der Engine erreicht, benutzt damit fremde Verbindungen (siehe oben). `quackmux_authorize` gibt die IDs
+  nicht heraus.
 * Das Makro prüft Text, nicht Bedeutung: Es ist eine Sperrliste. Funktionen und Anweisungen, die eine spätere
   DuckDB-Version oder eine geladene Extension mitbringt, sperrt es nicht. Prüfen Sie die Liste nach jedem Update von
   DuckDB oder den Extensions des Images (`SELECT function_name FROM duckdb_functions()`, Selbsttest).
@@ -1055,8 +1080,9 @@ Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nic
 | Gateway-Pod in `CrashLoopBackOff` | `kubectl -n quackmux logs deployment/quackmux --previous` (mit `overlays/ha`: `kubectl -n quackmux logs <pod> --previous`, sonst wählt kubectl einen bereiten Pod): Konfigurationsfehler (unbekanntes Feld), fehlende oder ungültige `users.yaml`, Session-Key kürzer als 16 Bytes. |
 | `Authentication failed` | Token unbekannt (in `users.yaml` gehört das sha256 des Tokens ohne `?…`), abgelaufen (`expires`) oder der Benutzer ist `disabled`. Passt der `SCOPE` des Secrets nicht zum Ziel des `ATTACH` (anderer Host oder Port, `localhost` statt `127.0.0.1`), verwendet der Client das Secret nicht. Gateway-Log: `authentication failed` mit Grund; Metrik `quackmux_auth_failures_total`. |
 | `quackmux: session closed: idle timeout (6h0m0s). DETACH and ATTACH again to reconnect.` | Die Session hat länger als `session.idleTimeout` keine Query geschickt; Heartbeats zählen nicht. `DETACH` und erneut `ATTACH`, oder `session.idleTimeout` erhöhen (`0s` schaltet ab). Verwandte Gründe: `heartbeat lease expired` (der Client war länger als Lease plus `heartbeatGrace` stumm), `max lifetime`, `engine …` (Engine beendet oder ausgefallen). |
-| `quackmux: session closed: no request arrived within the recovery grace after the gateway took over, so the gateway closed the engine connection as orphaned. …` | Nach einem Neustart oder einer Übernahme kam von diesem Client in der Frist keine einzige Anfrage an (er war unterbrochen, eingefroren oder seine Heartbeats hingen an einem alten Pod), also hat das Gateway seine Verbindung auf der Engine als verwaist geschlossen. `DETACH` und erneut `ATTACH`; bei häufigen längeren Unterbrechungen `engine.recoveryGrace` erhöhen ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). |
-| Gateway-Log: `cannot list the connections of a recovered engine: its orphaned connections stay open` | Das Gateway kann die verwaisten Verbindungen dieser Engine nicht schließen; sie bleiben bis zum Ende der Engine. Mit `hint` zum Makro: Die gehärtete Engine läuft mit einem Makro ohne die Ausnahme für `SELECT connection_id FROM quack_active_connections()` (älteres Engine-Image oder eigenes Makro); ein aktuelles Image ausrollen. Mit `hint` zu 2048: Die Engine hat mehr als 2048 Verbindungen. Sonst war die Engine nicht erreichbar. |
+| `quackmux: session closed: the engine no longer knows this connection. DETACH and ATTACH again to reconnect.` | Nach einem Neustart oder einer Übernahme fand das Gateway die Verbindung des Clients nicht mehr auf seiner Engine: Die Engine hat inzwischen neu gestartet, oder der Client war länger fort als die Engine-Lease seiner Verbindung (`session.backendHeartbeatTimeout`), und die Engine hat sie entfernt ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). `DETACH` und erneut `ATTACH`. |
+| Gateway-Log: `cannot list the connections of a recovered engine: its orphaned connections stay open` | Das Gateway kann die verwaisten Verbindungen dieser Engine nicht schließen; sie bleiben bis zum Ende der Engine. Mit `hint` zu 2048: Die Engine hat mehr als 2048 Verbindungen. Sonst war die Engine nicht erreichbar. |
+| Gateway-Log: `not closing orphaned connections: the authorization function of the engine refuses the listing` | Die gehärtete Engine läuft mit `quackmux_authorize` (oder einem älteren oder eigenen Makro), das das Listing ablehnt; ihre verwaisten Verbindungen bleiben bis zum Ende der Engine. Erreicht außer dem Gateway niemand ihren Port, lässt `quackmux_authorize_listing` das Listing durch ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)). |
 | `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
 | `quackmux: gateway is not ready: not the leader` | Der Request landet bei einem Follower: ein Port-Forward auf einen bestimmten Pod oder, mit `overlays/ha`, ein Service ohne `quackmux.io/leader: "true"` im Selektor. `svc/quackmux` verwenden bzw. den Selektor ergänzen; `quackmux_requests_total{outcome="not_leader"}` zählt solche Requests. Der Request lief nicht. |
 | HA: Gateway-Pod bleibt `0/1 READY`, `/readyz` meldet `label quackmux.io/leader of pod … not yet removed: …` | Der Pod kann sein Leader-Label nicht entfernen, meist weil die API nicht erreichbar ist; bis dahin bekommt er keinen Traffic. `waiting to campaign for leadership` ist in den ersten `3 × ha.retryPeriod` nach dem Start normal, `stepping down: the lease is no longer fresh` bei einem Leader, der seine Lease verloren hat, bis zu seinem Neustart als Follower. |
