@@ -332,12 +332,13 @@ func (l *queryLimits) dropLocked(sq *sessionQueries) {
 }
 
 // sessionClosed is the session manager's close hook.
-func (l *queryLimits) sessionClosed(s *session.Session) {
+func (l *queryLimits) sessionClosed(s *session.Session, _ bool) <-chan struct{} {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if sq := l.sessions[s.ID]; sq != nil && sq.sess == s {
 		l.dropLocked(sq)
 	}
+	return nil
 }
 
 // track starts following a request of sess right before the gateway

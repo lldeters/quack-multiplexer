@@ -137,7 +137,7 @@ type Manager struct {
 	// fence, if set, must report true for Reap to act (see SetFence).
 	fence func() bool
 	// closeHook, if set, runs after every close (see SetCloseHook).
-	closeHook func(*Session)
+	closeHook func(s *Session, keep bool) <-chan struct{}
 
 	mu         sync.RWMutex
 	sessions   map[string]*Session
@@ -148,6 +148,7 @@ type Manager struct {
 	wg         sync.WaitGroup // background control requests
 	bgMu       sync.Mutex     // orders spawn against Shutdown
 	bgClosed   bool
+	stop       chan struct{} // closed by Shutdown
 
 	// adoptions confirms each adopted session with the engine once, also
 	// when many requests of it arrive at the same time.
@@ -168,6 +169,7 @@ func NewManager(cfg *config.Config, engines Engines, backend Backend, sealer *Se
 		tombstones: map[string]tombstone{},
 		perUser:    map[string]int{},
 		pending:    map[string]int{},
+		stop:       make(chan struct{}),
 	}
 }
 
@@ -184,7 +186,15 @@ func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
 // SetCloseHook makes f run after a session was closed, for whatever reason,
 // with the closed session; the proxy drops the state it keeps per session
 // there. f must not block. Call it before sessions are opened.
-func (m *Manager) SetCloseHook(f func(*Session)) { m.closeHook = f }
+//
+// keep tells f that the engine still has the session's connection and is
+// about to get its DISCONNECT. f may then return a channel: the manager sends
+// the DISCONNECT only once the channel is closed (or the manager shuts down),
+// and keeps the lease of the connection alive until then. The Quack server
+// lets the requests of a connection that are in flight finish after a
+// DISCONNECT, and their statement runs on with them; the query time limit
+// needs the connection to cancel it.
+func (m *Manager) SetCloseHook(f func(s *Session, keep bool) <-chan struct{}) { m.closeHook = f }
 
 // Reservation holds a slot under the session limits while a connect is in
 // progress. Exactly one of Open or Cancel must be called.
@@ -461,6 +471,8 @@ type CloseMode struct {
 	MustInvalidate bool
 	// Force closes even with requests in flight.
 	Force bool
+	// gone marks a connection the engine no longer has.
+	gone bool
 }
 
 // Close ends a session. It returns false if the session was not open or had
@@ -505,28 +517,59 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 	}
 	m.log.Info("session closed", "session", s.ID, "user", s.User, "engine", s.EngineID, "reason", reason,
 		"age", now.Sub(s.CreatedAt).Round(time.Second))
+	var target engine.Target
+	reachable := false
+	if mode.Disconnect || mode.Cancel {
+		target, reachable = m.engines.Lookup(s.EngineID)
+	}
+	var hold <-chan struct{}
 	if m.closeHook != nil {
-		m.closeHook(s)
+		hold = m.closeHook(s, mode.Disconnect && !mode.gone && reachable)
 	}
 
-	if mode.Disconnect || mode.Cancel {
-		if target, ok := m.engines.Lookup(s.EngineID); ok {
-			m.spawn(func() {
-				ctx := context.Background()
-				if mode.Cancel {
-					if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil {
-						m.log.Debug("cancel on close failed", "session", s.ID, "err", err)
-					}
+	if (mode.Disconnect || mode.Cancel) && reachable {
+		m.spawn(func() {
+			ctx := context.Background()
+			if mode.Cancel {
+				if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil {
+					m.log.Debug("cancel on close failed", "session", s.ID, "err", err)
 				}
-				if mode.Disconnect {
-					if err := m.backend.Disconnect(ctx, target.Endpoint, s.BackendConnID); err != nil {
-						m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
-					}
+			}
+			if mode.Disconnect {
+				if hold != nil {
+					m.awaitRelease(s, target, hold)
 				}
-			})
-		}
+				if err := m.backend.Disconnect(ctx, target.Endpoint, s.BackendConnID); err != nil {
+					m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
+				}
+			}
+		})
 	}
 	return true
+}
+
+// awaitRelease waits until release is closed or the manager shuts down, and
+// keeps the lease of the closed session's engine connection alive meanwhile,
+// as Reap does for open sessions.
+func (m *Manager) awaitRelease(s *Session, target engine.Target, release <-chan struct{}) {
+	var tick <-chan time.Time
+	if every := m.cfg.Session.BackendHeartbeatTimeout.Duration / 3; every > 0 {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		tick = t.C
+	}
+	for {
+		select {
+		case <-release:
+			return
+		case <-m.stop:
+			return
+		case <-tick:
+			if err := m.backend.Heartbeat(context.Background(), target.Endpoint, s.BackendConnID); err != nil {
+				m.log.Debug("backend keep-alive of a closed session failed", "session", s.ID, "engine", s.EngineID, "err", err)
+			}
+		}
+	}
 }
 
 // spawn runs f in the background unless the manager is shutting down.
@@ -549,10 +592,14 @@ func (m *Manager) Wait() { m.wg.Wait() }
 
 // Shutdown starts no more background control requests and waits for the
 // running ones. Handlers may still be running (the HTTP shutdown can time
-// out), so starting new ones must stop before the wait.
+// out), so starting new ones must stop before the wait. The DISCONNECTs that
+// wait for a close hook go out at once.
 func (m *Manager) Shutdown() {
 	m.bgMu.Lock()
-	m.bgClosed = true
+	if !m.bgClosed {
+		m.bgClosed = true
+		close(m.stop)
+	}
 	m.bgMu.Unlock()
 	m.wg.Wait()
 }
@@ -576,7 +623,7 @@ func (m *Manager) ClosedByClient(s *Session) {
 // The DISCONNECT is best effort: should the engine still have the
 // connection after all, it is not left behind.
 func (m *Manager) ClosedByBackend(s *Session, msg string) {
-	m.close(s, "backend closed the connection: "+msg, CloseMode{Force: true, Disconnect: true}, nil)
+	m.close(s, "backend closed the connection: "+msg, CloseMode{Force: true, Disconnect: true, gone: true}, nil)
 }
 
 // EngineGone implements engine.SessionCloser.

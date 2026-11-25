@@ -33,7 +33,7 @@ func newTestLimits(t *testing.T, adopted bool) (*queryLimits, *session.Session) 
 	l := newQueryLimits(g)
 	s := &session.Session{ID: "s1", User: "alice", Adopted: adopted}
 	l.sessions[s.ID] = &sessionQueries{sess: s, adopting: adopted}
-	t.Cleanup(func() { l.sessionClosed(s) }) // stops the timers
+	t.Cleanup(func() { l.sessionClosed(s, false) }) // stops the timers
 	return l, s
 }
 
@@ -61,7 +61,7 @@ func TestEnforcementOfAQueryThatEndsMeanwhile(t *testing.T) {
 		name string
 		end  func(l *queryLimits, s *session.Session, q *trackedQuery)
 	}{
-		{"session closed", func(l *queryLimits, s *session.Session, _ *trackedQuery) { l.sessionClosed(s) }},
+		{"session closed", func(l *queryLimits, s *session.Session, _ *trackedQuery) { l.sessionClosed(s, false) }},
 		{"query ended", func(l *queryLimits, _ *session.Session, q *trackedQuery) {
 			l.mu.Lock()
 			l.endLocked(q)
