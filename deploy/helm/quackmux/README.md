@@ -8,8 +8,9 @@ beschreibt [deploy/kubernetes/README.md](../../kubernetes/README.md); hier steht
 
 ## Voraussetzungen
 
-* Kubernetes 1.30 oder neuer, Helm 3 oder 4 (CI prüft 3.22 und 4.3). Helm 3 braucht für `helm template` die
-  Angabe `--kube-version 1.30.0` (oder neuer), weil es sonst Kubernetes 1.20 annimmt.
+* Kubernetes 1.30 oder neuer, Helm 3 oder 4 (CI prüft 3.22 und 4.3). Ein aus den Quellen gebautes Helm 3
+  (`go install`, wie in CI) nimmt ohne Cluster Kubernetes 1.20 an und braucht für `helm template` die Angabe
+  `--kube-version 1.30.0` (oder neuer); die Release-Binaries von Helm 3 und Helm 4 brauchen sie nicht.
 * Ein CNI, das NetworkPolicies durchsetzt, und die Images `ghcr.io/lldeters/quackmux` und
   `ghcr.io/lldeters/duckdb-engine` wie bei Kustomize ([Voraussetzungen](../../kubernetes/README.md#voraussetzungen)).
   Die Chart-Version ist das quackmux-Release; das Gateway-Image hat dessen Tag, das Engine-Image steht in der
@@ -189,8 +190,8 @@ helm template quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --ku
 
 * `secrets.users.existingSecret` ersetzt den Wert `users` durch ein Secret mit dem Schlüssel `users.yaml`.
 * **Helm behält Session-Key und Admin-Token** (`helm.sh/resource-policy: keep`), auch wenn das Chart sie nicht mehr
-  rendert: beim Wechsel auf `existingSecret` und nach `helm uninstall`. Ein neues Release desselben Namens
-  übernimmt sie samt Werten; die Sessions weiterlaufender Engines bleiben gültig. Entfernen:
+  rendert: beim Wechsel auf `existingSecret` (Pods früherer ReplicaSets hängen sie noch ein) und nach
+  `helm uninstall`. Ein neues Release desselben Namens übernimmt sie samt Werten. Entfernen:
   [Deinstallieren](#deinstallieren).
 * **Vom erzeugten zu einem eigenen Secret** (etwa vor dem Umstieg auf Argo CD): den Wert in ein Secret mit anderem
   Namen kopieren und dieses nennen. Den Namen eines Secrets, das das Chart erzeugt, lehnt `existingSecret` ab.
@@ -253,23 +254,45 @@ Node-Wartung: [Hochverfügbarkeit](../../kubernetes/README.md#hochverfügbarkeit
 helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml
 ```
 
-Werte, die `helm upgrade` nicht bekommt, fallen auf die Defaults zurück; deshalb die Werte in einer Datei halten
-(oder `--reuse-values`). Ein neues Chart bringt das Gateway-Image seines Releases und dessen Konfiguration mit.
-Laufende Engines behalten ihr Image, bis sie enden; ändert sich ihr Profil, ersetzt das Gateway sie
-(`engine.replaceOnSpecChange`). `helm rollback` stellt Konfiguration und Image einer früheren Revision wieder her.
+Die Werte in einer Datei halten und bei jedem Upgrade angeben: Mit `-f` oder `--set` gilt für alles Übrige der
+Default des (neuen) Charts; ganz ohne `-f` und `--set` übernimmt `helm upgrade` die Werte der letzten Revision.
+`--reuse-values` nicht verwenden: Es setzt die alten Werte an die Stelle der Defaults des neuen Charts, neue oder
+geänderte Defaults kommen so nie an, und ein Schlüssel, den das neue Chart nicht mehr kennt, scheitert am Schema.
+Wer auf den letzten Werten aufbauen will, nimmt `--reset-then-reuse-values` (Helm 3.14 und neuer, Helm 4).
+
+Ein neues Chart bringt das Gateway-Image seines Releases und dessen Konfiguration mit. Laufende Engines behalten
+ihr Image, bis sie enden; ändert sich ihr Profil, ersetzt das Gateway sie (`engine.replaceOnSpecChange`). Werden
+die neuen Pods nicht ready (eine Konfiguration, die das Gateway ablehnt, ein Image, das sich nicht ziehen lässt),
+bleibt der Rollout mit HA stehen, und die alten Pods bedienen mit ihrer Konfiguration weiter; ohne HA ist das
+Gateway bis zur Korrektur weg (`Recreate`). `helm upgrade --wait` meldet das als Fehler. `helm rollback` stellt
+Konfiguration und Image einer früheren Revision wieder her (mit HA: [Hochverfügbarkeit](#hochverfügbarkeit)).
 
 ## Deinstallieren
 
+Zuerst das Gateway stoppen und die Engines löschen, dann deinstallieren:
+
 ```sh
+kubectl -n quackmux scale deployment/quackmux --replicas=0
+kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/name=quackmux,app.kubernetes.io/component=gateway \
+  --timeout=120s
+kubectl -n quackmux delete pod -l app.kubernetes.io/component=engine,app.kubernetes.io/managed-by=quackmux
 helm -n quackmux uninstall quackmux
 ```
 
-Das entfernt die Objekte des Charts. Was das Gateway selbst angelegt hat, gehört nicht zum Release und bleibt:
+Die Engine-Pods hat das Gateway selbst angelegt; sie gehören nicht zum Release und liefen nach `helm uninstall`
+weiter, ohne die NetworkPolicies des Releases: Jeder Pod im Cluster erreichte dann ihren Quack-Port (ihr Token
+kann jeder Benutzer einer geteilten Engine lesen), und die Sperre des Metadata-Dienstes fiele weg. Das Gateway
+zuerst, weil es Engines des Warm-Pools sonst gleich wieder startet. Die Token-Secrets der Engines gehen mit ihren
+Pods. Wer nur neu installieren und die Engines behalten will, deinstalliert nicht, sondern nimmt `helm upgrade`
+oder `helm rollback`.
 
-* **Engine-Pods** laufen weiter, bis man sie löscht (ihre Token-Secrets gehen mit ihnen):
+`helm uninstall` entfernt die Objekte des Charts bis auf die, die Helm behält. Es bleiben:
+
+* **Session-Key, Admin-Token und die ConfigMaps** (`helm.sh/resource-policy: keep`); ein neues Release desselben
+  Namens übernimmt sie. Entfernen:
 
   ```sh
-  kubectl -n quackmux delete pod -l app.kubernetes.io/component=engine,app.kubernetes.io/managed-by=quackmux
+  kubectl -n quackmux delete configmap,secret -l app.kubernetes.io/name=quackmux,app.kubernetes.io/instance=quackmux
   ```
 
 * **Daten-Volumes persistenter Profile** (PersistentVolumeClaims `quackmux-data-…`) bleiben mit den Daten
