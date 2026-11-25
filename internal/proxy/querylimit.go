@@ -41,7 +41,9 @@ import (
 //
 // Answers to requests that the gateway forwarded while the PREPARE still
 // waited prove nothing: the engine may not have made the query its
-// statement yet, and they may be about the statement before.
+// statement yet, and they may be about the statement before. The gateway
+// waits for the answer to a PREPARE also when its client goes away: the
+// engine runs the query anyway.
 //
 // The gateway cannot see whether a client still wants a query that it does
 // not ask anything for: an answered PREPARE may carry the whole result
@@ -206,6 +208,10 @@ type enforcement struct {
 	elapsed time.Duration
 	cut     bool  // its PREPARE was cut off: the engine never got all of it
 	fail    error // the gateway cannot cancel it on the engine
+	// quiet marks a precaution: no request of the query waits, and the
+	// gateway does not know whether it still runs (its PREPARE got no
+	// answer), so it is no timeout a client sees.
+	quiet bool
 }
 
 func newQueryLimits(g *Gateway) *queryLimits {
@@ -568,6 +574,16 @@ func (r *queryRequest) setUUID(uuid wire.Hugeint) {
 	}
 }
 
+// outlivesClient reports whether r is a PREPARE that keeps waiting for the
+// engine when its client goes away. The engine runs the query anyway (it
+// does not notice that the client left), and only its answer tells the
+// gateway whether the query is over: without it the gateway would follow
+// the query until its limit, and cancel it then whatever the engine had
+// done. The limit bounds the wait.
+func (r *queryRequest) outlivesClient() bool {
+	return r != nil && r.q != nil && r.kind == wire.TypePrepareRequest && r.q.limit > 0
+}
+
 // timeoutError returns the error the gateway answers with instead of the
 // engine's answer to r: the query of r ran out of time.
 func (r *queryRequest) timeoutError() (string, bool) {
@@ -635,12 +651,15 @@ func (r *queryRequest) finish(ev requestEvent) {
 			// there is no result to fetch.
 			l.endLocked(q)
 		case evFailed:
-			if q.uuidKnown && (r.body == nil || r.body.sentAll()) {
+			if q.limit > 0 && q.uuidKnown && (r.body == nil || r.body.sentAll()) {
 				// No answer, but the engine got the whole PREPARE: it may
-				// run the query (the client went away).
+				// run the query. (The gateway waits for the answer also when
+				// the client goes away; this takes a failure between gateway
+				// and engine, or the gateway's own abort.)
 				q.unanswered = true
 			} else {
-				l.endLocked(q) // the engine cannot have it
+				// The engine cannot have it, or there is no limit to enforce.
+				l.endLocked(q)
 			}
 		}
 	case wire.TypeFetchRequest:
@@ -716,7 +735,7 @@ func (l *queryLimits) startLocked(q *trackedQuery) *enforcement {
 	q.timedOut, q.expired, q.enforcing = true, false, true
 	q.enforced = make(chan struct{})
 	sq := q.sq
-	e := &enforcement{elapsed: time.Since(q.started)}
+	e := &enforcement{elapsed: time.Since(q.started), quiet: q.unanswered && len(q.waiting) == 0}
 	switch {
 	case q.preparing && q.prepare.body != nil && q.prepare.body.stop():
 		// The engine has not got the whole PREPARE, and now never will.
@@ -792,6 +811,13 @@ func (l *queryLimits) run(q *trackedQuery, e *enforcement) {
 	}
 	if err != nil {
 		attrs = append(attrs, "err", err)
+	}
+	if e.quiet {
+		// The CANCEL was a precaution: no client waits for the query, and the
+		// gateway does not know whether it still ran after its PREPARE got
+		// no answer (the client got an error for that).
+		l.g.log.Debug("query time limit reached by a query whose PREPARE got no answer", attrs...)
+		return
 	}
 	l.g.log.Warn("query cancelled at its time limit", attrs...)
 	if l.g.audit != nil {

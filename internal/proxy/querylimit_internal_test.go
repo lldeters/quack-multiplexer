@@ -1,14 +1,17 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"quackmux/internal/config"
+	"quackmux/internal/metrics"
 	"quackmux/internal/session"
 	"quackmux/internal/wire"
 )
@@ -266,6 +269,69 @@ func TestRunningQueryIsNeverForgotten(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("%d queries followed, want the two that may run", n)
 	}
+}
+
+// A PREPARE that got no answer although the engine got all of it (a failure
+// between gateway and engine; the client got an error for it) is cancelled
+// at its limit as a precaution. No client sees a timeout then, so the
+// gateway neither counts nor logs one, whatever the CANCEL brings; it does
+// once a request of the query waits. A statement without a limit (COMMIT)
+// that gets no answer is not followed any further.
+func TestUnansweredPrepareIsCancelledQuietly(t *testing.T) {
+	for _, waiting := range []bool{false, true} {
+		l, s := newTestLimits(t, false)
+		var logs bytes.Buffer
+		l.g.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		l.g.met = metrics.New()
+		r := l.testPrepare(t, s, wire.Hugeint{})
+		r.finish(evFailed)
+		// A later PREPARE: a CANCEL with the zero uuid could meet it, so the
+		// gateway cannot send one, and the enforcement fails without an engine.
+		l.testPrepare(t, s, wire.Hugeint{Upper: 2})
+		if waiting {
+			var zero wire.Hugeint
+			if f, _, err := l.beginReading(context.Background(), s, &zero, true, func() {}); f == nil || f.q != r.q || err != nil {
+				t.Fatalf("FETCH: %v, %v", f, err)
+			}
+		}
+		l.mu.Lock()
+		e := l.startLocked(r.q)
+		l.mu.Unlock()
+		l.run(r.q, e)
+		warned := strings.Contains(logs.String(), "level=WARN")
+		counted := testCounter(t, l.g.met, "quackmux_query_timeouts_total") > 0
+		if warned != waiting || counted != waiting {
+			t.Errorf("request waiting %v: logged a warning %v, counted %v; want %v", waiting, warned, counted, waiting)
+		}
+	}
+
+	l, s := newTestLimits(t, false)
+	r, err := l.beginPrepare(context.Background(), s, wire.OptionalIdx{}, wire.Hugeint{}, true, true, func() {}, nil)
+	if r == nil || err != nil {
+		t.Fatalf("COMMIT: %v, %v", r, err)
+	}
+	r.finish(evFailed)
+	if l.followed(r.q) {
+		t.Fatal("the gateway still follows a COMMIT that got no answer")
+	}
+}
+
+// testCounter sums the counter name in the registry of met.
+func testCounter(t *testing.T, met *metrics.Metrics, name string) float64 {
+	t.Helper()
+	mfs, err := met.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n float64
+	for _, mf := range mfs {
+		if mf.GetName() == name {
+			for _, m := range mf.GetMetric() {
+				n += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return n
 }
 
 // COMMIT, END, ROLLBACK and ABORT (with WORK or TRANSACTION) have no limit;

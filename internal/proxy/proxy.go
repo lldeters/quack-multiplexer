@@ -609,8 +609,16 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	upCtx := r.Context()
 	stopAbort := func() bool { return true }
 	if h.Type == wire.TypePrepareRequest || g.limits != nil {
+		// The request to the engine of a PREPARE that the query time limit
+		// follows outlives its client (queryRequest.outlivesClient): it
+		// starts detached from the client, and is tied to it again below if
+		// the limit does not follow it.
+		parent := upCtx
+		if g.limits != nil && h.Type == wire.TypePrepareRequest {
+			parent = context.WithoutCancel(parent)
+		}
 		var cancelUp context.CancelFunc
-		upCtx, cancelUp = context.WithCancel(upCtx)
+		upCtx, cancelUp = context.WithCancel(parent)
 		defer cancelUp()
 		if h.Type == wire.TypePrepareRequest {
 			// A query waiting for its engine when the gateway shuts down is
@@ -640,7 +648,16 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 				writeError(w, g.limits.message(timedOut), wire.ExceptionInterrupt, false)
 				return "query_timeout"
 			}
-			return g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, qr)
+			detached := qr.outlivesClient()
+			if h.Type == wire.TypePrepareRequest && !detached {
+				stop := context.AfterFunc(r.Context(), cancelUp)
+				defer stop()
+			}
+			outcome := g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, qr)
+			if detached && outcome != "shutdown" && r.Context().Err() != nil {
+				outcome = "client_gone" // the engine's answer reached no one
+			}
+			return outcome
 		}
 	}
 	return g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, nil)
@@ -665,7 +682,10 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 	}
 	if err != nil {
 		qr.finish(evFailed)
-		if r.Context().Err() != nil {
+		// A request that outlives its client does not fail because the
+		// client left: at a shutdown it is cancelled on the engine all the
+		// same.
+		if r.Context().Err() != nil && !(aborted && qr.outlivesClient()) {
 			return "client_gone"
 		}
 		if aborted {
