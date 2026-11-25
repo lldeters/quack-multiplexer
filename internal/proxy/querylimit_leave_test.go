@@ -253,3 +253,29 @@ func TestCancelForAConnectionTheEngineDropped(t *testing.T) {
 		t.Fatalf("%v timeouts counted for a query whose engine connection is gone", n)
 	}
 }
+
+// Queries whose cancel the engine refused may still run: the gateway keeps
+// answering their later requests itself, but they do not count toward the
+// bound of the queries it follows (it can do nothing more about them), and
+// of them it keeps only the newest, as many as the bound. 64 of them once
+// made the session refuse every PREPARE until it reconnected; a CANCEL did
+// not help.
+func TestFailedCancelsDoNotFillTheSession(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 50ms}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	srv := h.prov.Server(h.sessionEngine(c))
+	srv.CancelError = "the engine is overloaded"
+	n := proxy.MaxSessionQueries + 8
+	for i := 0; i < n; i++ {
+		mustTimeoutFailed(t, h.prepare(c, "SLEEP 150", wire.Hugeint{Upper: 90, Lower: uint64(i + 1)}), "50ms", "limits.queryTimeout")
+	}
+	if _, q := proxy.TrackedQueries(h.gw); q != proxy.MaxSessionQueries {
+		t.Fatalf("%d queries followed after %d failed cancels, want the newest %d", q, n, proxy.MaxSessionQueries)
+	}
+	mustTimeoutFailed(t, h.fetch(c, wire.Hugeint{Upper: 90, Lower: uint64(n)}, 1), "50ms", "limits.queryTimeout")
+	srv.CancelError = ""
+	mustType(t, h.prepare(c, "SELECT 1", uuidA), wire.TypePrepareResponse)
+	if n := requestCount(t, h.met, "too_many_queries"); n != 0 {
+		t.Fatalf("%v requests refused as too_many_queries", n)
+	}
+}

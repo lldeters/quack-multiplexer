@@ -108,7 +108,10 @@ const (
 // that the engine may still run, or the client could stop its clock: at the
 // bound it forgets only queries whose cancel the engine confirmed, and
 // otherwise does not forward a further PREPARE (or a FETCH that would adopt
-// a query) but answers it with an error.
+// a query) but answers it with an error. Queries whose cancel failed (the
+// gateway gave up on them) do not count: it can do nothing more about them
+// and keeps them only to answer their later requests itself, at most this
+// many, the newest.
 const maxSessionQueries = 64
 
 // fenceRetry is how soon the gateway looks again at a limit that passed
@@ -417,24 +420,64 @@ func (sq *sessionQueries) holdsLocked() bool {
 // is room. It forgets only queries that the engine is done with: those
 // whose cancel at their limit it confirmed, or whose PREPARE the gateway
 // cut off. Later requests of them get the engine's error then instead of
-// the gateway's.
+// the gateway's. Queries the gateway gave up on do not count.
 func (l *queryLimits) roomLocked(sq *sessionQueries) bool {
 	if len(sq.queries) < maxSessionQueries {
 		return true
 	}
 	kept := make([]*trackedQuery, 0, len(sq.queries))
+	counted := 0
 	for _, o := range sq.queries {
 		if o.timedOut && !o.enforcing && !o.failed {
-			o.ended = true
-			if o.timer != nil {
-				o.timer.Stop()
-			}
+			forgetLocked(o)
+			continue
+		}
+		if !o.givenUp() {
+			counted++
+		}
+		kept = append(kept, o)
+	}
+	sq.queries = kept
+	return counted < maxSessionQueries
+}
+
+// givenUp reports whether the gateway could not cancel q at its limit and
+// is done trying: q may still run, but the gateway can do nothing more
+// about it than answer its later requests itself.
+func (q *trackedQuery) givenUp() bool { return q.timedOut && q.failed && !q.enforcing }
+
+// pruneLocked forgets the oldest queries of sq that the gateway gave up on
+// beyond maxSessionQueries.
+func (l *queryLimits) pruneLocked(sq *sessionQueries) {
+	n := 0
+	for _, o := range sq.queries {
+		if o.givenUp() {
+			n++
+		}
+	}
+	if n <= maxSessionQueries {
+		return
+	}
+	kept := make([]*trackedQuery, 0, len(sq.queries))
+	for _, o := range sq.queries {
+		if n > maxSessionQueries && o.givenUp() {
+			forgetLocked(o)
+			n--
 			continue
 		}
 		kept = append(kept, o)
 	}
 	sq.queries = kept
-	return len(kept) < maxSessionQueries
+}
+
+// forgetLocked marks a query that the gateway stops following without
+// evidence of its end: requests of it in flight keep it (their answers
+// still get its timeout error), nothing else does.
+func forgetLocked(q *trackedQuery) {
+	q.ended = true
+	if q.timer != nil {
+		q.timer.Stop()
+	}
 }
 
 // dropLocked forgets a session and its queries, and lets its DISCONNECT go
@@ -1008,6 +1051,9 @@ func (l *queryLimits) run(q *trackedQuery, e *enforcement) {
 	close(q.enforced)
 	if result == "cancelled" && q.unanswered {
 		l.endLocked(q) // no client waits for it, and the engine has ended it
+	}
+	if q.givenUp() && !q.ended {
+		l.pruneLocked(sq)
 	}
 	if sq.cancels--; sq.cancels == 0 {
 		close(sq.cancelsDone)
