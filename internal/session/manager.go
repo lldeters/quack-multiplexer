@@ -117,6 +117,10 @@ type View struct {
 type tombstone struct {
 	Closed
 	user string
+	// held marks a session whose DISCONNECT waits for the close hook: the
+	// engine still has its connection, so the session must stay closed
+	// whatever the age of the tombstone.
+	held bool
 }
 
 // Errors.
@@ -193,7 +197,9 @@ func (m *Manager) SetFence(fence func() bool) { m.fence = fence }
 // and keeps the lease of the connection alive until then. The Quack server
 // lets the requests of a connection that are in flight finish after a
 // DISCONNECT, and their statement runs on with them; the query time limit
-// needs the connection to cancel it.
+// needs the connection to cancel it. Until the DISCONNECT the session stays
+// closed, however old its tombstone: the engine would confirm the
+// connection to an adoption.
 func (m *Manager) SetCloseHook(f func(s *Session, keep bool) <-chan struct{}) { m.closeHook = f }
 
 // Reservation holds a slot under the session limits while a connect is in
@@ -413,6 +419,16 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	return s, nil, nil
 }
 
+// Closed reports why the session was closed, and false while it is open.
+func (s *Session) Closed() (*Closed, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != StateClosed {
+		return nil, false
+	}
+	return &Closed{Reason: s.closeReason, ClosedAt: s.closedAt}, true
+}
+
 // Begin marks a request of the session as in flight. It fails if the
 // session was closed concurrently.
 func (s *Session) Begin(now time.Time, t wire.MessageType) (*Closed, bool) {
@@ -522,9 +538,16 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 	if mode.Disconnect || mode.Cancel {
 		target, reachable = m.engines.Lookup(s.EngineID)
 	}
+	keep := mode.Disconnect && !mode.gone && reachable
 	var hold <-chan struct{}
 	if m.closeHook != nil {
-		hold = m.closeHook(s, mode.Disconnect && !mode.gone && reachable)
+		hold = m.closeHook(s, keep)
+	}
+	if !keep {
+		hold = nil // only a DISCONNECT that is about to go out can wait
+	}
+	if hold != nil {
+		m.setHeld(s.ID, true)
 	}
 
 	if (mode.Disconnect || mode.Cancel) && reachable {
@@ -542,10 +565,23 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 				if err := m.backend.Disconnect(ctx, target.Endpoint, s.BackendConnID); err != nil {
 					m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
 				}
+				if hold != nil {
+					m.setHeld(s.ID, false)
+				}
 			}
 		})
 	}
 	return true
+}
+
+// setHeld marks the tombstone of a closed session as held (see tombstone).
+func (m *Manager) setHeld(id string, held bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.tombstones[id]; ok {
+		t.held = held
+		m.tombstones[id] = t
+	}
 }
 
 // awaitRelease waits until release is closed or the manager shuts down, and
@@ -702,7 +738,7 @@ func (m *Manager) Reap() {
 	ttl := sc.TombstoneTTL.Duration
 	m.mu.Lock()
 	for id, t := range m.tombstones {
-		if now.Sub(t.ClosedAt) > ttl {
+		if !t.held && now.Sub(t.ClosedAt) > ttl {
 			delete(m.tombstones, id)
 		}
 	}
