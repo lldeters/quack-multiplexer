@@ -167,7 +167,9 @@ DETACH bi;
 -- ATTACH 'quack:quackmux.example.com:9494' AS lake (DISABLE_SSL true);
 --
 -- Mit TLS (server.tls oder ein L4-Load-Balancer, der TLS terminiert) ohne
--- DISABLE_SSL; das Zertifikat muss für den Client vertrauenswürdig sein:
+-- DISABLE_SSL; das Zertifikat muss für den Client vertrauenswürdig sein. Eine
+-- eigene CA bekommt er global, sonst scheitern größere Ergebnisse (docs/tls.md):
+-- SET GLOBAL ca_cert_file = '/pfad/zu/ca.crt';
 -- ATTACH 'quack:quackmux.example.com:9494' AS lake;
 --
 -- Ein selbstsigniertes Zertifikat kann der Client stattdessen pinnen

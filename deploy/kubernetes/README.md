@@ -173,7 +173,9 @@ DETACH lake;
 ```
 
 `localhost` spricht der Client per HTTP an. Das Token ist das öffentliche Beispiel-Token aus
-`base/secrets/users.yaml`; mit Ihrem eigenen Overlay gilt Ihr eigenes.
+`base/secrets/users.yaml`; mit Ihrem eigenen Overlay gilt Ihr eigenes. Mit `server.tls` scheitert dieses `ATTACH`
+mit `Bad Request`; dann pinnt der Client das Zertifikat, oder er verbindet sich mit `(DISABLE_SSL false)` und
+`DNS:localhost` im Zertifikat ([docs/tls.md](../../docs/tls.md#was-sich-für-bestehende-clients-ändert)).
 
 ### Im Cluster
 
@@ -184,6 +186,9 @@ Andere Pods erreichen das Gateway unter `quackmux.quackmux.svc.cluster.local:949
 CREATE SECRET (TYPE quack, TOKEN '…', SCOPE 'quack:quackmux.quackmux.svc.cluster.local:9494');
 ATTACH 'quack:quackmux.quackmux.svc.cluster.local:9494' AS lake (DISABLE_SSL true);
 ```
+
+Mit `server.tls` entfällt `DISABLE_SSL` (sonst `Bad Request`); dann muss der Name des Service im Zertifikat
+stehen, oder die Clients pinnen es.
 
 ### Von außen: L4-Load-Balancer
 
@@ -247,11 +252,13 @@ Mit Plain HTTP gehen die Tokens im Klartext über das Netz; außerhalb vertrauen
 ### Selbstsigniertes Zertifikat und `ssl_fingerprint`
 
 Ohne CA genügt ein selbstsigniertes Zertifikat, wenn die Clients seinen SHA-256-Fingerprint pinnen. Zertifikat,
-Secret (für den Patch oben) und Fingerprint:
+Secret (für den Patch oben) und Fingerprint (die Namen im `subjectAltName` brauchen nur Clients, die das Zertifikat
+statt eines Pins als CA hinterlegen):
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 730 \
-  -subj '/CN=quackmux.example.com' -addext 'subjectAltName=DNS:quackmux.example.com' \
+  -subj '/CN=quackmux.example.com' \
+  -addext 'subjectAltName=DNS:quackmux.example.com,DNS:quackmux.quackmux.svc.cluster.local,DNS:localhost' \
   -keyout tls.key -out tls.crt
 kubectl -n quackmux create secret tls quackmux-tls --cert=tls.crt --key=tls.key
 kubectl -n quackmux get secret quackmux-tls -o jsonpath='{.data.tls\.crt}' | base64 -d |
@@ -1170,7 +1177,7 @@ Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nic
 | `quackmux: session closed: the engine no longer knows this connection. DETACH and ATTACH again to reconnect.` | Nach einem Neustart oder einer Übernahme fand das Gateway die Verbindung des Clients nicht mehr auf seiner Engine: Die Engine hat inzwischen neu gestartet, oder der Client war länger fort als die Engine-Lease seiner Verbindung (`session.backendHeartbeatTimeout`), und die Engine hat sie entfernt ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). `DETACH` und erneut `ATTACH`. |
 | Gateway-Log: `cannot list the connections of a recovered engine: its orphaned connections stay open` | Das Gateway kann die verwaisten Verbindungen dieser Engine nicht schließen; sie bleiben bis zum Ende der Engine. Mit `hint` zu 2048: Die Engine hat mehr als 2048 Verbindungen. Sonst war die Engine nicht erreichbar. |
 | Gateway-Log: `not closing orphaned connections: the authorization function of the engine refuses the listing` | Die gehärtete Engine läuft mit `quackmux_authorize` (oder einem älteren oder eigenen Makro), das das Listing ablehnt; ihre verwaisten Verbindungen bleiben bis zum Ende der Engine. Erreicht außer dem Gateway niemand ihren Port, lässt `quackmux_authorize_listing` das Listing durch ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)). |
-| `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
+| `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400); `localhost` (Port-Forward) braucht dann einen Pin oder `(DISABLE_SSL false)` ([docs/tls.md](../../docs/tls.md#fehlermeldungen)). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
 | `quackmux: gateway is not ready: not the leader` | Der Request landet bei einem Follower: ein Port-Forward auf einen bestimmten Pod oder, mit `overlays/ha`, ein Service ohne `quackmux.io/leader: "true"` im Selektor. `svc/quackmux` verwenden bzw. den Selektor ergänzen; `quackmux_requests_total{outcome="not_leader"}` zählt solche Requests. Der Request lief nicht. |
 | HA: Gateway-Pod bleibt `0/1 READY`, `/readyz` meldet `label quackmux.io/leader of pod … not yet removed: …` | Der Pod kann sein Leader-Label nicht entfernen, meist weil die API nicht erreichbar ist; bis dahin bekommt er keinen Traffic. `waiting to campaign for leadership` ist in den ersten `3 × ha.retryPeriod` nach dem Start normal, `stepping down: the lease is no longer fresh` bei einem Leader, der seine Lease verloren hat, bis zu seinem Neustart als Follower. |
 | HA: Follower bleibt `0/1 READY`, `/readyz` meldet `no request for lease … has succeeded …`, Log: `Error retrieving lease lock … forbidden` | Der Follower darf die Lease nicht nutzen oder erreicht die API nicht und könnte nie übernehmen: Im Namespace der Lease (`ha.namespace`, sonst der Engine-Namespace) fehlen Role und RoleBinding aus `base/rbac.yaml`. |

@@ -2,13 +2,14 @@
 
 Ohne `server.tls` spricht das Gateway auf dem Quack-Port Plain HTTP. DuckDB-Clients erwarten für jeden Host außer
 `localhost` HTTPS und brauchen dann `DISABLE_SSL true`; Tokens und Daten gehen im Klartext über das Netz. Mit
-`server.tls` spricht der Port nur noch HTTPS (ab TLS 1.2), und die Clients verbinden sich ohne `DISABLE_SSL`.
+`server.tls` spricht der Port nur noch HTTPS (ab TLS 1.2), und die Clients verbinden sich ohne `DISABLE_SSL`; was
+das für Port-Forwards und Clients im Cluster heißt, steht [unten](#was-sich-für-bestehende-clients-ändert).
 
 Dem Zertifikat des Gateways vertraut ein Client auf einem von zwei Wegen:
 
 | | CA-Prüfung (Default) | Pinning mit `ssl_fingerprint` |
 |---|---|---|
-| Vertrauen | CA-Bundle des Systems oder `SET ca_cert_file` | nur der SHA-256-Fingerprint des Zertifikats |
+| Vertrauen | CA-Bundle des Systems oder `SET GLOBAL ca_cert_file` | nur der SHA-256-Fingerprint des Zertifikats |
 | Hostname und Ablaufdatum | geprüft | nicht geprüft |
 | HTTP im Client | httpfs (curl) | eigener HTTP-Client der quack-Extension, ohne httpfs |
 | Optionen per `EXTRA_HTTP_HEADERS` | ja | nein, nur im Token |
@@ -39,15 +40,28 @@ server:
 * Kubernetes: Secret und Volume-Patch stehen in [deploy/kubernetes/README.md](../deploy/kubernetes/README.md#von-außen-l4-load-balancer).
   Terminiert stattdessen ein L4-Load-Balancer TLS, sehen die Clients sein Zertifikat; ein Pin gilt dann diesem.
 
-Ein selbstsigniertes Zertifikat (OpenSSL 1.1.1 oder neuer; der Name muss der sein, den die Clients im `ATTACH`
-verwenden):
+Ein selbstsigniertes Zertifikat (OpenSSL 1.1.1 oder neuer). Ins `subjectAltName` gehört jeder Name, unter dem
+Clients mit CA-Prüfung das Gateway ansprechen: der externe Name, im Cluster der des Service und für einen
+Port-Forward `localhost`. Gepinnte Clients prüfen den Namen nicht.
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 730 \
-  -subj '/CN=quackmux.example.com' -addext 'subjectAltName=DNS:quackmux.example.com' \
+  -subj '/CN=quackmux.example.com' \
+  -addext 'subjectAltName=DNS:quackmux.example.com,DNS:quackmux.quackmux.svc.cluster.local,DNS:localhost' \
   -keyout tls.key -out tls.crt
 kubectl -n quackmux create secret tls quackmux-tls --cert=tls.crt --key=tls.key
 ```
+
+### Was sich für bestehende Clients ändert
+
+Mit `server.tls` nimmt der Port keine HTTP-Requests mehr an; wer weiter HTTP spricht, bekommt `Bad Request`:
+
+* **Clients mit `DISABLE_SSL true`**, etwa die im Cluster aus
+  [deploy/kubernetes/README.md](../deploy/kubernetes/README.md#im-cluster): Die Option entfällt. Der Name, den sie
+  im `ATTACH` verwenden (`quackmux.quackmux.svc.cluster.local`), muss dann im Zertifikat stehen, oder sie pinnen es.
+* **`localhost`, `127.0.0.1` und `::1`**, also auch ein Port-Forward: Diese Hosts spricht der Client von sich aus
+  per HTTP an. Mit einem Pin (im Secret oder im `ATTACH`) nimmt er HTTPS; mit CA-Prüfung braucht er
+  `ATTACH 'quack:localhost:9494' AS lake (DISABLE_SSL false)` und `DNS:localhost` im Zertifikat.
 
 ## Clients mit CA-Prüfung
 
@@ -60,12 +74,20 @@ Für ein Zertifikat, das keine öffentliche CA ausgestellt hat, braucht der Clie
 einem selbstsignierten das Zertifikat selbst:
 
 ```sql
-SET ca_cert_file = '/pfad/zu/ca.crt';
+SET GLOBAL ca_cert_file = '/pfad/zu/ca.crt';
 ```
 
-Der Host im `ATTACH` muss im Zertifikat stehen (`subjectAltName`). Sonst und ohne passende CA scheitert das `ATTACH`
-mit `SSL peer certificate or SSH remote key was not OK`. Optionen per `EXTRA_HTTP_HEADERS` funktionieren auf diesem
-Weg wie ohne TLS.
+* **Nur mit `GLOBAL`.** Ein `SET ca_cert_file` ohne `GLOBAL` gilt nur für die Requests, die der Client im Kontext
+  der Sitzung schickt: das `ATTACH` und Queries mit kleinen Ergebnissen. Größere Ergebnisse holt er parallel über
+  weitere Verbindungen ab, die nur die globalen Einstellungen lesen. Die Query scheitert dann mit `SSL peer
+  certificate or SSH remote key was not OK`, danach auch jede weitere Query dieses Attachments.
+* **Die Datei ersetzt das CA-Bundle des Systems**, für jeden HTTPS-Request von httpfs im Client-Prozess, auch für
+  S3 und `https://`-Dateien. Liest der Client auch von dort, gehören beide in die Datei, etwa
+  `cat /etc/ssl/certs/ca-certificates.crt ca.crt > bundle.crt` (der Pfad des System-Bundles hängt von der
+  Distribution ab).
+* Der Host im `ATTACH` muss im Zertifikat stehen (`subjectAltName`). Sonst und ohne passende CA scheitert das
+  `ATTACH` mit `SSL peer certificate or SSH remote key was not OK`.
+* Optionen per `EXTRA_HTTP_HEADERS` funktionieren auf diesem Weg wie ohne TLS.
 
 ## Clients mit `ssl_fingerprint`
 
@@ -120,10 +142,17 @@ Ein Pin schaltet HTTPS ein. Steht er im `ATTACH` oder in einem dort mit `SECRET`
 * **Kurze Timeouts.** Jeder Request wartet höchstens `http_timeout` Sekunden (Default 30), sobald im
   Client-Prozess httpfs geladen ist (etwa für S3, durch `LOAD httpfs` oder eine httpfs-Einstellung), sonst 300 s.
   Lange warten aber gerade die Quack-Requests: das `ATTACH`, während das Gateway eine Engine startet
-  (`CONNECTION` ohne Warm-Pool, die erste Session eines Engine-Schlüssels; bis `engine.startupTimeout`), und ein
-  FETCH, bis die Engine die nächsten Zeilen hat (eine Aggregation liefert erst am Ende). Dauert es länger, meldet der
-  Client `Failed to read connection error for HTTP POST to 'https://…/quack'`; die Session bleibt nutzbar. Ohne
-  Pinning wartet der Client bis zu 24 h. Abhilfe vor dem `ATTACH`:
+  (`CONNECTION` ohne Warm-Pool, die erste Session eines Engine-Schlüssels; bis `engine.startupTimeout`), und eine
+  Query, bis die Engine die ersten oder nächsten Zeilen hat (eine Aggregation liefert erst am Ende). Dauert es
+  länger, meldet der Client `Failed to read connection error for HTTP POST to 'https://…/quack'`. Ohne Pinning
+  wartet er bis zu 24 h.
+  * Bei einer Query scheitert nur sie; die Session bleibt nutzbar.
+  * Beim `ATTACH` entsteht keine Session. Die Engine startet weiter: Ein neues `ATTACH` mit `USER`, `GROUP` oder
+    `SERVER` wartet auf sie, eins mit `CONNECTION` startet eine weitere Engine (die erste endet ungenutzt). Dauert
+    der Start eines `CONNECTION`-Pods länger als das Timeout, kommt der Client also nie durch, und jeder Versuch
+    kostet einen Pod-Start.
+
+  Abhilfe vor dem `ATTACH`:
 
   ```sql
   SET GLOBAL http_timeout = 86400;
@@ -145,5 +174,5 @@ Ein Pin schaltet HTTPS ein. Steht er im `ATTACH` oder in einem dort mit `SECRET`
 | `Invalid Input Error: Invalid SSL fingerprint "…": expected the SHA-256 fingerprint of the server certificate as hex digits, optionally separated by colons` | Pin im falschen Format, etwa die ganze `openssl`-Zeile |
 | `Invalid Input Error: ssl_fingerprint pins the server's TLS certificate and cannot be combined with disable_ssl` | Pin im `ATTACH` und `DISABLE_SSL true` |
 | `IO Error: Failed to send message: Failed to read connection error for HTTP POST to 'https://…:9494/quack'` | gepinnter Client: Request dauerte länger als sein Timeout |
-| `IO Error: Failed to send message: IO Error: SSL peer certificate or SSH remote key was not OK error for HTTP POST to 'https://…:9494/quack'` | ohne Pin: Zertifikat nicht vertrauenswürdig oder Hostname passt nicht |
-| `IO Error: Failed to send message: Bad Request` | `DISABLE_SSL true` gegen ein Gateway mit `server.tls` |
+| `IO Error: Failed to send message: IO Error: SSL peer certificate or SSH remote key was not OK error for HTTP POST to 'https://…:9494/quack'` | ohne Pin: Zertifikat nicht vertrauenswürdig oder Hostname nicht im Zertifikat. Scheitern nur Queries mit größeren Ergebnissen (und danach alle des Attachments), steht `ca_cert_file` ohne `GLOBAL` im `SET` |
+| `IO Error: Failed to send message: Bad Request` | Der Client spricht HTTP mit einem Gateway mit `server.tls`: `DISABLE_SSL true`, oder `localhost` bzw. `127.0.0.1` (Port-Forward) ohne Pin und ohne `DISABLE_SSL false` |
