@@ -227,9 +227,10 @@ Mit Plain HTTP gehen die Tokens im Klartext über das Netz; außerhalb vertrauen
       keyFile: /etc/quackmux/tls/tls.key
   ```
 
-  Das Zertifikat muss zum Hostnamen passen und für den Client vertrauenswürdig sein. Das Gateway lädt es beim
-  Start; nach einer Erneuerung `kubectl -n quackmux rollout restart deployment/quackmux` (im HA-Modus übergibt
-  der Rollout selbst an einen neuen Pod, siehe unten).
+  Das Zertifikat muss zum Hostnamen passen und für den Client vertrauenswürdig sein, oder die Clients pinnen es
+  ([Selbstsigniertes Zertifikat und `ssl_fingerprint`](#selbstsigniertes-zertifikat-und-ssl_fingerprint)). Das
+  Gateway lädt es beim Start; nach einer Erneuerung `kubectl -n quackmux rollout restart deployment/quackmux` (im
+  HA-Modus übergibt der Rollout selbst an einen neuen Pod, siehe unten).
 * **Idle-Timeout des Load Balancers:** Während die Engine rechnet, fließen in einem FETCH-Request keine Bytes.
   Das Idle-Timeout muss deutlich über der längsten erwarteten Rechenzeit liegen (anbieterspezifische
   Annotation, Beispiel in `service.yaml`).
@@ -242,6 +243,34 @@ Mit Plain HTTP gehen die Tokens im Klartext über das Netz; außerhalb vertrauen
 > Body-Limit auf mindestens 100 MiB, Request-Buffering aus (ingress-nginx:
 > `nginx.ingress.kubernetes.io/proxy-read-timeout`, `…/proxy-send-timeout`, `…/proxy-body-size`,
 > `…/proxy-request-buffering: "off"`).
+
+### Selbstsigniertes Zertifikat und `ssl_fingerprint`
+
+Ohne CA genügt ein selbstsigniertes Zertifikat, wenn die Clients seinen SHA-256-Fingerprint pinnen. Zertifikat,
+Secret (für den Patch oben) und Fingerprint:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 730 \
+  -subj '/CN=quackmux.example.com' -addext 'subjectAltName=DNS:quackmux.example.com' \
+  -keyout tls.key -out tls.crt
+kubectl -n quackmux create secret tls quackmux-tls --cert=tls.crt --key=tls.key
+kubectl -n quackmux get secret quackmux-tls -o jsonpath='{.data.tls\.crt}' | base64 -d |
+  openssl x509 -noout -fingerprint -sha256 | cut -d= -f2
+```
+
+```sql
+SET GLOBAL http_timeout = 86400;
+CREATE SECRET (TYPE quack, TOKEN 'mein-token?subdomain=bi', SSL_FINGERPRINT 'F8:C0:31:…:BB:7D',
+               SCOPE 'quack:quackmux.example.com:9494');
+ATTACH 'quack:quackmux.example.com:9494' AS lake;
+```
+
+Ein gepinnter Client prüft nur den Fingerprint, nicht Hostname oder Ablaufdatum. Er sendet keine
+`EXTRA_HTTP_HEADERS` (Optionen gehören in den Token) und bricht ohne das `SET GLOBAL http_timeout` jeden Request
+nach 30 s ab, ohne geladenes httpfs nach 300 s: auch ein `ATTACH`, das auf den Start einer Engine wartet, und ein
+FETCH, der auf die Zeilen einer langen Query wartet. Ein neues Zertifikat ändert den Fingerprint; das Gateway
+liefert es mit dem nächsten Neustart aus, die Clients brauchen dann den neuen Pin. Details und Fehlermeldungen:
+[docs/tls.md](../../docs/tls.md).
 
 ## Share-Levels und Optionen
 

@@ -20,8 +20,12 @@ Everything quackmux relies on is listed here. File paths refer to
   (up to about 32 MiB each), HEARTBEAT, CANCEL and catalog PREPAREs (`query_uuid {0,0}`) run in parallel as well.
   Requests must be routed by the header `connection_id` only.
 - **Timeouts.** Client requests time out after 86400 s (`HTTP_TIMEOUT_SECONDS`). Clients that pin
-  `ssl_fingerprint` use `http_timeout`, 30 s by default, which matters for engine cold starts. There are no
-  Quack-level retries. libcurl may resend a POST when a reused socket was closed before any answer, which would
+  `ssl_fingerprint` use their own cpp-httplib client (`PinnedHttpsQuackClient`, no httpfs): its connect, read and
+  write timeouts are the global value of `http_timeout` (30 s by default) when httpfs is loaded, else the
+  cpp-httplib defaults (300 s connect and read, 5 s write). That bounds every request, the handshake during an
+  engine cold start and the long-polled PREPAREs and FETCHes alike. `SET GLOBAL http_timeout = 86400` before
+  ATTACH lifts it; a session-scoped `SET http_timeout` does not (verified with DuckDB v2.0.0, see docs/tls.md).
+  There are no Quack-level retries. libcurl may resend a POST when a reused socket was closed before any answer, which would
   re-run a PREPARE. **Never close a connection after reading a request without answering it.**
 - **Heartbeats** run at `timeout/3 · [0.8, 1.2]`, and failures are swallowed. A hung heartbeat blocks DETACH.
   DETACH sends DISCONNECT with a 2 s timeout.

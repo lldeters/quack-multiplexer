@@ -20,7 +20,8 @@ Grundlage ist der Quellcode von [duckdb/duckdb-quack](https://github.com/duckdb/
 * Der Client hält pro Verbindung mehrere Keep-Alive-HTTP-Verbindungen (Pool pro asynchronem Thread) und
   schickt parallele Requests mit derselben `connection_id`, etwa Fetch-Ahead oder Heartbeats. Der Server
   ordnet ausschließlich über die `connection_id` zu, **nicht** über die TCP-Verbindung.
-* Client-Timeout pro Request: 24 h (`HTTP_TIMEOUT_SECONDS`). Retries: 0.
+* Client-Timeout pro Request: 24 h (`HTTP_TIMEOUT_SECONDS`). Retries: 0. Mit `ssl_fingerprint` gilt der globale
+  Wert von `http_timeout` (Default 30 s), ohne geladenes httpfs 300 s ([TLS](tls.md)).
 * Server (cpp-httplib):
   * 5 s Socket-Read/Write-Timeout. Ein ins Stocken geratener Peer wird abgebrochen.
   * Request-Bodies bis 100 MiB.
