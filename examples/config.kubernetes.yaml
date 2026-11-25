@@ -405,13 +405,20 @@ profiles:
     # options are global; options with session scope only affect the init
     # script's own connection.
     settings: {}
+    # The values of the default profile in deploy/kubernetes/base:
     # settings:
     #   memory_limit: 3GB
     #   threads: "2"
+    #   # Spill space (here twice limits.memory). A query that needs more
+    #   # fails with an error; without the setting DuckDB may fill 90% of
+    #   # the node's free disk. Keep it below
+    #   # resources.limits.ephemeral-storage.
+    #   max_temp_directory_size: 8GiB
+    #   # Spill directory. The default is /tmp/.tmp (in the pod's emptyDir)
+    #   # with ":memory:" and <database>.tmp next to a database file, which
+    #   # with persistence is on the data volume. A path below /tmp keeps the
+    #   # spill in the emptyDir.
     #   temp_directory: /tmp/duckdb-spill
-    #   # Spill space; without it DuckDB may fill 90% of the node's free disk
-    #   # (keep it below resources.limits.ephemeral-storage).
-    #   max_temp_directory_size: 20GiB
     # Several engines per key, sessions spread over them (Kyuubi:
     # kyuubi.engine.pool.size / selectPolicy). Every engine has its own
     # database state: only for stateless workloads (reading a lake).
@@ -476,17 +483,21 @@ profiles:
 
     # Kubernetes pod shaping (provider kubernetes only).
     # Resources of the engine container. Keep settings.memory_limit below
-    # limits.memory.
+    # limits.memory. The emptyDir at /tmp (spill files included) counts
+    # towards limits.ephemeral-storage; beyond it the kubelet evicts the
+    # engine.
     resources: {}
     # resources:
     #   requests:
     #     cpu: "1"
     #     memory: 2Gi
-    #     ephemeral-storage: 2Gi
+    #     ephemeral-storage: 1Gi
     #   limits:
     #     cpu: "2"
     #     memory: 4Gi
-    #     ephemeral-storage: 24Gi
+    #     # settings.max_temp_directory_size plus 2 GiB for the container log
+    #     # and other files in /tmp.
+    #     ephemeral-storage: 10Gi
     # Extra environment variables of the engine container (the contract
     # variables above are always set by the gateway and cannot be replaced).
     env: []
@@ -561,9 +572,10 @@ profiles:
   #   settings:
   #     memory_limit: 12GB
   #     threads: "4"
+  #     max_temp_directory_size: 32GiB
   #   resources:
-  #     requests: {cpu: "4", memory: 16Gi}
-  #     limits: {cpu: "4", memory: 16Gi}
+  #     requests: {cpu: "4", memory: 16Gi, ephemeral-storage: 1Gi}
+  #     limits: {cpu: "4", memory: 16Gi, ephemeral-storage: 34Gi}
 
 # -----------------------------------------------------------------------------
 # Query audit log.
