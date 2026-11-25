@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"math/rand/v2"
@@ -354,4 +355,54 @@ func TestPrepareOfAClientThatLeavesEarly(t *testing.T) {
 	eventually(t, "the query forgotten", func() bool { _, q := proxy.TrackedQueries(h.gw); return q == 0 })
 	time.Sleep(600 * time.Millisecond)
 	noTimeouts(t, h, srv)
+}
+
+// Without a fresh lease the gateway does not cancel queries, but it does
+// not hold a PREPARE for the engine's answer past the limit once the
+// client went away either, whether the client left before the limit or
+// after it: the query is then followed as one whose PREPARE got no answer,
+// and cancelled as a precaution once the lease is fresh. The gateway once
+// held such a PREPARE until the engine answered.
+func TestStaleLeaseDoesNotHoldAnAbandonedPrepare(t *testing.T) {
+	for _, leaves := range []string{"before the limit", "after the limit"} {
+		t.Run(leaves, func(t *testing.T) {
+			h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+			var fresh atomic.Bool
+			proxy.SetFence(h.gw, fresh.Load)
+			c := h.connect("tok?user=alice", nil)
+			srv := h.prov.Server(h.sessionEngine(c))
+			msg := wire.PrepareRequest{SQL: "SLEEP 8000", QueryUUID: uuidA}.Encode(wire.Header{ConnectionID: c})
+			if leaves == "before the limit" {
+				h.postAndLeave(msg)
+			} else {
+				ctx, cancel := context.WithCancel(context.Background())
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.srv.URL+"/quack", bytes.NewReader(msg))
+				if err != nil {
+					t.Fatal(err)
+				}
+				go func() {
+					if resp, err := http.DefaultClient.Do(req); err == nil {
+						resp.Body.Close()
+					}
+				}()
+				time.AfterFunc(800*time.Millisecond, cancel)
+			}
+			start := time.Now()
+			eventually(t, "the PREPARE at the engine", func() bool { return h.gw.InFlight() == 1 })
+			eventually(t, "the PREPARE let go", func() bool { return h.gw.InFlight() == 0 })
+			if d := time.Since(start); d > 4*time.Second {
+				t.Fatalf("without a fresh lease the abandoned PREPARE was held %s (limit 300ms)", d.Round(time.Millisecond))
+			}
+			if got := cancels(srv); len(got) != 0 {
+				t.Fatalf("engine got CANCEL for %v without a fresh lease", got)
+			}
+			fresh.Store(true)
+			waitCancels(t, srv, uuidA)
+			time.Sleep(200 * time.Millisecond)
+			noTimeouts := timeouts(t, h.met, "cancelled")+timeouts(t, h.met, "failed") == 0
+			if !noTimeouts {
+				t.Fatal("the precaution was counted as a timeout, although no client waited")
+			}
+		})
+	}
 }

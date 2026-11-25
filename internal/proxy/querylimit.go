@@ -919,9 +919,21 @@ func (l *queryLimits) expire(q *trackedQuery) {
 	}
 	if !l.fresh() {
 		// Another replica may serve the session by now: leave its engine
-		// alone, and look again later.
+		// alone, and look again later. But do not hold a PREPARE of the
+		// query for the engine's answer once its client went away: the
+		// query is followed as one whose PREPARE got no answer then, and
+		// cancelled as a precaution once the lease is fresh.
+		var aborts []context.CancelFunc
+		for r := range q.waiting {
+			if r.client != nil && r.client.Err() != nil {
+				aborts = append(aborts, r.abort)
+			}
+		}
 		q.timer.Reset(fenceRetry)
 		l.mu.Unlock()
+		for _, abort := range aborts {
+			abort()
+		}
 		return
 	}
 	if len(q.waiting) == 0 && !q.unanswered {
