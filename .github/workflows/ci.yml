@@ -1,7 +1,8 @@
 # Checks for every pull request and every push to main: formatting, vet, the
 # tests (also with the race detector), cross builds, the shipped
-# configurations and manifests, shell scripts and workflows, and the end to
-# end tests against the released DuckDB with Docker Compose and kind.
+# configurations and manifests, the Helm chart, shell scripts and workflows,
+# and the end to end tests against the released DuckDB with Docker Compose
+# and kind.
 name: CI
 
 on:
@@ -105,6 +106,54 @@ jobs:
         run: |
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
           "$(go env GOPATH)/bin/actionlint"
+
+  helm:
+    name: Helm chart (Helm ${{ matrix.helm }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both major versions of Helm, built from source like the other tools.
+        helm: [v3.22.1, v4.3.2]
+    env:
+      HELM_VERSION: ${{ matrix.helm }}
+    defaults:
+      run:
+        # -o pipefail: a failing helm template must fail the pipe.
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Install helm and kubeconform
+        run: |
+          go install "helm.sh/helm/${HELM_VERSION%%.*}/cmd/helm@${HELM_VERSION}"
+          go install "github.com/yannh/kubeconform/cmd/kubeconform@${KUBECONFORM_VERSION}"
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+      - name: helm lint
+        run: |
+          helm lint --strict deploy/helm/quackmux
+          helm lint --strict deploy/helm/quackmux --set ha.enabled=true
+          helm lint --strict deploy/helm/quackmux -f test/helm/testdata/values-options.yaml
+      - name: Render and validate the chart
+        run: |
+          check() {
+            echo "== helm template $*"
+            helm template quackmux deploy/helm/quackmux --namespace quackmux --kube-version 1.30.0 "$@" |
+              kubeconform -strict -summary -kubernetes-version 1.30.0 -
+          }
+          check
+          check --set ha.enabled=true
+          check -f test/helm/testdata/values-options.yaml
+      # The rendering with default values must equal kubectl kustomize of
+      # deploy/kubernetes/base, the one with ha.enabled that of overlays/ha
+      # (test/helm, deploy/helm/quackmux/README.md).
+      - name: Compare with the Kustomize manifests, chart tests
+        run: QUACKMUX_HELM=helm go test -count=1 -v ./test/helm/
 
   e2e-compose:
     name: End-to-end (Docker Compose)
