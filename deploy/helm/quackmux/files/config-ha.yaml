@@ -73,16 +73,21 @@ profiles:
     description: "Standard engine: 1-2 CPUs, 4 GiB memory"
     image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
     imagePullPolicy: IfNotPresent
+    # Spill space twice limits.memory; the disk limit adds 2 GiB for the log
+    # and other files in /tmp (see ../../base/config.yaml).
     settings:
       memory_limit: 3GB
       threads: "2"
+      max_temp_directory_size: 8GiB
     resources:
       requests:
         cpu: "1"
         memory: 2Gi
+        ephemeral-storage: 1Gi
       limits:
         cpu: "2"
         memory: 4Gi
+        ephemeral-storage: 10Gi
 
   large:
     description: "Large engine for heavy queries: 4 CPUs, 16 GiB memory"
@@ -90,13 +95,16 @@ profiles:
     settings:
       memory_limit: 12GB
       threads: "4"
+      max_temp_directory_size: 32GiB
     resources:
       requests:
         cpu: "4"
         memory: 16Gi
+        ephemeral-storage: 1Gi
       limits:
         cpu: "4"
         memory: 16Gi
+        ephemeral-storage: 34Gi
     # warmPool:
     #   size: 0
     # startupTimeout: 10m
