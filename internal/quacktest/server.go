@@ -10,6 +10,9 @@
 //	STREAM <n> <ms> answers at once that there is more to fetch; FETCH reads
 //	                n batches, batch i is ready i*<ms> milliseconds after the
 //	                PREPARE (see statements.go)
+//	UPLOAD <ms>     answers at once that there is more to fetch, and takes
+//	                <ms> milliseconds to consume each SEND_DATA (a CANCEL or
+//	                the next PREPARE interrupts it)
 //	FAIL <message>  answers with an ERROR_RESPONSE
 //	BLOB <bytes>    answers with a PREPARE_RESPONSE followed by <bytes> filler
 //	                bytes (to exercise streaming of large bodies)
@@ -264,9 +267,7 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 	case wire.TypeCancelRequest:
 		return s.cancel(c, body[n:], &rec), 0
 	case wire.TypeSendDataRequest:
-		// accept_budget is written with WriteProperty: an unset optional_idx.
-		return append(wire.Header{Type: wire.TypeSendDataResponse}.Encode(),
-			0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xff, 0xff), 0
+		return s.sendData(c), 0
 	case wire.TypeFetchRequest:
 		return s.fetch(c, body[n:], &rec), 0
 	case wire.TypePrepareRequest:
@@ -307,6 +308,11 @@ func (s *Server) runQuery(c *conn, p wire.PrepareRequest) ([]byte, int) {
 	case "STREAM":
 		s.mu.Lock()
 		st.stream, st.batches, st.every = true, uint64(max(argN(1), 0)), time.Duration(argN(2))*time.Millisecond
+		s.mu.Unlock()
+		return prepareResponse(p.QueryUUID, true), 0
+	case "UPLOAD":
+		s.mu.Lock()
+		st.upload, st.every = true, time.Duration(arg())*time.Millisecond
 		s.mu.Unlock()
 		return prepareResponse(p.QueryUUID, true), 0
 	case "FAIL":

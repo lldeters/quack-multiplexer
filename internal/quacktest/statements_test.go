@@ -214,3 +214,31 @@ func TestDisconnectWithARequestInFlight(t *testing.T) {
 		t.Fatal("a DISCONNECT without a request in flight left the statement running")
 	}
 }
+
+// A SEND_DATA of an UPLOAD statement waits until the statement consumed its
+// batch; a CANCEL interrupts it.
+func TestUploadStatement(t *testing.T) {
+	s := NewServer("tok")
+	defer s.Close()
+	c := connect(t, s)
+	u := wire.Hugeint{Upper: 2, Lower: 2}
+	send := wire.EncodeEmpty(wire.Header{Type: wire.TypeSendDataRequest, ConnectionID: c})
+	post(t, s, wire.PrepareRequest{SQL: "UPLOAD 200", QueryUUID: u}.Encode(wire.Header{ConnectionID: c}))
+	start := time.Now()
+	if msg := errorText(t, post(t, s, send)); msg != "" || time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("SEND_DATA answered %q after %s, want success after the batch was consumed", msg, time.Since(start))
+	}
+	post(t, s, wire.PrepareRequest{SQL: "UPLOAD 60000", QueryUUID: u}.Encode(wire.Header{ConnectionID: c}))
+	answer := make(chan []byte, 1)
+	go func() { answer <- post(t, s, send) }()
+	time.Sleep(100 * time.Millisecond)
+	post(t, s, wire.EncodeCancel(c, u))
+	select {
+	case b := <-answer:
+		if msg := errorText(t, b); msg != MsgCancelled {
+			t.Fatalf("SEND_DATA of a cancelled upload answered %q", msg)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the CANCEL did not interrupt the SEND_DATA")
+	}
+}
