@@ -168,5 +168,15 @@ messages against the engine image and runs of the DuckDB 2.0 CLI through the gat
   engine therefore still waits in its PREPARE when the limit passes. When the client pulls the rows (a join with a
   local table, or an aggregate that is not pushed down), a FETCH gets the error; the client then needs seconds to
   wind down its read-aheads (5-15 s on a loaded 4-core machine with 32 MiB batches).
+- **DISCONNECT with requests in flight** (checked in `quack_server.cpp` f96420e and against DuckDB 2.0, 2026-11-25).
+  `DisconnectConnection` only erases the connection from the map of connections. Every handler holds the connection
+  (`shared_ptr` in `DispatchMessage`) while it runs, and only `~QuackConnection`, when the last handler returns,
+  aborts the statement: a PREPARE or a FETCH in flight runs on, and its statement with it, while a CANCEL after the
+  DISCONNECT gets "Invalid connection id". A query with a 3 s limit whose client sent DISCONNECT on another request
+  delivered its result after 14 s; without a request in flight the DISCONNECT ends the statement at once.
+- **A request reaches the server whole.** The `/quack` handler (`quack_http_server.cpp`) reads the whole body into a
+  `MemoryStream` before `HandleMessage`, which then serves the statement the connection has at that moment: a FETCH
+  sent before the PREPARE of its uuid, with a body that arrives after that PREPARE was installed, long-polls a batch
+  of that query.
 - **Engine-side alternative.** `SET max_execution_time = <ms>` makes the engine end a query with `INTERRUPT` "Query
   exceeded maximum execution time"; a client can change it with `SET` unless the configuration is locked.
