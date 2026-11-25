@@ -74,6 +74,8 @@ type Server struct {
 	closed   bool
 
 	http *httptest.Server
+
+	listingError string // see SetListingError
 }
 
 // NewServer starts a fake engine that accepts the given token.
@@ -222,6 +224,9 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 	}
 	c.lastRenewed = now
 	s.mu.Unlock()
+	if resp, ok := s.listConnections(h, body[n:], &rec); ok {
+		return resp, 0
+	}
 
 	switch h.Type {
 	case wire.TypeDisconnect:
