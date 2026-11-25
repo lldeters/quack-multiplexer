@@ -4,7 +4,7 @@ Diese Tests prüfen quackmux mit **echten DuckDB-2.0-Clients und -Engines**. Es 
 
 | Umgebung | Verzeichnis | Was läuft | Dauer |
 |---|---|---|---|
-| Docker Compose | [compose](compose) | Gateway mit Provider `static` vor zwei Engine-Containern, Auth `static` | ca. 1 min (plus Build) |
+| Docker Compose | [compose](compose) | Gateway mit Provider `static` vor zwei Engine-Containern, Auth `static` | ca. 1,5 min (plus Build) |
 | kind | [kind](kind) | Overlay `deploy/kubernetes/overlays/dev`: Das Gateway startet Engine-Pods selbst, auch mit Volume pro Benutzer | einige Minuten |
 
 Die Unit- und Integrationstests (`go test ./...`) brauchen weder Docker noch DuckDB. Das gilt auch für die
@@ -246,7 +246,10 @@ Die Go-Tests dieses Pakets ([fixtures_test.go](fixtures_test.go)) laufen ohne Do
 Sie prüfen die Compose-Fixtures mit dem Code des Gateways:
 
 * Beide Gateway-Konfigurationen laden mit `config.Load` (unbekannte Felder sind Fehler) und unterscheiden sich nur im
-  Session- und Engine-Timing.
+  Session- und Engine-Timing und darin, dass nur `gateway` verwaiste Verbindungen schließt (Szenario k, mit einer
+  Frist von höchstens einer Minute).
+* Das Autorisierungs-Makro des Engine-Images lässt genau die Anfrage durch, mit der das Gateway die Verbindungen
+  einer Engine listet, und seine Fälle prüfen das ([authorize_test.go](authorize_test.go)).
 * `users.yaml` akzeptiert die Tokens aus `e2e.env` über den echten `static`-Authenticator, weist den falschen Token
   ab und enthält keine Klartext-Tokens. `admin.token` und die Engine-Tokens passen zu `e2e.env`.
 * Die Handshakes von `run.sh` (Token plus Optionen) laufen durch Authentifizierung und Policy: a, c, e und f landen
