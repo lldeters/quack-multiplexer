@@ -55,7 +55,12 @@ type conn struct {
 	heartbeatTimeout time.Duration
 	lastRenewed      time.Time
 	expired          bool
-	stmt             *statement // guarded by Server.mu
+	// The fields below are guarded by Server.mu.
+	stmt *statement
+	// inFlight counts the requests of the connection being handled; gone
+	// marks a connection that DISCONNECT removed (see requestDone).
+	inFlight int
+	gone     bool
 }
 
 // HeartbeatTimeouts returns the lease each live connection negotiated.
@@ -240,13 +245,18 @@ func (s *Server) handle(body []byte, headers http.Header) (resp []byte, trailer 
 		return errorResponse("Connection heartbeat lease expired"), 0
 	}
 	c.lastRenewed = now
+	c.inFlight++
 	s.mu.Unlock()
+	defer s.requestDone(c)
 
 	switch h.Type {
 	case wire.TypeDisconnect:
-		s.endStatement(c)
+		// Like the Quack server, DISCONNECT only forgets the connection:
+		// requests that are in flight go on, and the statement ends with the
+		// last of them (see requestDone).
 		s.mu.Lock()
 		delete(s.conns, h.ConnectionID)
+		c.gone = true
 		s.mu.Unlock()
 		return wire.EncodeEmpty(wire.Header{Type: wire.TypeSuccessResponse}), 0
 	case wire.TypeHeartbeatRequest, wire.TypeAcknowledgement:

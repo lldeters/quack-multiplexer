@@ -11,7 +11,9 @@ import (
 // interrupts it with Server.Supersede), CANCEL_REQUEST interrupts it, and
 // FETCH_REQUEST reads the batches of a STREAM statement. Requests that wait
 // for an interrupted statement get its error, like those of the real server
-// (quack_server.cpp, AbortStatement).
+// (quack_server.cpp, AbortStatement). DISCONNECT_MESSAGE removes the
+// connection but interrupts its statement only once no request of the
+// connection is in flight any more (see requestDone).
 
 // Texts of the server's errors around a statement.
 const (
@@ -147,11 +149,16 @@ func (s *Server) fetch(c *conn, body []byte, rec *Received) []byte {
 	return append(head, 0x64, 0x00, 0x01, 0xff, 0xff)
 }
 
-// endStatement interrupts the statement of a connection that goes away.
-func (s *Server) endStatement(c *conn) {
+// requestDone ends a request of c. The Quack server's handlers hold the
+// connection while they run, and DISCONNECT only removes it from the map of
+// connections: the statement of a connection that DISCONNECT removed runs on
+// while a request of the connection is in flight, and is interrupted when
+// the last one returns (~QuackConnection).
+func (s *Server) requestDone(c *conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if c.stmt != nil {
+	c.inFlight--
+	if c.gone && c.inFlight == 0 && c.stmt != nil {
 		abortLocked(c.stmt, msgDisconnected)
 	}
 }
