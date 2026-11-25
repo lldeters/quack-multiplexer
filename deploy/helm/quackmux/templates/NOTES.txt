@@ -1,0 +1,35 @@
+{{- $fullname := include "quackmux.fullname" . -}}
+{{- $cfg := fromYaml (include "quackmux.config" .) -}}
+{{- $auth := toString (dig "auth" "mode" "" $cfg) -}}
+{{- $ns := .Release.Namespace -}}
+quackmux {{ .Chart.AppVersion }} in namespace {{ $ns }}: {{ if .Values.ha.enabled }}{{ include "quackmux.replicas" . }} replicas with leader election (only the leader, label quackmux.io/leader=true, receives Quack traffic){{ else }}one gateway{{ end }}.
+
+  kubectl -n {{ $ns }} rollout status deployment/{{ $fullname }}
+
+Clients in the cluster (plain HTTP unless server.tls is set):
+
+  CREATE SECRET (TYPE quack, TOKEN '<token>', SCOPE 'quack:{{ $fullname }}.{{ $ns }}.svc.cluster.local:9494');
+  ATTACH 'quack:{{ $fullname }}.{{ $ns }}.svc.cluster.local:9494' AS lake (DISABLE_SSL true);
+
+From your machine: kubectl -n {{ $ns }} port-forward svc/{{ $fullname }} 9494:9494 9495:9495
+and ATTACH 'quack:localhost:9494'.
+
+Admin API token:
+
+  kubectl -n {{ $ns }} get secret {{ include "quackmux.adminTokenSecret" . }} -o jsonpath='{.data.token}' | base64 -d
+{{- if and (eq $auth "static") (not .Values.secrets.users.existingSecret) (not .Values.users) }}
+
+WARNING: the users file defines no users, so every client is rejected. Create a
+token with "quackmux token" and add its sha256 to the values "users", then
+helm upgrade (no restart needed).
+{{- end }}
+{{- if eq $auth "none" }}
+
+WARNING: auth.mode none accepts every token and lets clients pick any user
+name. Development only.
+{{- end }}
+
+Engine pods and the data volumes of persistent profiles belong to the gateway,
+not to this release: "helm uninstall" leaves them, and its NetworkPolicies no
+longer protect the engines. Before uninstalling, scale the gateway to 0 and
+delete the engine pods; the data volumes stay (README.md, "Deinstallieren").

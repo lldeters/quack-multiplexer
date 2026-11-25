@@ -1,0 +1,23 @@
+{{- /*
+The gateway configuration, mounted at /etc/quackmux/config.yaml (see
+quackmux.config in _helpers.tpl). Check your own with
+  quackmux validate -config config.yaml
+
+Like the configMapGenerator of deploy/kubernetes/base, the name carries a
+hash of the content: a changed configuration gets a new ConfigMap, and the
+Deployment rolls out with it. Helm keeps the earlier ones
+(helm.sh/resource-policy: keep), so that a pod of an earlier ReplicaSet that
+restarts during a rollout comes back with the configuration it was started
+with, not with the new one, which may be one its gateway refuses.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "quackmux.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+data:
+  {{- dict "config.yaml" (include "quackmux.config" .) | toYaml | nindent 2 }}

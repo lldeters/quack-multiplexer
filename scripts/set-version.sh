@@ -3,7 +3,8 @@
 # set-version.sh VERSION points every reference to the published images at
 # release VERSION (without the "v"): ghcr.io/lldeters/quackmux:VERSION and
 # ghcr.io/lldeters/duckdb-engine:<duckdb>-VERSION, with <duckdb> the
-# DUCKDB_VERSION of the Makefile. See docs/releasing.md.
+# DUCKDB_VERSION of the Makefile, and sets version and appVersion of the Helm
+# chart to VERSION. See docs/releasing.md.
 #
 # IMAGE_REGISTRY overrides the registry prefix (default ghcr.io/lldeters).
 set -euo pipefail
@@ -26,4 +27,10 @@ git grep -lE "$re/(quackmux|duckdb-engine):" -- ':!.github' ':!scripts' | while 
 	' "$f"
 	echo "updated $f"
 done
+chart=deploy/helm/quackmux/Chart.yaml
+VERSION=$version perl -pi -e '
+	s{^version: .*}{version: $ENV{VERSION}};
+	s{^appVersion: .*}{appVersion: "$ENV{VERSION}"};
+' "$chart"
+echo "updated $chart"
 bash scripts/check-image-refs.sh "$version"

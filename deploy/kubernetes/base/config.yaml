@@ -4,6 +4,8 @@
 # mounted at /etc/quackmux/config.yaml. Unknown fields are rejected; check a
 # change with:  quackmux validate -config config.yaml
 # Every option with its default: examples/config.kubernetes.yaml
+# The Helm chart ships a copy (deploy/helm/quackmux/files/config.yaml); after
+# a change: go test ./test/helm/ -run TestConfigFilesMatchKustomize -update
 
 server:
   # Quack endpoint (plain HTTP; clients use ATTACH ... (DISABLE_SSL true) or

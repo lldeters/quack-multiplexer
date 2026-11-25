@@ -89,6 +89,12 @@ Kubernetes (Kustomize):
 kubectl apply -k deploy/kubernetes/base
 ```
 
+Oder mit Helm, in einen vorhandenen Namespace ([deploy/helm/quackmux](deploy/helm/quackmux/README.md)):
+
+```powershell
+helm install quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml
+```
+
 Details zu Secrets, Images und HA stehen in [deploy/kubernetes/README.md](deploy/kubernetes/README.md).
 Releases veröffentlichen Binaries und Images für amd64 und arm64 (`ghcr.io/lldeters/quackmux`,
 `ghcr.io/lldeters/duckdb-engine`); CI und Release-Ablauf beschreibt [docs/releasing.md](docs/releasing.md).
@@ -109,6 +115,7 @@ Releases veröffentlichen Binaries und Images für amd64 und arm64 (`ghcr.io/lld
 | [internal/admin](internal/admin), [internal/ha](internal/ha) | Admin-API, Metriken, Leader-Election |
 | [images/engine](images/engine) | Engine-Image (DuckDB 2.0 + quack/httpfs, tini, FIFO-Entrypoint, Autorisierungs-Makro für geteilte Engines) |
 | [deploy/kubernetes](deploy/kubernetes) | Manifeste (RBAC, NetworkPolicy, Overlays `dev`/`ha`) |
+| [deploy/helm/quackmux](deploy/helm/quackmux) | Helm-Chart mit denselben Objekten (`ha.enabled` wie `overlays/ha`) |
 | [examples](examples) | Beispielkonfigurationen und Client-SQL |
 | [test/e2e](test/e2e) | End-to-End-Tests mit echtem DuckDB (Docker Compose, kind) |
 | [docs](docs) | [Design](docs/design.md), [Protokoll](docs/protocol.md), [TLS](docs/tls.md) (Zertifikate, `ssl_fingerprint`) |

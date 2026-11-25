@@ -1,0 +1,184 @@
+{{- /*
+The gateway (deploy/kubernetes/base/deployment.yaml, with ha.enabled
+overlays/ha/deployment-patch.yaml).
+
+Without leader election exactly one gateway process may manage the engines:
+one replica and the Recreate strategy (a rolling update would briefly run two
+gateways that both launch and reap engines). Sessions survive the restart
+(sealed connection ids, the kept session key); only requests that are running
+at that moment fail. With ha.enabled every healthy replica is ready, and a
+rollout starts a new pod before it removes an old one; the leader gives its
+pod a deletion cost, so a rollout hands over exactly once.
+
+The gateway reads its configuration once at start-up. A changed one has a
+ConfigMap of a new name (configmap.yaml), so it rolls out, and the pods of
+earlier ReplicaSets keep theirs.
+*/ -}}
+{{- include "quackmux.checkOneGateway" . -}}
+{{- include "quackmux.checkHASwitch" . -}}
+{{- include "quackmux.checkGracePeriod" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "quackmux.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  replicas: {{ include "quackmux.replicas" . }}
+  revisionHistoryLimit: 5
+  strategy:
+    {{- if .Values.ha.enabled }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.ha.rollingUpdate.maxUnavailable | toJson }}
+      maxSurge: {{ .Values.ha.rollingUpdate.maxSurge | toJson }}
+    {{- else }}
+    type: Recreate
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "quackmux.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "quackmux.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "quackmux.serviceAccountName" . }}
+      # The gateway talks to the Kubernetes API (engine pods, token Secrets,
+      # data volumes, leader lease); the service account does not automount.
+      automountServiceAccountToken: true
+      # The Service would otherwise inject <NAME>_SERVICE_* and <NAME>_PORT*
+      # variables into the container.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with include "quackmux.affinity" . }}
+      affinity:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "quackmux.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image's entrypoint is the quackmux binary.
+          args: ["serve", "-config", "/etc/quackmux/config.yaml"]
+          env:
+            # Leader election identity (ha.enabled); the leader labels the
+            # pod of this name in POD_NAMESPACE.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Default namespace for engine pods and the lease.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.goMemLimit }}
+            - name: GOMEMLIMIT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: quack
+              containerPort: 9494
+              protocol: TCP
+            - name: admin
+              containerPort: 9495
+              protocol: TCP
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Read once at start-up; a change rolls out (a new ConfigMap), so
+            # a subPath mount (which never updates) is fine.
+            - name: config
+              mountPath: /etc/quackmux/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            # auth.static.file: /etc/quackmux/users/users.yaml. Mounted as a
+            # directory so that Secret updates reach the pod; the gateway
+            # reloads the file without a restart.
+            - name: users
+              mountPath: /etc/quackmux/users
+              readOnly: true
+            # admin.tokenFile: /etc/quackmux/admin/token
+            - name: admin-token
+              mountPath: /etc/quackmux/admin
+              readOnly: true
+            # server.sessionKeyFile: /etc/quackmux/session/key
+            - name: session-key
+              mountPath: /etc/quackmux/session
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "quackmux.configMapName" . }}
+        - name: users
+          secret:
+            secretName: {{ include "quackmux.usersSecret" . }}
+            defaultMode: 0440
+        - name: admin-token
+          secret:
+            secretName: {{ include "quackmux.adminTokenSecret" . }}
+            defaultMode: 0440
+        - name: session-key
+          secret:
+            secretName: {{ include "quackmux.sessionKeySecret" . }}
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

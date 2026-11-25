@@ -1,0 +1,160 @@
+# quackmux gateway configuration for Kubernetes (base deployment).
+#
+# kustomization.yaml turns this file into the ConfigMap "quackmux-config",
+# mounted at /etc/quackmux/config.yaml. Unknown fields are rejected; check a
+# change with:  quackmux validate -config config.yaml
+# Every option with its default: examples/config.kubernetes.yaml
+# The Helm chart ships a copy (deploy/helm/quackmux/files/config.yaml); after
+# a change: go test ./test/helm/ -run TestConfigFilesMatchKustomize -update
+
+server:
+  # Quack endpoint (plain HTTP; clients use ATTACH ... (DISABLE_SSL true) or
+  # an L4 load balancer that terminates TLS).
+  listen: ":9494"
+  # Seals gateway connection ids. Mounted from the Secret
+  # "quackmux-session-key"; must be identical on all replicas. With it,
+  # sessions survive gateway restarts and leader changes.
+  sessionKeyFile: /etc/quackmux/session/key
+  # HTTPS directly on the gateway (mount a TLS Secret, see README.md):
+  # tls:
+  #   certFile: /etc/quackmux/tls/tls.crt
+  #   keyFile: /etc/quackmux/tls/tls.key
+
+admin:
+  # Admin API, /healthz, /readyz and /metrics.
+  listen: ":9495"
+  # Bearer token for /api (Secret "quackmux-admin-token").
+  tokenFile: /etc/quackmux/admin/token
+
+auth:
+  mode: static
+  static:
+    # Users, groups and sha256 token hashes (Secret "quackmux-users"). The
+    # file is re-read when it changes; an invalid version is rejected and
+    # the previous users stay active.
+    file: /etc/quackmux/users/users.yaml
+    reloadInterval: 10s
+
+# Routing of a session unless the client asks for something else (token
+# options or X-Quackmux-* headers).
+defaults:
+  shareLevel: USER
+  subdomain: default
+  profile: default
+
+# Per user/group defaults and restrictions; the first match wins. Example:
+# overrides:
+#   - groups: [analytics]
+#     defaults:
+#       shareLevel: GROUP
+
+session:
+  # Close sessions without queries for this long (heartbeats do not count).
+  idleTimeout: 6h
+  # Hard upper bound for a session's age (0s = off).
+  maxLifetime: 0s
+  # Range the client's heartbeat lease is clamped to (DuckDB asks for 60s).
+  minHeartbeatTimeout: 5s
+  maxHeartbeatTimeout: 300s
+  # Added to the lease before a silent client counts as dead.
+  heartbeatGrace: 15s
+  # Lease the gateway holds at the engine; it renews it for quiet sessions.
+  backendHeartbeatTimeout: 1h
+  # Closed sessions are remembered this long for precise error messages.
+  tombstoneTTL: 1h
+  checkInterval: 5s
+
+engine:
+  # Launch budget for an engine pod (scheduling, image pull, start-up).
+  startupTimeout: 180s
+  # Terminate engines without sessions after this long, per share level.
+  # CONNECTION engines end with their session.
+  idleTimeout:
+    CONNECTION: 0s
+    USER: 30m
+    GROUP: 30m
+    SERVER: 30m
+  # Drain engines older than this (0s = off): new sessions get a new engine,
+  # existing ones finish; after drainTimeout they are closed.
+  maxLifetime: 0s
+  drainTimeout: 1h
+  # After a gateway (re)start, recovered engines are not reaped as idle for
+  # this long, so that their sessions can re-attach with the next heartbeat.
+  recoveryGrace: 180s
+  checkInterval: 5s
+  # Replace engines (drain old, launch new) when their profile changed.
+  replaceOnSpecChange: true
+  # Failed engine pods are kept this long for "kubectl describe/logs".
+  failedRetention: 10m
+
+limits:
+  # Protect the cluster (0 = unlimited).
+  maxSessions: 2000
+  maxSessionsPerUser: 100
+  maxEngines: 40
+  maxEnginesPerUser: 4
+  maxStartingEngines: 10
+
+provider:
+  type: kubernetes
+  kubernetes:
+    # Engines run next to the gateway (see networkpolicy.yaml, rbac.yaml).
+    # An overlay that moves quackmux to another namespace must change this
+    # too, or drop it (the default is the gateway's own namespace).
+    namespace: quackmux
+    # Separates several gateways in one namespace (label quackmux.io/instance).
+    instance: default
+
+profiles:
+  default:
+    description: "Standard engine: 1-2 CPUs, 4 GiB memory"
+    image: ghcr.io/lldeters/duckdb-engine:2.0.0-0.1.0
+    imagePullPolicy: IfNotPresent
+    # Applied with SET before the Quack server starts. memory_limit stays
+    # below limits.memory to leave room for allocations outside DuckDB's
+    # buffer manager.
+    settings:
+      memory_limit: 3GB
+      threads: "2"
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+
+  large:
+    description: "Large engine for heavy queries: 4 CPUs, 16 GiB memory"
+    # A dedicated engine per user or per connection only: nobody shares a
+    # large engine with other users.
+    allowedShareLevels: [USER, CONNECTION]
+    settings:
+      memory_limit: 12GB
+      threads: "4"
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+    # Pre-started engines for share_level=connection (0 = none). Each warm
+    # engine reserves the resources above while it waits.
+    # warmPool:
+    #   size: 0
+    # Large pods may need a new node first (cluster autoscaler):
+    # startupTimeout: 10m
+
+audit:
+  # Log every query (user, session, engine, truncated SQL) as a JSON line.
+  enabled: true
+  maxQueryBytes: 4096
+
+ha:
+  # Leader election for several replicas: see overlays/ha.
+  enabled: false
+
+log:
+  level: info
+  format: json

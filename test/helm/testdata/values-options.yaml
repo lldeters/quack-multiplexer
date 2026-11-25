@@ -1,0 +1,95 @@
+# Every optional object and field of the chart, for TestChartOptions and the
+# kubeconform check in CI (.github/workflows/ci.yml).
+image:
+  repository: registry.example.com/quackmux
+  tag: "1.2.3"
+  pullPolicy: Always
+imagePullSecrets:
+  - name: registry
+replicas: 3
+ha:
+  enabled: true
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+config:
+  server:
+    tls:
+      certFile: /etc/quackmux/tls/tls.crt
+      keyFile: /etc/quackmux/tls/tls.key
+  limits:
+    maxEngines: 80
+users:
+  - name: alice
+    groups: [analytics]
+    tokens:
+      - sha256: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+goMemLimit: 3600MiB
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
+podAnnotations:
+  example.com/team: data
+podLabels:
+  example.com/team: data
+extraEnv:
+  - name: QUACKMUX_EXTRA
+    value: "1"
+extraVolumes:
+  - name: tls
+    secret:
+      secretName: quackmux-tls
+      defaultMode: 0440
+extraVolumeMounts:
+  - name: tls
+    mountPath: /etc/quackmux/tls
+    readOnly: true
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: quackmux
+    effect: NoSchedule
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/arch
+              operator: In
+              values: [amd64, arm64]
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: quackmux
+        app.kubernetes.io/component: gateway
+priorityClassName: quackmux
+terminationGracePeriodSeconds: 90
+serviceAccount:
+  annotations:
+    iam.example.com/role: quackmux
+service:
+  annotations:
+    example.com/owner: data
+externalService:
+  enabled: true
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout: "30"
+  loadBalancerSourceRanges: [203.0.113.0/24]
+  loadBalancerClass: example.com/lb
+networkPolicy:
+  adminFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  engineEgress:
+    - to:
+        - namespaceSelector: {}

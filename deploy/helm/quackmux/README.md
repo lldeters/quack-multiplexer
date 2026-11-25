@@ -1,0 +1,384 @@
+# Helm-Chart für quackmux
+
+Das Chart installiert das quackmux-Gateway mit denselben Objekten wie die Kustomize-Manifeste in
+[deploy/kubernetes](../../kubernetes): mit den Default-Werten die von `base`, mit `ha.enabled` die von
+`overlays/ha`. Das Gateway startet die Engines (DuckDB 2.0 mit `quack_serve`) selbst als Pods im Namespace des
+Releases und räumt sie nach Timeouts wieder ab. Betrieb, Konfiguration, Persistenz, Härtung und Fehlersuche
+beschreibt [deploy/kubernetes/README.md](../../kubernetes/README.md); hier steht, was beim Chart anders ist.
+
+## Voraussetzungen
+
+* Kubernetes 1.30 oder neuer, Helm 3 oder 4 (CI prüft 3.22 und 4.3). Ein aus den Quellen gebautes Helm 3
+  (`go install`, wie in CI) nimmt ohne Cluster Kubernetes 1.20 an und braucht für `helm template` die Angabe
+  `--kube-version 1.30.0` (oder neuer); die Release-Binaries von Helm 3 und Helm 4 brauchen sie nicht.
+* Ein CNI, das NetworkPolicies durchsetzt, und die Images `ghcr.io/lldeters/quackmux` und
+  `ghcr.io/lldeters/duckdb-engine` wie bei Kustomize ([Voraussetzungen](../../kubernetes/README.md#voraussetzungen)).
+  Die Chart-Version ist das quackmux-Release; das Gateway-Image hat dessen Tag, das Engine-Image steht in der
+  Konfiguration (`profiles.<name>.image`).
+* **Ein Gateway pro Namespace**, also ein eigener Namespace pro Release. Die Gateway-Pods aller Releases tragen
+  dieselben Labels, und die mitgelieferte Konfiguration nennt dieselbe `provider.kubernetes.instance`: Zwei
+  Releases oder ein Release neben einer Kustomize-Installation teilten sich Service-Endpunkte,
+  PodDisruptionBudget, NetworkPolicies, Lease und Engines. `helm install` und `helm upgrade` brechen deshalb ab,
+  wenn im Namespace schon ein anderes Gateway-Deployment steht. Außerdem darf die Role des Gateways alle Secrets
+  des Namespaces lesen.
+* **Rechte für `helm install` und `helm upgrade`:** Das Chart liest dabei im Namespace des Releases die
+  Deployments, mit `ha.enabled` auch die Pods, und seine eigenen Secrets (`lookup`). Wer installiert, braucht dort
+  außer den Rechten zum Anlegen also `get` und `list` auf Deployments, Pods und Secrets; ein Namespace-Admin hat
+  sie. Fehlt eines, bricht Helm mit der Fehlermeldung der API ab.
+
+## Installation
+
+1. Namespace mit Pod Security `restricted` anlegen (Kustomize legt ihn selbst an, ein Helm-Release nicht):
+
+   ```sh
+   kubectl create namespace quackmux
+   kubectl label namespace quackmux pod-security.kubernetes.io/enforce=restricted \
+     pod-security.kubernetes.io/warn=restricted pod-security.kubernetes.io/audit=restricted
+   ```
+
+2. Benutzer anlegen: `quackmux token` liefert ein Token für den Benutzer und dessen sha256, das in eine
+   Values-Datei kommt (Format: [examples/users.yaml](../../../examples/users.yaml)):
+
+   ```yaml
+   # meine-werte.yaml
+   users:
+     - name: alice
+       groups: [analytics]            # die erste Gruppe ist der Default für share_level=group
+       tokens:
+         - sha256: "<sha256 aus quackmux token>"
+           description: "Laptop"
+   ```
+
+3. Installieren und warten:
+
+   ```sh
+   helm install quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml
+   kubectl -n quackmux rollout status deployment/quackmux
+   ```
+
+   Ein Release veröffentlicht das Chart auch als Paket (`quackmux-X.Y.Z.tgz` am GitHub-Release,
+   [docs/releasing.md](../../../docs/releasing.md)); `helm install` nimmt statt des Verzeichnisses auch dessen
+   URL.
+
+Session-Key und Admin-Token erzeugt das Chart selbst ([Secrets](#secrets)). Den Admin-Token liest man so:
+
+```sh
+kubectl -n quackmux get secret quackmux-admin-token -o jsonpath='{.data.token}' | base64 -d
+```
+
+Mit dem Release-Namen `quackmux` heißen die Objekte wie bei Kustomize: Deployment und Service `quackmux`,
+ServiceAccount, Role und RoleBinding `quackmux-gateway`, ConfigMap `quackmux-config-<hash>`, Secrets
+`quackmux-session-key`, `quackmux-admin-token`, `quackmux-users`. Ein anderer Release-Name ohne „quackmux“
+ergibt `<release>-quackmux`; `fullnameOverride` setzt den Namen direkt. Verbinden, Admin-API und Metriken wie in
+[deploy/kubernetes/README.md](../../kubernetes/README.md#verbinden), mit dem Service-Namen des Releases.
+
+## Werte
+
+Die vollständige Liste mit Kommentaren steht in [values.yaml](values.yaml). Unbekannte Schlüssel sind Fehler
+([values.schema.json](values.schema.json)): Ein Tippfehler wie `ha.enable` fällt nicht still auf einen Default
+zurück.
+
+| Wert | Default | Bedeutung |
+|---|---|---|
+| `image.repository`, `image.tag`, `image.pullPolicy` | `ghcr.io/lldeters/quackmux`, `appVersion` des Charts, `IfNotPresent` | Gateway-Image |
+| `imagePullSecrets` | `[]` | Pull-Secrets für das Gateway-Image; Engines: `profiles.<name>.imagePullSecrets` |
+| `replicas` | 1, mit `ha.enabled` 2 | mehr als eine Replika nur mit `ha.enabled` |
+| `ha.enabled` | `false` | Leader-Election wie `overlays/ha` ([Hochverfügbarkeit](#hochverfügbarkeit)) |
+| `ha.rollingUpdate.maxSurge`, `…maxUnavailable` | 1, 0 | Rollout mit `ha.enabled` |
+| `configYaml` | leer: `base/config.yaml` bzw. `overlays/ha/config.yaml` | die vollständige Gateway-Konfiguration als Text |
+| `config` | `{}` | Änderungen an der Konfiguration ([Konfiguration](#konfiguration)) |
+| `users` | `[]` | Benutzer für `auth.mode: static`; leer: niemand kann sich anmelden. Was das Gateway ablehnen würde (unbekannte Felder wie `disable`, doppelte Benutzer oder Tokens, ein `sha256` ohne 64 Hex-Ziffern), lehnt schon das Chart ab |
+| `secrets.sessionKey`, `secrets.adminToken`, `secrets.users` | erzeugt bzw. aus `users` | `existingSecret`: ein vorhandenes Secret |
+| `goMemLimit` | `1800MiB` | `GOMEMLIMIT`, etwa 10 % unter `resources.limits.memory` |
+| `resources` | Requests 250m/512 MiB, Limits 2 CPU/2 GiB | wie `base` |
+| `readinessProbe`, `livenessProbe` | wie `base` | |
+| `podSecurityContext`, `securityContext` | wie `base` (Pod Security `restricted`) | |
+| `terminationGracePeriodSeconds` | 45 | `server.shutdownTimeout` (30 s) plus Reserve; beide zusammen ändern. Einen Wert, der nicht größer ist als `server.shutdownTimeout`, lehnt das Chart ab: Kurz vorher beantwortet das Gateway die Queries, die noch warten |
+| `podAnnotations`, `podLabels` | `prometheus.io/*`, keine | am Pod-Template |
+| `extraEnv`, `extraVolumes`, `extraVolumeMounts` | keine | etwa ein TLS-Zertifikat für `server.tls` (Beispiel in `values.yaml`) |
+| `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | keine; mit `ha.enabled` eine bevorzugte `podAntiAffinity` | Scheduling des Gateways (nicht der Engines: die stehen im Profil). Die `podAntiAffinity` von `ha.enabled` bleibt neben anderen Regeln wie einer `nodeAffinity`; `affinity.podAntiAffinity` ersetzt sie, `{}` schaltet sie ab |
+| `serviceAccount.create`, `.name`, `.annotations`, `rbac.create` | an, `<name>-gateway` | ServiceAccount, Role und RoleBinding im Namespace des Releases |
+| `service.type`, `service.annotations` | `ClusterIP` | Service mit Quack-Port 9494 und Admin-Port 9495 |
+| `externalService.*` | aus | zweiter Service nur mit dem Quack-Port, Typ `LoadBalancer` (oder `NodePort`, dann ohne `loadBalancerSourceRanges` und `loadBalancerClass`), `externalTrafficPolicy: Local` |
+| `networkPolicy.enabled`, `.adminFrom`, `.engineEgress` | an, keine, wie `base` | NetworkPolicies; `adminFrom` öffnet den Admin-Port etwa für Prometheus aus einem anderen Namespace |
+| `fullnameOverride` | leer | Name der Objekte |
+
+Von außerhalb des Clusters erreichen Clients das Gateway über `externalService` (L4-Load-Balancer, nur Port
+9494; mit `ha.enabled` wählt er wie der Service den Leader). Kein L7-Ingress davor
+([Von außen](../../kubernetes/README.md#von-außen-l4-load-balancer)).
+
+## Konfiguration
+
+Ohne Angaben enthält die ConfigMap die Konfiguration von `base` (mit `ha.enabled` die von `overlays/ha`), samt
+Kommentaren. Das Chart führt dafür Kopien beider Dateien unter [files/](files); CI scheitert, sobald sie von den
+Originalen abweichen. Zwei Wege, sie zu ändern:
+
+* **`config`: Änderungen hineinmischen.** Maps werden zusammengeführt, jeder andere Wert ersetzt den bisherigen,
+  `null` entfernt einen Schlüssel. Die ConfigMap enthält dann die zusammengeführte Konfiguration ohne die
+  Kommentare der Datei.
+
+  ```yaml
+  config:
+    limits:
+      maxEngines: 80
+    profiles:
+      default:
+        image: registry.example.com/duckdb-engine:2.0.0-1.2.3   # eigene Registry
+        imagePullSecrets: [{name: registry}]
+      large: null                                             # Profil entfernen
+  ```
+
+* **`configYaml`: eine eigene, vollständige Datei** (wie `configMapGenerator` mit `behavior: replace`), auf die
+  `config` dann noch angewendet wird:
+
+  ```sh
+  helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --set-file configYaml=config.yaml
+  ```
+
+Vorher prüfen: `helm template` zeigt die ConfigMap, `quackmux validate -config config.yaml` prüft eine eigene Datei
+wie das Gateway beim Start.
+
+```sh
+helm template quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --kube-version 1.30.0 \
+  --show-only templates/configmap.yaml
+```
+
+* Eine geänderte Konfiguration rollt das Gateway aus: Wie bei Kustomize trägt der Name der ConfigMap einen Hash
+  des Inhalts (`quackmux-config-<hash>`), jede Konfiguration bekommt eine eigene. Ohne HA ist das eine kurze
+  Unterbrechung, die Sessions überleben; mit HA übergibt der Rollout an einen neuen Pod.
+* **Frühere ConfigMaps bleiben** (`helm.sh/resource-policy: keep`), auch nach `helm uninstall`: Startet während
+  eines Rollouts ein Pod des alten ReplicaSets neu (Verlust der Lease, OOM, Eviction), kommt er mit seiner
+  bisherigen Konfiguration zurück, nicht mit der neuen, die sein Gateway vielleicht ablehnt. So bleibt ein
+  Rollout, dessen neue Pods nicht ready werden, stehen, und die alten bedienen weiter (mit HA). Aufräumen, wenn
+  der Rollout fertig ist (`kubectl rollout status`), alle bis auf die aktuelle:
+
+  ```sh
+  CONFIG=$(kubectl -n quackmux get deployment quackmux \
+    -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
+  kubectl -n quackmux delete configmap -l app.kubernetes.io/name=quackmux,app.kubernetes.io/instance=quackmux \
+    --field-selector "metadata.name!=$CONFIG"
+  ```
+
+  `helm rollback` legt die ConfigMap seiner Revision bei Bedarf wieder an.
+* **Die Engines laufen im Namespace des Releases.** In einem anderen Namespace als `quackmux` setzt das Chart
+  `provider.kubernetes.namespace` der mitgelieferten Konfiguration auf den Namespace des Releases. Eine eigene
+  Konfiguration lässt den Wert weg oder nennt diesen Namespace; ein anderer bricht `helm install` mit einem Fehler
+  ab: Role, NetworkPolicies und die Daten-Volumes persistenter Profile gehören in den Namespace der Engines.
+* `ha.enabled` der Konfiguration muss zum Wert `ha.enabled` des Charts passen, sonst bricht das Chart ab.
+* `server.sessionKeyFile`, `admin.tokenFile` und `auth.static.file` zeigen auf die Pfade, unter denen das Chart
+  die Secrets einhängt (`/etc/quackmux/session/key`, `/etc/quackmux/admin/token`,
+  `/etc/quackmux/users/users.yaml`); eine eigene Konfiguration übernimmt sie.
+
+## Secrets
+
+| Secret | Schlüssel | ohne `existingSecret` |
+|---|---|---|
+| `<name>-session-key` | `key` | 43 zufällige Zeichen, beim ersten `helm install` erzeugt |
+| `<name>-admin-token` | `token` | ebenso |
+| `<name>-users` | `users.yaml` | aus dem Wert `users` |
+
+* `helm upgrade` behält Session-Key und Admin-Token: Das Chart liest die Werte der Secrets im Cluster (`lookup`)
+  und schreibt sie unverändert zurück. Sessions überleben Upgrades deshalb wie Rollouts.
+* Öffentliche Platzhalter wie bei Kustomize gibt es nicht.
+* **Ohne Cluster gibt es kein `lookup`:** `helm template`, `helm install --dry-run=client` und GitOps-Werkzeuge,
+  die mit `helm template` rendern (Argo CD), erzeugen bei jedem Rendern neue Werte; jeder Sync beendete dann alle
+  Sessions. Dort Session-Key und Admin-Token als eigene Secrets anlegen (etwa aus einem Tresor) und per
+  `secrets.sessionKey.existingSecret` und `secrets.adminToken.existingSecret` nennen:
+
+  ```sh
+  quackmux token | sed -n 's/^token: *//p' > session-key
+  quackmux token | sed -n 's/^token: *//p' > admin-token
+  kubectl -n quackmux create secret generic quackmux-session-key-own --from-file=key=session-key
+  kubectl -n quackmux create secret generic quackmux-admin-token-own --from-file=token=admin-token
+  ```
+
+* `secrets.users.existingSecret` ersetzt den Wert `users` durch ein Secret mit dem Schlüssel `users.yaml`.
+* **Helm behält die drei Secrets** (`helm.sh/resource-policy: keep`), auch wenn das Chart sie nicht mehr rendert:
+  beim Wechsel auf `existingSecret` (Pods früherer ReplicaSets hängen sie noch ein) und nach `helm uninstall`. Ein
+  neues Release desselben Namens übernimmt Session-Key und Admin-Token samt Werten; die Benutzer schreibt es aus
+  seinen Werten neu. Nach einem Wechsel auf `existingSecret` das alte Secret löschen, sobald der Rollout fertig ist
+  (das Benutzer-Secret enthält Token-Hashes oder mit `plain` die Tokens selbst):
+
+  ```sh
+  kubectl -n quackmux rollout status deployment/quackmux
+  kubectl -n quackmux delete secret quackmux-users
+  ```
+
+  Nach `helm uninstall`: [Deinstallieren](#deinstallieren).
+* **Vom erzeugten zu einem eigenen Secret** (etwa vor dem Umstieg auf Argo CD): den Wert in ein Secret mit anderem
+  Namen kopieren und dieses nennen. Den Namen eines Secrets, das das Chart erzeugt, lehnt `existingSecret` ab.
+
+  ```sh
+  kubectl -n quackmux get secret quackmux-session-key -o jsonpath='{.data.key}' | base64 -d > session-key
+  kubectl -n quackmux create secret generic quackmux-session-key-own --from-file=key=session-key
+  helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml \
+    --set secrets.sessionKey.existingSecret=quackmux-session-key-own
+  ```
+
+  Ebenso der Admin-Token (Schlüssel `token`). Der neue Name rollt das Gateway aus; der Wert ist derselbe, die
+  Sessions bleiben.
+* Änderungen: Ein neuer Session-Key beendet alle Sessions (die Clients müssen neu attachen). Session-Key und
+  Admin-Token liest das Gateway beim Start; nach einer Änderung an einem vorhandenen Secret
+  `kubectl -n quackmux rollout restart deployment/quackmux`. Die Benutzer übernimmt es ohne Neustart (nach etwa
+  einer Minute), auch nach `helm upgrade` mit geänderten `users`.
+
+## Hochverfügbarkeit
+
+```sh
+helm install quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --set ha.enabled=true
+kubectl -n quackmux rollout status deployment/quackmux
+```
+
+`ha.enabled` tut, was `overlays/ha` tut: zwei Replikas mit Leader-Election, die HA-Konfiguration, Rollouts mit
+`maxSurge: 1` und `maxUnavailable: 0`, das Label `quackmux.io/leader: "true"` im Selektor des Services (und von
+`externalService`), ein PodDisruptionBudget mit `minAvailable: 1` und eine bevorzugte `podAntiAffinity`. Beide
+Replikas sind ready, Quack-Traffic bekommt nur der Leader. Verhalten bei Übergabe, Ausfall, Rollout und
+Node-Wartung: [Hochverfügbarkeit](../../kubernetes/README.md#hochverfügbarkeit-overlaysha).
+
+* **Umstieg eines laufenden Releases:** zuerst das einzelne Gateway stoppen und warten, bis sein Pod weg ist,
+  damit nie ein Gateway ohne Leader-Election neben einem Leader läuft. `helm install` und `helm upgrade` prüfen
+  das (Replikas des Deployments, noch vorhandene Gateway-Pods) und brechen sonst ab:
+
+  ```sh
+  kubectl -n quackmux scale deployment/quackmux --replicas=0
+  kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/name=quackmux,app.kubernetes.io/component=gateway \
+    --timeout=120s
+  helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml --set ha.enabled=true
+  ```
+
+  Zurück ohne HA genügt `helm upgrade` mit `ha.enabled=false` (oder `helm rollback` auf eine Revision ohne HA):
+  Die Strategie `Recreate` beendet alle alten Pods, bevor der neue startet.
+* **`helm rollback` prüft nichts:** Es rendert das Chart nicht, sondern spielt die gespeicherte Revision ein.
+  Läuft das Gateway ohne HA, startet ein Rollback auf eine Revision mit `ha.enabled` Leader neben ihm (beim Wechsel
+  von `Recreate` auf `RollingUpdate` skaliert der Deployment-Controller sogar das alte ReplicaSet mit hoch). Davor
+  also dieselben Schritte: auf 0 skalieren, warten, bis der Pod weg ist, dann `helm rollback`. Dasselbe gilt für
+  den automatischen Rollback von `helm upgrade --atomic` (Helm 3) und `--rollback-on-failure` (Helm 4): nicht für
+  ein Upgrade verwenden, das `ha.enabled` ändert. GitOps-Werkzeuge, die mit `helm template` rendern (Argo CD),
+  prüfen ebenfalls nichts: vor dem Sync, der `ha.enabled` einschaltet, Auto-Sync aussetzen, auf 0 skalieren und
+  warten.
+* Ohne Platz für einen dritten Gateway-Pod: `ha.rollingUpdate.maxSurge=0` und `ha.rollingUpdate.maxUnavailable=1`.
+* Die Lease (`ha.leaseName`, `ha.namespace`, `provider.kubernetes.instance`) nicht per Upgrade ändern
+  ([Lease nicht per Rollout ändern](../../kubernetes/README.md#hochverfügbarkeit-overlaysha)).
+
+## Upgrade
+
+```sh
+helm upgrade quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml
+```
+
+Die Werte in einer Datei halten und bei jedem Upgrade angeben: Mit `-f` oder `--set` gilt für alles Übrige der
+Default des (neuen) Charts; ganz ohne `-f` und `--set` übernimmt `helm upgrade` die Werte der letzten Revision.
+`--reuse-values` nicht verwenden: Es setzt die alten Werte an die Stelle der Defaults des neuen Charts, neue oder
+geänderte Defaults kommen so nie an, und ein Schlüssel, den das neue Chart nicht mehr kennt, scheitert am Schema.
+Wer auf den letzten Werten aufbauen will, nimmt `--reset-then-reuse-values` (Helm 3.14 und neuer, Helm 4).
+
+Ein neues Chart bringt das Gateway-Image seines Releases und dessen Konfiguration mit. Laufende Engines behalten
+ihr Image, bis sie enden; ändert sich ihr Profil, ersetzt das Gateway sie (`engine.replaceOnSpecChange`). Werden
+die neuen Pods nicht ready (eine Konfiguration, die das Gateway ablehnt, ein Image, das sich nicht ziehen lässt),
+bleibt der Rollout mit HA stehen, und die alten Pods bedienen mit ihrer Konfiguration weiter; ohne HA ist das
+Gateway bis zur Korrektur weg (`Recreate`). `helm upgrade --wait` meldet das als Fehler; mit `--atomic` (Helm 3)
+bzw. `--rollback-on-failure` (Helm 4) rollt Helm dann selbst zurück, außer bei einem Wechsel von `ha.enabled`
+([Hochverfügbarkeit](#hochverfügbarkeit)). `helm rollback` stellt Konfiguration und Image einer früheren Revision
+wieder her.
+
+## Deinstallieren
+
+Zuerst das Gateway stoppen und die Engines löschen, dann deinstallieren:
+
+```sh
+kubectl -n quackmux scale deployment/quackmux --replicas=0
+kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/name=quackmux,app.kubernetes.io/component=gateway \
+  --timeout=120s
+kubectl -n quackmux delete pod -l app.kubernetes.io/component=engine,app.kubernetes.io/managed-by=quackmux
+helm -n quackmux uninstall quackmux
+```
+
+Die Engine-Pods hat das Gateway selbst angelegt; sie gehören nicht zum Release und liefen nach `helm uninstall`
+weiter, ohne die NetworkPolicies des Releases: Jeder Pod im Cluster erreichte dann ihren Quack-Port (ihr Token
+kann jeder Benutzer einer geteilten Engine lesen), und die Sperre des Metadata-Dienstes fiele weg. Das Gateway
+zuerst, weil es Engines des Warm-Pools sonst gleich wieder startet. Die Token-Secrets der Engines gehen mit ihren
+Pods. Wer nur neu installieren und die Engines behalten will, deinstalliert nicht, sondern nimmt `helm upgrade`
+oder `helm rollback`.
+
+`helm uninstall` entfernt die Objekte des Charts bis auf die, die Helm behält. Es bleiben:
+
+* **Die Secrets (Session-Key, Admin-Token, Benutzer) und die ConfigMaps** (`helm.sh/resource-policy: keep`); ein
+  neues Release desselben Namens übernimmt sie. Ein Release mit anderem Namen, aber denselben Objektnamen (etwa
+  über `fullnameOverride`), lehnt Helm ab, solange sie da sind: Sie gehören noch dem alten Release. Entfernen:
+
+  ```sh
+  kubectl -n quackmux delete configmap,secret -l app.kubernetes.io/name=quackmux,app.kubernetes.io/instance=quackmux
+  ```
+
+* **Daten-Volumes persistenter Profile** (PersistentVolumeClaims `quackmux-data-…`) bleiben mit den Daten
+  erhalten; ein neues Release im selben Namespace (mit derselben `provider.kubernetes.instance`) findet sie über
+  ihre Namen wieder. **Wer sie löscht, löscht die Daten**: `kubectl delete pvc` oder das Löschen des Namespaces
+  entfernt alle Claims, mit `reclaimPolicy: Delete` der StorageClass (der Default bei kind und den meisten Clouds)
+  auch die Volumes. Für Daten, die bleiben sollen: eine StorageClass mit `reclaimPolicy: Retain` und Backups
+  ([Persistente Daten](../../kubernetes/README.md#persistente-daten)).
+* Die Lease (mit `ha.enabled`, `quackmux-default`) und der Namespace selbst bleiben ebenfalls;
+  `kubectl delete namespace quackmux` entfernt alles, die Daten eingeschlossen.
+
+## Umstieg von Kustomize
+
+Helm übernimmt keine Objekte, die `kubectl apply -k` angelegt hat. Engines und Volumes laufen weiter, das neue
+Gateway findet sie wieder (gleiche `provider.kubernetes.instance` und gleicher Namespace). Damit auch die Sessions
+überleben, behält man den bisherigen Session-Key:
+
+```sh
+kubectl -n quackmux scale deployment/quackmux --replicas=0
+kubectl -n quackmux wait --for=delete pod -l app.kubernetes.io/component=gateway --timeout=120s
+SESSION_KEY=$(kubectl -n quackmux get deployment quackmux \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="session-key")].secret.secretName}')
+kubectl -n quackmux delete deployment,service,serviceaccount,role,rolebinding,networkpolicy,poddisruptionbudget,configmap \
+  -l app.kubernetes.io/part-of=quackmux
+kubectl -n quackmux delete secret -l app.kubernetes.io/part-of=quackmux --field-selector "metadata.name!=$SESSION_KEY"
+helm install quackmux deploy/helm/quackmux -n quackmux -f meine-werte.yaml \
+  --set secrets.sessionKey.existingSecret="$SESSION_KEY"
+```
+
+Den Namespace nicht löschen (`kubectl delete -k` täte das, samt den Daten-Volumes). Die Benutzer kommen aus
+`users` (oder `secrets.users.existingSecret`), die Konfiguration aus `configYaml` und `config`; der Admin-Token
+ist neu. Mit `overlays/ha` zusätzlich `--set ha.enabled=true`.
+
+## Unterschiede zu Kustomize
+
+CI rendert das Chart mit den Default-Werten und mit `ha.enabled` und vergleicht jedes Objekt mit
+`kubectl kustomize deploy/kubernetes/base` bzw. `overlays/ha` ([test/helm](../../../test/helm)). Gleich sein muss
+alles außer:
+
+1. **Helm-Metadaten:** Die Objekte des Charts tragen zusätzlich die Helm-Labels `helm.sh/chart`,
+   `app.kubernetes.io/instance`, `app.kubernetes.io/version` und `app.kubernetes.io/managed-by: Helm` (nicht am
+   Pod-Template: Die Selektoren und Pod-Labels sind dieselben); was Helm behalten soll, die Annotation
+   `helm.sh/resource-policy: keep`.
+2. **Hash im Namen:** Kustomize hängt an ConfigMap, Session-Key- und Admin-Token-Secret einen Hash des Inhalts,
+   das Chart einen eigenen an die ConfigMap. Die Secrets haben feste Namen (das Chart behält ihre Werte); zurück
+   geht es mit `helm rollback` statt `kubectl rollout undo`.
+3. **Secret-Inhalte** (verglichen werden nur die Schlüssel): Kustomize liefert öffentliche Platzhalter, das Chart
+   erzeugt Session-Key und Admin-Token und baut `users.yaml` aus den Werten.
+4. **Kein Namespace-Objekt:** Das Release kommt in einen vorhandenen Namespace (siehe Installation).
+
+Dazu kommt Verhalten, das Kustomize nicht hat: Die mitgelieferte Konfiguration folgt dem Namespace des Releases,
+und das Chart bricht ab bei mehreren Replikas ohne `ha.enabled`, bei einer Replika mit `ha.enabled`, bei
+Konfiguration und Wert `ha.enabled`, die nicht zusammenpassen, bei Engines außerhalb des Namespaces des Releases,
+bei einem zweiten Gateway im Namespace und beim Umstieg auf HA, solange das Gateway ohne Leader-Election läuft
+(die letzten beiden prüfen nur `helm install` und `helm upgrade`).
+
+Ändert sich `base/config.yaml` oder `overlays/ha/config.yaml`, schlägt `go test ./test/helm/` fehl, bis die
+Kopien in `files/` nachgezogen sind:
+
+```sh
+go test ./test/helm/ -run TestConfigFilesMatchKustomize -update
+```
+
+Die übrigen Prüfungen brauchen `helm` und `kubectl` (Helm etwa per
+`go install helm.sh/helm/v3/cmd/helm@v3.22.1`):
+
+```sh
+helm lint --strict deploy/helm/quackmux
+QUACKMUX_HELM=helm go test -count=1 ./test/helm/
+```
+
+Was nur mit einem Cluster geht (`lookup`: erhaltene Secrets, die Abbrüche bei einem zweiten Gateway und beim
+verfrühten Umstieg auf HA; ConfigMaps, die Helm behält, Rollback, Deinstallation), prüft
+[test/e2e/kind/helm.sh](../../../test/e2e/kind/helm.sh) in kind, in CI nach den übrigen kind-Szenarien.

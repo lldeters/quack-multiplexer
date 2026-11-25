@@ -1,7 +1,9 @@
 # quackmux auf Kubernetes
 
 Kustomize-Manifeste für das quackmux-Gateway. Das Gateway startet die Engines (DuckDB 2.0 mit
-`quack_serve`) selbst als Pods in seinem Namespace und räumt sie nach Timeouts wieder ab.
+`quack_serve`) selbst als Pods in seinem Namespace und räumt sie nach Timeouts wieder ab. Dieselben Objekte
+installiert das Helm-Chart [deploy/helm/quackmux](../helm/quackmux/README.md) (mit `ha.enabled` die von
+`overlays/ha`); was dort anders ist, steht in dessen README, alles andere gilt für beide.
 
 ```
 deploy/kubernetes/

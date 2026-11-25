@@ -1,5 +1,6 @@
 # Release for a tag vX.Y.Z (see docs/releasing.md): the checks, cross-compiled
-# binaries with SHA256SUMS as a GitHub release, and multi-arch images on GHCR:
+# binaries and the Helm chart with SHA256SUMS as a GitHub release, and
+# multi-arch images on GHCR:
 #   ghcr.io/<owner>/quackmux:X.Y.Z                (also :X.Y and :latest)
 #   ghcr.io/<owner>/duckdb-engine:<duckdb>-X.Y.Z  (also :<duckdb>)
 # Pre-releases (vX.Y.Z-rc.1) get only the full version tags.
@@ -15,6 +16,9 @@ permissions:
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  HELM_VERSION: v4.3.2
 
 jobs:
   verify:
@@ -94,6 +98,17 @@ jobs:
             fi
             rm -r "dist/${name:?}"
           done
+      # Version and appVersion of the chart are the release (the verify job
+      # checked them with check-image-refs.sh).
+      - name: Helm chart
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          go install "helm.sh/helm/${HELM_VERSION%%.*}/cmd/helm@${HELM_VERSION}"
+          "$(go env GOPATH)/bin/helm" package deploy/helm/quackmux --destination dist
+          test -f "dist/quackmux-$VERSION.tgz"
+      - name: Checksums
+        run: |
           (cd dist && sha256sum -- * >SHA256SUMS)
           cat dist/SHA256SUMS
       - name: GitHub release

@@ -1,0 +1,17 @@
+# The quackmux gateway for Kubernetes, equivalent to deploy/kubernetes/base
+# and, with ha.enabled, overlays/ha (README.md).
+#
+# version and appVersion are the release (scripts/set-version.sh sets both,
+# scripts/check-image-refs.sh checks them); the gateway image tag defaults to
+# appVersion.
+apiVersion: v2
+name: quackmux
+description: Gateway for DuckDB Quack that multiplexes sessions onto engine pods it starts and stops itself (like Apache Kyuubi)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"
+keywords:
+  - duckdb
+  - quack
+  - gateway

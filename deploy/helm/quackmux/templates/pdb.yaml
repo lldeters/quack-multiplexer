@@ -1,0 +1,22 @@
+{{- /*
+With ha.enabled (overlays/ha/pdb.yaml): keeps one ready gateway through
+voluntary evictions such as "kubectl drain". Followers are ready too, so the
+leader may be evicted while a follower is ready: it removes its label,
+releases the lease, and the follower takes over within seconds. The last
+ready replica is never evicted; an unready one always may be.
+*/ -}}
+{{- if .Values.ha.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "quackmux.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "quackmux.selectorLabels" . | nindent 6 }}
+{{- end }}
