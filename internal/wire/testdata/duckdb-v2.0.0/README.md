@@ -37,6 +37,21 @@ Files named `*.truncated.bin` hold the first 4096 bytes of a large message
 | `error-invalid-connection-id.bin` | heartbeat with an unknown connection id |
 | `error-lease-expired.bin` | heartbeat after the client was killed and its 2 s lease ran out |
 
+The query results below were recorded on 2026-11-25 from the same engine
+image with a raw Quack client built on this package (`result_test.go`). Each
+file is a complete answer to a PREPARE_REQUEST that asked for up to 65536
+inline rows, unless noted.
+
+| File | Query |
+|---|---|
+| `prepare-active-connections-response.bin` | `SELECT connection_id FROM quack_active_connections()` with `query_uuid {0,0}` from a control connection, with two other connections open: three rows, the asking connection among them |
+| `error-active-connections-limit.bin` | the same query with 2049 connections open: `quack_active_connections()` writes every row into one vector of 2048 |
+| `prepare-varchar-nulls-response.bin` | `SELECT CASE WHEN range % 3 = 0 THEN NULL ELSE 'v' \|\| range END AS v FROM range(7)` (a validity mask) |
+| `prepare-varchar-constant-response.bin` | `SELECT 'quack' AS c FROM range(1500)` (one chunk with a constant vector) |
+| `prepare-varchar-chunks-response.bin` | `SELECT 'row ' \|\| range AS v FROM range(3000)` (two chunks, 2048 and 952 rows) |
+| `prepare-varchar-fetch-response.bin` | `SELECT range::VARCHAR AS v FROM range(30000)` with `inline_rows = 0` (no rows inline, `needs_more_fetch`) |
+| `prepare-integer-response.bin` | `SELECT 42 AS n` (an INTEGER column) |
+
 To check a whole recording, point `QUACK_CAPTURE_DIR` at a directory with
 `NNNN-req.bin`, `NNNN-resp.bin` and `NNNN.meta` files (first line
 `POST /quack`) and run `go test ./internal/wire/ -run RealTraffic`.

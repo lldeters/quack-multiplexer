@@ -175,5 +175,102 @@ docker compose and kind (Kubernetes v1.37). Recordings of the traffic are fixtur
   - What the init SQL creates stays visible to every session: paths of attached databases (`duckdb_databases()`,
     query strings included), view and macro definitions (`duckdb_views()`, `duckdb_functions()`), name, scope and
     `KEY_ID` of secrets.
+- **Listing the connections of an engine** (for the orphan sweep, checked on 2026-11-25 against the engine image,
+  source `src/quack_active_connections.cpp`, `src/quack_server.cpp`):
+  - `quack_active_connections()` returns `server_id`, `connection_id`, `query`, `state`, `client_id_hash`
+    (VARCHAR), `cached_rows` (BIGINT) and `query_started_at` (TIMESTAMP), one row per entry of the server's
+    connection table: the connection that asks is listed as well, and so are connections whose lease ran out but
+    that no request touched since (expiry is lazy). The authorization callback runs on a connection of its own
+    that is not listed. Connection ids are 32 upper-case hex characters.
+  - The scan writes all rows into one output vector: with more than 2048 connections it fails with
+    `Vector::SetValue index 2048 is out of range for vector with capacity 2048` (Invalid Input, the engine stays
+    usable); 2048 list fine.
+  - The rows of a PREPARE come inline: the server drains whole result batches until `inline_rows` (from the
+    request, else `quack_prepare_inline_rows`, 24576) is reached, so one batch may exceed it; `inline_rows = 0`
+    sends none and sets `needs_more_fetch`. Chunks have up to 2048 rows; chunks below 1024 rows are merged into
+    flat ones (`QuackChunkStager`), larger ones keep their vector form (a constant vector stays constant). The
+    layout of the inline DataChunks (storage V2_0_0) is in `internal/wire/result.go`; recordings are in
+    `internal/wire/testdata/duckdb-v2.0.0`.
+  - Every message for a connection runs `RenewConnectionLease` before its handler. For a connection whose lease
+    ran out, a HEARTBEAT (like any other message) answers `Connection heartbeat lease expired`, removes it and
+    interrupts a query that runs on it (`CleanupExpiredConnection`: checked with a CPU-bound query on a 4-second
+    lease, its PREPARE answered `connection heartbeat lease expired` (INTERRUPT) 8 ms after the HEARTBEAT, CPU
+    97 % to 0 %); the next message answers `Invalid connection id`. For a valid lease the HEARTBEAT only renews it.
+    So a probe with HEARTBEAT removes exactly the connections that nobody can use any more.
+  - DISCONNECT of a connection with a valid lease removes it, but does not stop a query that runs on it (the
+    handler keeps the connection until the query ends); CANCEL with the wildcard uuid first interrupts it at once.
+  - A DuckDB client heartbeats `timeout/3 · U(0.8, 1.2)` after the previous heartbeat returned
+    (`QuackPeriodicWorker`), so a live client sends at least one message within `0.4 × timeout` of the gateway
+    becoming reachable, unless its previous heartbeat hangs. It does hang: the client keeps one keep-alive HTTP
+    connection, a heartbeat waits up to `HTTP_TIMEOUT_SECONDS` (86400 s) without retries, and when the gateway's
+    node vanishes without FIN or RST, it waits until TCP gives up (`tcp_retries2`, about 15 min by default), on a
+    frozen gateway until that is killed. A review experiment (gateway A lost its network and was killed, B took
+    over under the same name, `tcp_retries2=8`) saw the first message of the client at B 107 s later.
+  - In a SQL macro, `=` does not resolve through the catalog (a macro named `=` changes nothing), but
+    `default_collation = 'nocase'` makes `sql = '…'` case-insensitive; `sql = ('…' COLLATE c)` compares bytes
+    under any default collation. `COLLATE` on a bare macro parameter fails at `CREATE MACRO` ("collations are
+    only supported for type varchar"). `FROM r.query('<text>')` of a client sends `<text>` verbatim.
 - **Kubernetes.** From Kubernetes 1.35 on the kubelet refuses hosts with cgroup v1 (`failCgroupV1: true`); kind needs
   a KubeletConfiguration patch there (`test/e2e/README.md`).
+
+## Query lifecycle and CANCEL (checked against DuckDB v2.0.0, 2026-11-23)
+
+The facts behind the query time limit (`internal/proxy/querylimit.go`). Source: `quack_server.cpp`
+(`HandleMessageInternal`, `AbortStatement`), `quack_scan.cpp`, `quack_fetch_ahead.cpp`; probes with raw Quack
+messages against the engine image and runs of the DuckDB 2.0 CLI through the gateway.
+
+- **One statement per connection.** Every PREPARE replaces the connection's statement (`AbortStatement`, also with
+  `query_uuid {0,0}`), but only after `quack_authorization_function` allowed it; a PREPARE that is denied or cannot be
+  decoded leaves the running statement alone. The replaced PREPARE gets `INTERRUPT` "superseded by a new query",
+  later FETCHes of its uuid "Result has been closed".
+- **CANCEL.** `{0,0}` cancels whatever runs. Another uuid must be the uuid of the connection's statement, else the
+  answer is "Attempted to cancel a different query with id '…' instead of '…'" and nothing happens. The statement keeps
+  its uuid after it finished, so a CANCEL with the uuid of a finished query succeeds. A waiting PREPARE and every
+  waiting FETCH get `INTERRUPT` "Interrupted: query was cancelled" at once, later FETCHes of the uuid the same error;
+  the next PREPARE works. The upload streams of the statement are closed.
+- **`quack_cancel(catalog, connection_id)`** (`quack_cancel.cpp`) is a client-side table function: it sends CANCEL
+  with the zero uuid and the *target* connection id in the header over the catalog's connection. Through the gateway
+  the target must be a gateway connection id like any other routed request.
+- **Idle CANCEL is harmless.** A CANCEL (own uuid or `{0,0}`) on a connection whose query is over, also inside
+  `BEGIN … COMMIT`, does not affect the next statement or the commit. Cancelling a running query inside a transaction
+  aborts it ("Current transaction is aborted (please ROLLBACK)"); the transaction is rolled back.
+- **End of a result.** PREPARE answers once `quack_prepare_inline_rows` rows or the end are there; `needs_more_fetch`
+  (field 3) follows the result types (field 1, `vector<LogicalType>` with nested type infos and values), so a proxy
+  needs a full LogicalType decoder to read it. A FETCH beyond the last batch gets `FETCH_RESPONSE` without
+  `chunk_count` (body `02 00 <total> ff ff`); a data batch starts `01 00 <chunk_count> 03 00 <batch_index> ff ff`.
+  FETCH with batch index 0 gets "FETCH_REQUEST is missing its batch index".
+- **Client.** Each query has a random uuid. The fetcher sends read-ahead FETCHes (16 with 4 cores) and finishes a
+  scan only when every one is answered, so late read-aheads do not overlap the next query. A scan that stops early
+  sends CANCEL with its uuid (`~QuackScanBindData`), except catalog scans, whose bind data keeps uuid `{0,0}`.
+- **Where long queries meet the limit.** DuckDB 2.0 often pushes an aggregate over `remote.query(…)` into the engine
+  (`SELECT count(*) FROM remote.query(…)` was pushed, `SELECT 'x=' || CAST(count(*) AS VARCHAR) FROM remote.query(…)`
+  was not: the client fetched every row). Results are cut into batches of up to 32 MiB (`quack_target_batch_bytes`),
+  emitted in order; a selective filter over a huge range emitted nothing until its end. A long query computed on the
+  engine therefore still waits in its PREPARE when the limit passes. When the client pulls the rows (a join with a
+  local table, or an aggregate that is not pushed down), a FETCH gets the error; the client then needs seconds to
+  wind down its read-aheads (5-15 s on a loaded 4-core machine with 32 MiB batches).
+- **DISCONNECT with requests in flight** (checked in `quack_server.cpp` f96420e and against DuckDB 2.0, 2026-11-25).
+  `DisconnectConnection` only erases the connection from the map of connections. Every handler holds the connection
+  (`shared_ptr` in `DispatchMessage`) while it runs, and only `~QuackConnection`, when the last handler returns,
+  aborts the statement: a PREPARE or a FETCH in flight runs on, and its statement with it, while a CANCEL after the
+  DISCONNECT gets "Invalid connection id". A query with a 3 s limit whose client sent DISCONNECT on another request
+  delivered its result after 14 s; without a request in flight the DISCONNECT ends the statement at once.
+- **A request reaches the server whole.** The `/quack` handler (`quack_http_server.cpp`) reads the whole body into a
+  `MemoryStream` before `HandleMessage`, which then serves the statement the connection has at that moment: a FETCH
+  sent before the PREPARE of its uuid, with a body that arrives after that PREPARE was installed, long-polls a batch
+  of that query.
+- **Engine-side alternative.** `SET max_execution_time = <ms>` makes the engine end a query with `INTERRUPT` "Query
+  exceeded maximum execution time"; a client can change it with `SET` unless the configuration is locked. Checked
+  with DuckDB 2.0 on 2026-11-25: in the init SQL, a plain `SET max_execution_time = 2000` stays with the init
+  connection (sessions see `0`, a count over 10^11 rows ran 8 s), while `SET GLOBAL max_execution_time = 2000;
+  SET lock_configuration = true` holds for every session: they see `2000`, the count ends after 2.0 s, and their
+  `SET` or `SET GLOBAL` of it fails ("the configuration has been locked"). It also ends a statement that no
+  request waits for: a PREPARE with `inline_rows 0` answered at once, left alone, stopped the engine's work after
+  2 s, and the next FETCH got the engine's error.
+- **Statements that run on after their PREPARE was answered** (checked against DuckDB 2.0, 2026-11-25). The engine
+  runs a statement on a thread of its own: with `inline_rows 0` it answers the PREPARE after planning, and of a SQL
+  text with several statements the later ones run after the answer that carries the first one's rows (a
+  `CREATE TABLE ... AS` after a `SELECT` ran about 15 s with a limit of 3 s and committed, when the client fetched
+  nothing). The fetch stream ends only after the last statement: the stock client, which fetches its result, got
+  the timeout error after 3 s for `remote.query('SELECT * FROM range(30000); CREATE TABLE ... AS ...')`, and the
+  table was not created.

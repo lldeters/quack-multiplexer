@@ -174,8 +174,8 @@ make docker-engine        # mit geprüftem Download (DUCKDB_SHA256_* im Makefile
 Der Build-Kontext ist `images/engine`. Beim Bauen lädt Docker das Release von GitHub und die Extensions von
 `extensions.duckdb.org`. Am Ende startet der Build `quackmux-engine-selftest` im fertigen Image als UID 1000: Start,
 `GET /`, kein Token in Ausgabe und Prozessargumenten, `SIGTERM`, Exit-Code 0, ein Init-SQL-Ergebnis in einer
-Datenbankdatei und eine gehärtete Engine mit den Fällen des Autorisierungs-Makros. Schlägt der Test fehl, bricht der
-Build mit dem Log der Engine ab.
+Datenbankdatei und zwei gehärtete Engines mit den Fällen des Autorisierungs-Makros (`quackmux_authorize` und
+`quackmux_authorize_listing`). Schlägt der Test fehl, bricht der Build mit dem Log der Engine ab.
 
 | Build-Argument | Default | Bedeutung |
 |---|---|---|
@@ -328,9 +328,23 @@ Datenbankdatei darauf kann nur eine Engine schreibend öffnen. Beides beschreibt
   -e QUACKMUX_POST_START_SQL="SET enable_external_access = false; SET lock_configuration = true;"
   ```
 
-  Was es abdeckt und was nicht: [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Gehärtete
-  geteilte Engines“. Der Selbsttest prüft diese Kombination mit den Fällen aus
+  Das Makro `quackmux_authorize` lehnt auch `SELECT connection_id FROM quack_active_connections()` ab, die Anfrage,
+  mit der das Gateway nach einem Neustart die Verbindungen der Engine listet, um verwaiste zu schließen. Die Variante
+  `quackmux_authorize_listing` lässt genau diesen Text durch; sie gehört ins Init-SQL nach das `.read`:
+
+  ```sql
+  SET GLOBAL quack_authorization_function = 'quackmux_authorize_listing';
+  ```
+
+  Damit kann aber jede Session die Verbindungs-IDs der Engine lesen, und die sind Bearer-Credentials: Wer den Port
+  der Engine direkt erreicht, kann mit einer fremden ID die Verbindung einer anderen Session benutzen. Die Variante
+  passt also nur, wenn außer dem Gateway niemand den Port erreicht (eine durchgesetzte NetworkPolicy, eine
+  Firewall).
+
+  Was das Makro abdeckt und was nicht: [deploy/kubernetes/README.md](../../deploy/kubernetes/README.md), „Gehärtete
+  geteilte Engines“. Der Selbsttest prüft beide Varianten mit den Fällen aus
   [`authorize-cases.tsv`](authorize-cases.tsv); eine laufende Engine oder ein Gateway davor prüft
-  `QUACK_TOKEN=<token> quackmux-authorize-test <host>:<port>` aus dem Image.
+  `QUACK_TOKEN=<token> quackmux-authorize-test <host>:<port>` aus dem Image (`QUACKMUX_TEST_LISTING=1` für
+  `quackmux_authorize_listing`).
 * Das Extension-Verzeichnis ist schreibgeschützt und Autoinstall ist aus. Engines brauchen deshalb keinen
   Internetzugang.

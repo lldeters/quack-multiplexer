@@ -12,18 +12,21 @@
 # /usr/local/share/quackmux/authorize-cases.tsv, which describes the format)
 # one after the other and compares each outcome with the expected one:
 #
-#   BLOCK  rejected by the macro ("quackmux_authorize: not allowed ...")
-#   PERM   refused by DuckDB: no file or network access
-#   LOCK   refused by DuckDB: the configuration is locked
-#   ERR    an error of any kind
-#   OK     no error
+#   BLOCK    rejected by the macro ("quackmux_authorize: not allowed ...")
+#   PERM     refused by DuckDB: no file or network access
+#   LOCK     refused by DuckDB: the configuration is locked
+#   ERR      an error of any kind
+#   OK       no error
+#   LISTING  the listing of the gateway: OK with QUACKMUX_TEST_LISTING=1 (the
+#            engine runs quackmux_authorize_listing), BLOCK otherwise
 #
 # Neither the token nor QUACKMUX_TEST_SECRET (for example the engine token
 # behind a gateway) may appear in the output of the client (checked for
 # values of at least 16 characters). The script prints the cases that fail
 # and a summary, and exits with status 0 only if every case passes.
 # QUACKMUX_TEST_VERBOSE=1 prints every case, QUACKMUX_TEST_OUT=DIR keeps the
-# client's script and output in DIR.
+# client's script and output in DIR. QUACKMUX_TEST_LISTING=1 checks an engine
+# that runs quackmux_authorize_listing instead of quackmux_authorize.
 #
 # It needs only bash, coreutils, grep and the DuckDB CLI with the quack
 # extension (QUACKMUX_DUCKDB_BIN; QUACKMUX_EXTENSION_DIR, default
@@ -96,7 +99,7 @@ while IFS=$'\t' read -r id exp k text || [[ -n $id ]]; do
 		die "$cases:$n: the id '$id' is invalid or not unique"
 	fi
 	case $exp in
-	BLOCK | PERM | LOCK | ERR | OK) ;;
+	BLOCK | PERM | LOCK | ERR | OK | LISTING) ;;
 	*) die "$cases:$n: unknown outcome '$exp'" ;;
 	esac
 	case $k in
@@ -169,9 +172,15 @@ report() {
 
 pass=0 failed=0
 for id in "${ids[@]}"; do
-	ok=0 out=${got[$id]-}
+	ok=0 out=${got[$id]-} exp=${expect[$id]}
+	if [[ $exp == LISTING ]]; then
+		exp=BLOCK
+		if [[ ${QUACKMUX_TEST_LISTING:-} == 1 ]]; then
+			exp=OK
+		fi
+	fi
 	if [[ -v got[$id] ]]; then
-		case ${expect[$id]} in
+		case $exp in
 		BLOCK) [[ $out == *"quackmux_authorize: not allowed on this engine"* ]] && ok=1 ;;
 		PERM) [[ $out == *"Permission Error"* && $out != *quackmux_authorize:* ]] && ok=1 ;;
 		LOCK) [[ $out == *"the configuration has been locked"* && $out != *quackmux_authorize:* ]] && ok=1 ;;
@@ -214,5 +223,9 @@ if [[ -s $work/secrets ]] && grep -qF -f "$work/secrets" "$work/client.out" "$wo
 fi
 rm -f -- "$work/secrets"
 
-printf 'authorization cases: %d passed, %d failed\n' "$pass" "$failed"
+variant=quackmux_authorize
+if [[ ${QUACKMUX_TEST_LISTING:-} == 1 ]]; then
+	variant=quackmux_authorize_listing
+fi
+printf 'authorization cases (%s): %d passed, %d failed\n' "$variant" "$pass" "$failed"
 ((failed == 0))

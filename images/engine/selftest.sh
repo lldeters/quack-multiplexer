@@ -2,17 +2,18 @@
 #
 # quackmux-engine-selftest - smoke test of the quackmux engine image.
 #
-# Runs the entrypoint in three scenarios: once with the image defaults, once
+# Runs the entrypoint in four scenarios: once with the image defaults, once
 # with a database file, init and post-start SQL from the environment and from
-# a file, and server settings, once hardened like a shared engine (the
-# authorization macro of the image and the post-start settings of its README).
+# a file, and server settings, twice hardened like a shared engine (the
+# authorization macro of the image, once as quackmux_authorize and once as
+# quackmux_authorize_listing, and the post-start settings of its README).
 # Each time it waits until the Quack server answers GET /,
 # checks that the token shows up neither in a process command line nor in the
 # output, stops the engine with SIGTERM and expects exit status 0. In the
 # second scenario a Quack client (the DuckDB CLI of the image) checks what a
 # session of the engine must not get: the token through FROM _ and the
-# standard input of the engine's CLI. In the third one the cases of the macro
-# run (quackmux-authorize-test), and a session tries to overwrite the
+# standard input of the engine's CLI. In the hardened ones the cases of the
+# macro run (quackmux-authorize-test), and a session tries to overwrite the
 # engine's database file and to plant SQL for IMPORT DATABASE in its temp
 # directory, the paths that DuckDB keeps writable. Finally it opens the
 # database files and checks that all four scripts ran, the post-start SQL
@@ -102,7 +103,14 @@ EOF
 # and the post-start settings: first the cases of the macro, then the same
 # attacks on the real paths of this engine (database file $dir/NAME.duckdb):
 # overwriting the database file and writing SQL for IMPORT DATABASE into the
-# temp directory.
+# temp directory. check_hardened_listing does the same for an engine that
+# runs quackmux_authorize_listing.
+check_hardened_listing() {
+	local QUACKMUX_TEST_LISTING=1
+	export QUACKMUX_TEST_LISTING
+	check_hardened "$@"
+}
+
 check_hardened() {
 	local name=$1 port=$2 db=$dir/$1.duckdb report
 	report=$dir/$name-authorize.log
@@ -226,6 +234,15 @@ run_scenario hardened 19495 check_hardened \
 	QUACKMUX_DATABASE="$dir/hardened.duckdb" \
 	QUACKMUX_INIT_SQL="CREATE OR REPLACE TABLE selftest_hardened AS SELECT 42 AS answer;
 .read $authorize_sql" \
+	QUACKMUX_POST_START_SQL="SET enable_external_access = false;
+SET lock_configuration = true;"
+
+run_scenario hardened-listing 19496 check_hardened_listing \
+	QUACKMUX_PORT=19496 \
+	QUACKMUX_DATABASE="$dir/hardened-listing.duckdb" \
+	QUACKMUX_INIT_SQL="CREATE OR REPLACE TABLE selftest_hardened AS SELECT 42 AS answer;
+.read $authorize_sql
+SET GLOBAL quack_authorization_function = 'quackmux_authorize_listing';" \
 	QUACKMUX_POST_START_SQL="SET enable_external_access = false;
 SET lock_configuration = true;"
 # The engine stopped cleanly with the configuration locked; the database file

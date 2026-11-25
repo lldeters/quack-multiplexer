@@ -86,6 +86,7 @@ var scenarios = []struct {
 	{name: "d: wrong token", tokenVar: "E2E_WRONG_TOKEN", options: "share_level=server", config: gatewayConfig, unauthenticated: true},
 	{name: "e: bob, SERVER", tokenVar: "E2E_BOB_TOKEN", options: "share_level=server", config: gatewayConfig, engine: "shared"},
 	{name: "f: alice, SERVER, gateway-idle", tokenVar: "E2E_ALICE_TOKEN", options: "share_level=server", config: idleConfig, engine: "shared"},
+	{name: "h: bob, SERVER, query time limit", tokenVar: "E2E_BOB_TOKEN", options: "share_level=server", config: gatewayConfig, engine: "shared"},
 }
 
 // readEnv parses e2e.env: KEY=VALUE lines, comments and blank lines.
@@ -302,12 +303,46 @@ func TestGatewayConfigs(t *testing.T) {
 		t.Errorf("%s: session.idleTimeout %s is short enough to break scenarios", gatewayConfig, d)
 	}
 
-	// Apart from the timing, the two files must agree.
+	// Scenario k restarts gateway, which then probes the connections that no
+	// client asks for once their engine lease has run out. The lease must
+	// outlast the restart, so that the living clients find their
+	// connections, and the grace must fit the run. gateway-idle never
+	// restarts.
+	if !gw.CloseOrphanedConnectionsEnabled() || idle.CloseOrphanedConnectionsEnabled() {
+		t.Errorf("engine.closeOrphanedConnections must be on in %s only", gatewayConfig)
+	}
+	if l := gw.Session.BackendHeartbeatTimeout.Duration; l < time.Minute {
+		t.Errorf("%s: session.backendHeartbeatTimeout %s is too short for the living clients of scenario k", gatewayConfig, l)
+	}
+	if d := gw.OrphanGrace(); d > 2*time.Minute {
+		t.Errorf("%s: the orphan grace %s is too long for scenario k", gatewayConfig, d)
+	}
+
+	// Apart from the timing and the orphan sweep, the two files must agree.
 	adjusted := *idle
 	adjusted.Session = gw.Session
 	adjusted.Engine.CheckInterval = gw.Engine.CheckInterval
+	adjusted.Engine.CloseOrphanedConnections = gw.Engine.CloseOrphanedConnections
+	adjusted.Engine.RecoveryGrace = gw.Engine.RecoveryGrace // derived from session.maxHeartbeatTimeout
 	if !reflect.DeepEqual(&adjusted, gw) {
-		t.Errorf("%s and %s differ in more than the session and engine timing", gatewayConfig, idleConfig)
+		t.Errorf("%s and %s differ in more than the session and engine timing and the orphan sweep", gatewayConfig, idleConfig)
+	}
+}
+
+// TestQueryTimeLimits pins the query time limits scenario h relies on: bob's
+// queries are cancelled after 5s, the other scenarios run without a limit.
+func TestQueryTimeLimits(t *testing.T) {
+	for _, path := range []string{gatewayConfig, idleConfig} {
+		cfg := loadConfig(t, path)
+		for user, want := range map[string]time.Duration{"bob": 5 * time.Second, "alice": 0} {
+			if got, source := policy.QueryTimeout(cfg, user, nil, cfg.Defaults.Profile); got != want {
+				t.Errorf("%s: %s's queries have the time limit %s (%s), want %s", path, user, got, source, want)
+			}
+		}
+	}
+	script := string(readFile(t, runScript))
+	if !strings.Contains(script, "time limit of 5s (overrides[0].queryTimeout)") {
+		t.Errorf("%s does not expect bob's limit of 5s from overrides[0]", runScript)
 	}
 }
 

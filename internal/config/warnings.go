@@ -41,7 +41,7 @@ func (c *Config) Warnings() []string {
 			warnings = append(warnings, staticProfileWarnings(name, c.Profiles[name])...)
 		}
 	}
-	return warnings
+	return append(warnings, c.queryTimeoutWarnings()...)
 }
 
 // staticProfileWarnings warns about the fields of a profile that only take

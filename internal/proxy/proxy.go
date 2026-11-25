@@ -65,6 +65,13 @@ type Gateway struct {
 	abortCtx context.Context
 	abort    context.CancelFunc
 
+	// limits follows queries for the query time limit (querylimit.go); nil
+	// if no limit is configured.
+	limits *queryLimits
+	// fence, if set, must report true for the query time limit to cancel
+	// queries on engines (see Options.Fence).
+	fence func() bool
+
 	inFlight atomic.Int64
 
 	// notLeaderWarned is when a replica that does not lead last logged that
@@ -88,6 +95,11 @@ type Options struct {
 	// is ready, and the Service selects the leader by its label. A replica
 	// that does not lead gives the reason ReasonNotLeader.
 	Ready func() (bool, string)
+	// Fence, if set, reports whether this process may act on engines on its
+	// own (with leader election: it holds a fresh lease). The query time
+	// limit cancels queries only while it reports true: a leader that
+	// resumes after a freeze must not cancel what the new leader serves.
+	Fence func() bool
 }
 
 // New creates the gateway handler.
@@ -98,7 +110,7 @@ func New(o Options) *Gateway {
 	}
 	g := &Gateway{
 		cfg: o.Config, auth: o.Auth, engines: o.Engines, sessions: o.Sessions, up: o.Upstream,
-		log: o.Log.With("component", "proxy"), met: o.Metrics, now: time.Now, ready: o.Ready,
+		log: o.Log.With("component", "proxy"), met: o.Metrics, now: time.Now, ready: o.Ready, fence: o.Fence,
 		buffers: semaphore.NewWeighted(budget),
 	}
 	g.abortCtx, g.abort = context.WithCancel(context.Background())
@@ -107,6 +119,10 @@ func New(o Options) *Gateway {
 	}
 	if g.ready == nil {
 		g.ready = func() (bool, string) { return o.Engines.Synced(), "starting up" }
+	}
+	if policy.QueryTimeoutConfigured(o.Config) && o.Sessions != nil {
+		g.limits = newQueryLimits(g)
+		o.Sessions.SetCloseHook(g.limits.sessionClosed)
 	}
 	return g
 }
@@ -545,12 +561,25 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	if r.ContentLength >= 0 {
 		contentLength = r.ContentLength - int64(hlen) + int64(len(newHeader))
 	}
+	// The query time limit reads the query uuid of FETCH and CANCEL from the
+	// start of their body, and whether a PREPARE ends a transaction.
+	var queryHead []byte
+	if g.limits != nil && (h.Type == wire.TypeFetchRequest || h.Type == wire.TypeCancelRequest || h.Type == wire.TypePrepareRequest) {
+		queryHead = peekQueryHead(br, r.ContentLength-int64(hlen))
+	}
 	// The transport may still read the body after Do has returned (it probes
 	// for bytes beyond the content length in its own goroutine), so the body
 	// must never reach past the client's message and the byte count is
 	// atomic.
 	var in io.Reader
 	var sent func() int64
+	// Only the body of a PREPARE that the query time limit follows passes a
+	// gate (the limit cuts off a body the engine has not got whole); every
+	// other body is read as without a limit.
+	gated := g.limits != nil && h.Type == wire.TypePrepareRequest
+	var gate *bodyGate
+	var body []byte                  // the body after the header, if buffered
+	var prepareScan *prepareUUIDSink // finds the uuid of a PREPARE that streams
 	if contentLength >= 0 && uc.MaxBufferedRequestBytes > 0 && contentLength <= uc.MaxBufferedRequestBytes && g.buffers.TryAcquire(contentLength) {
 		// Read the whole message before talking to the engine, so that a slow
 		// client cannot stall the engine's socket (it gives up after 5s).
@@ -566,28 +595,103 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		// wait long for the engine under backpressure.
 		release := sync.OnceFunc(func() { g.buffers.Release(contentLength) })
 		defer release()
-		in = &releasingReader{Reader: bytes.NewReader(buf), release: release}
+		if gated {
+			gate = &bodyGate{r: bytes.NewReader(buf), size: contentLength, release: release}
+			in = gate
+		} else {
+			in = &releasingReader{Reader: bytes.NewReader(buf), release: release}
+		}
 		sent = func() int64 { return contentLength }
+		body = buf[len(newHeader):]
 	} else {
 		var rest io.Reader = br
 		if r.ContentLength >= 0 {
 			rest = io.LimitReader(br, r.ContentLength-int64(hlen))
 		}
-		cr := &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest)}
-		in, sent = cr, cr.n.Load
+		if gated {
+			prepareScan = &prepareUUIDSink{}
+			gate = &bodyGate{r: io.MultiReader(bytes.NewReader(newHeader), io.TeeReader(rest, prepareScan)), size: contentLength}
+			in, sent = gate, gate.sent
+		} else {
+			cr := &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest)}
+			in, sent = cr, cr.n.Load
+		}
 	}
 	upCtx := r.Context()
 	stopAbort := func() bool { return true }
-	if h.Type == wire.TypePrepareRequest {
-		// A query waiting for its engine when the gateway shuts down is
-		// answered with an error (see AbortQueries), never cut off.
+	if h.Type == wire.TypePrepareRequest || g.limits != nil {
+		// The request to the engine of a PREPARE that the query time limit
+		// follows outlives its client (queryRequest.outlivesClient): it
+		// starts detached from the client, and is tied to it again below if
+		// the limit does not follow it.
+		parent := upCtx
+		if g.limits != nil && h.Type == wire.TypePrepareRequest {
+			parent = context.WithoutCancel(parent)
+		}
 		var cancelUp context.CancelFunc
-		upCtx, cancelUp = context.WithCancel(upCtx)
+		upCtx, cancelUp = context.WithCancel(parent)
 		defer cancelUp()
-		stopAbort = context.AfterFunc(g.abortCtx, cancelUp)
+		if h.Type == wire.TypePrepareRequest {
+			// A query waiting for its engine when the gateway shuts down is
+			// answered with an error (see AbortQueries), never cut off.
+			stopAbort = context.AfterFunc(g.abortCtx, cancelUp)
+		}
+		if g.limits != nil {
+			qr, timedOut, err := g.limits.track(r.Context(), h, sess, body, queryHead, prepareScan, cancelUp, gate)
+			if err != nil || timedOut != nil {
+				stopAbort()
+			}
+			// Requests the gateway answers itself: it first reads what the
+			// client sends, so that its connection stays usable.
+			switch {
+			case errors.Is(err, errShuttingDown):
+				writeError(w, "quackmux: the gateway is shutting down; the query did not run. Run it again.",
+					wire.ExceptionConnection, false)
+				return "shutdown"
+			case errors.Is(err, errTooManyQueries):
+				_, _ = io.Copy(io.Discard, in)
+				writeError(w, tooManyQueriesMessage, wire.ExceptionInvalidInput, false)
+				return "too_many_queries"
+			case errors.Is(err, errSessionClosed):
+				// The session closed after the request arrived: answer as if
+				// it had come after the close.
+				_, _ = io.Copy(io.Discard, in)
+				c, _ := sess.Closed()
+				if c == nil {
+					c = &session.Closed{Reason: "closed"}
+				}
+				writeError(w, closedMessage(c), wire.ExceptionConnection, c.MustInvalidate)
+				return "session_closed"
+			case err != nil:
+				return "client_gone"
+			case timedOut != nil:
+				_, _ = io.Copy(io.Discard, in)
+				writeError(w, g.limits.message(timedOut), wire.ExceptionInterrupt, false)
+				return "query_timeout"
+			}
+			detached := qr.outlivesClient()
+			if h.Type == wire.TypePrepareRequest && !detached {
+				stop := context.AfterFunc(r.Context(), cancelUp)
+				defer stop()
+			}
+			outcome := g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, qr)
+			if detached && outcome != "shutdown" && r.Context().Err() != nil {
+				outcome = "client_gone" // the engine's answer reached no one
+			}
+			return outcome
+		}
 	}
+	return g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, nil)
+}
+
+// forward sends a request of a session to its engine and relays the answer.
+// qr is how the query time limit follows the request (nil: not at all).
+func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header, sess *session.Session, target engine.Target,
+	in io.Reader, sent func() int64, contentLength int64, upCtx context.Context, stopAbort func() bool, qr *queryRequest) string {
+	uc := g.cfg.Server.Upstream
 	upReq, err := upstream.NewRequest(upCtx, target.Endpoint, in, contentLength)
 	if err != nil {
+		qr.finish(evFailed)
 		writeError(w, "quackmux: "+err.Error(), wire.ExceptionConnection, false)
 		return "internal"
 	}
@@ -598,7 +702,11 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		g.met.Bytes.WithLabelValues("in").Add(float64(sent()))
 	}
 	if err != nil {
-		if r.Context().Err() != nil {
+		qr.finish(evFailed)
+		// A request that outlives its client does not fail because the
+		// client left: at a shutdown it is cancelled on the engine all the
+		// same.
+		if r.Context().Err() != nil && !(aborted && qr.outlivesClient()) {
 			return "client_gone"
 		}
 		if aborted {
@@ -611,13 +719,15 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 				wire.ExceptionConnection, false)
 			return "shutdown"
 		}
+		_, still := g.engines.Lookup(target.ID)
+		if msg, timedOut := qr.timeoutError(); timedOut && still {
+			// The query time limit cancelled the request.
+			writeError(w, msg, wire.ExceptionInterrupt, false)
+			return "query_timeout"
+		}
 		g.log.Warn("engine request failed", "engine", target.ID, "session", sess.ID, "type", h.Type, "err", err)
 		msg := fmt.Sprintf("quackmux: engine %s is unreachable: %v", target.ID, err)
-		if _, still := g.engines.Lookup(target.ID); !still {
-			writeError(w, msg, wire.ExceptionConnection, true)
-		} else {
-			writeError(w, msg, wire.ExceptionConnection, false)
-		}
+		writeError(w, msg, wire.ExceptionConnection, !still)
 		return "engine_unreachable"
 	}
 	defer resp.Body.Close()
@@ -625,14 +735,37 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	// lease - at or after sentAt (not when the answer came back).
 	sess.TouchBackend(sentAt)
 	if resp.StatusCode != http.StatusOK {
+		qr.finish(evFailed)
 		writeError(w, fmt.Sprintf("quackmux: engine %s answered HTTP %d", target.ID, resp.StatusCode), wire.ExceptionConnection, false)
 		return "engine_status"
 	}
 
 	rb := bufio.NewReaderSize(resp.Body, 32<<10)
 	respType := wire.TypeInvalid
-	if p, _ := rb.Peek(3); len(p) == 3 && p[0] == 0x01 && p[1] == 0x00 && p[2] < 0x80 {
+	peek := 3
+	if qr != nil && h.Type == wire.TypeFetchRequest {
+		peek = maxQueryHeadBytes // the head of a FETCH_RESPONSE tells a batch from the end
+	}
+	p, _ := rb.Peek(peek)
+	if len(p) >= 3 && p[0] == 0x01 && p[1] == 0x00 && p[2] < 0x80 {
 		respType = wire.MessageType(p[2])
+	}
+	// What the answer means for the query time limit.
+	ev := evAnswered
+	switch respType {
+	case wire.TypeErrorResponse:
+		ev = evError
+	case wire.TypePrepareResponse:
+		ev = evResult
+	case wire.TypeFetchResponse:
+		if qr != nil {
+			if f, err := wire.DecodeFetchResponseHead(p); err == nil {
+				ev = evBatch
+				if f.Terminal() {
+					ev = evComplete
+				}
+			}
+		}
 	}
 	if n := resp.ContentLength; respType == wire.TypeErrorResponse && n >= 0 && n <= maxInspectedErrorBytes && g.buffers.TryAcquire(n) {
 		// Small errors are read and looked at; larger ones (a huge message
@@ -641,13 +774,16 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		_, err := io.ReadFull(rb, body)
 		resp.Body.Close()
 		if err != nil {
+			qr.finish(evFailed)
 			g.buffers.Release(n)
 			// Nothing was sent yet: answer instead of dropping the connection
 			// (a dropped connection can make libcurl resend the request).
 			writeError(w, fmt.Sprintf("quackmux: engine %s broke off its response: %v", target.ID, err), wire.ExceptionConnection, false)
 			return "engine_broken"
 		}
-		if e, derr := wire.DecodeErrorResponse(body); derr == nil {
+		outcome := "engine_error"
+		e, derr := wire.DecodeErrorResponse(body)
+		if derr == nil {
 			switch {
 			case e.MustInvalidate:
 				g.engines.MarkFailed(target.ID, "engine database invalidated: "+e.Message)
@@ -655,9 +791,18 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 				g.sessions.ClosedByBackend(sess, e.Message)
 			}
 		}
-		writeBody(w, body)
+		msg, timedOut := qr.timeoutError()
+		qr.finish(ev)
+		if timedOut && derr == nil && !e.MustInvalidate && !upstream.IsSessionGone(e.Message) {
+			// The engine's answer to the query time limit's CANCEL (or a
+			// consequence of it): the client gets the gateway's reason.
+			writeError(w, msg, wire.ExceptionInterrupt, false)
+			outcome = "query_timeout"
+		} else {
+			writeBody(w, body)
+		}
 		g.buffers.Release(n)
-		return "engine_error"
+		return outcome
 	}
 
 	if n := resp.ContentLength; n >= 0 && uc.MaxBufferedResponseBytes > 0 && n <= uc.MaxBufferedResponseBytes && g.buffers.TryAcquire(n) {
@@ -666,11 +811,13 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		_, err := io.ReadFull(rb, buf)
 		resp.Body.Close()
 		if err != nil {
+			qr.finish(evFailed)
 			g.buffers.Release(n)
 			g.log.Warn("engine response broken", "engine", target.ID, "session", sess.ID, "type", h.Type, "err", err)
 			writeError(w, fmt.Sprintf("quackmux: engine %s broke off its response: %v", target.ID, err), wire.ExceptionConnection, false)
 			return "engine_broken"
 		}
+		qr.finish(ev)
 		writeBody(w, buf)
 		g.buffers.Release(n)
 		if g.met != nil {
@@ -679,6 +826,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		return "ok"
 	}
 
+	qr.finish(ev)
 	w.Header().Set("Content-Type", wire.ContentType)
 	if resp.ContentLength >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
@@ -762,4 +910,77 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n.Add(int64(n))
 	return n, err
+}
+
+// bodyGate is the body of a PREPARE_REQUEST that the query time limit
+// follows, as the HTTP transport reads it (in its own goroutine). It counts
+// what the transport read, and stop cuts it off unless the transport has
+// read all of it.
+type bodyGate struct {
+	r       io.Reader
+	size    int64  // the length of the body; negative: unknown, it ends at EOF
+	release func() // run by Close if set: the budget of a buffered body
+
+	mu       sync.Mutex
+	n        int64 // what the transport has read
+	complete bool  // the transport has read all of the body
+	stopped  bool  // stop cut it off
+}
+
+// errBodyCut is what the transport reads from a body that stop cut off.
+var errBodyCut = errors.New("quackmux: the request body was cut off")
+
+func (b *bodyGate) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	stopped := b.stopped
+	b.mu.Unlock()
+	if stopped {
+		return 0, errBodyCut
+	}
+	n, err := b.r.Read(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stopped {
+		return 0, errBodyCut // the transport never gets these bytes
+	}
+	b.n += int64(n)
+	if err == io.EOF || (b.size >= 0 && b.n >= b.size) {
+		b.complete = true
+	}
+	return n, err
+}
+
+// Close runs release once the transport is done with the body (after
+// sending it, or on failure).
+func (b *bodyGate) Close() error {
+	if b.release != nil {
+		b.release()
+	}
+	return nil
+}
+
+// sent returns how many bytes the transport has read.
+func (b *bodyGate) sent() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
+}
+
+// stop cuts the body off unless the transport has read all of it, and
+// reports whether it did: the engine cannot get the whole message then.
+func (b *bodyGate) stop() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.complete {
+		b.stopped = true
+	}
+	return b.stopped
+}
+
+// sentAll reports whether the transport has read all of the body, so that
+// the engine may have the whole message.
+func (b *bodyGate) sentAll() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.complete
 }

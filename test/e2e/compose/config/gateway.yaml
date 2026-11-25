@@ -30,9 +30,21 @@ defaults:
 session:
   # The default idle timeout (6h) never interferes with the scenarios.
   checkInterval: 2s
+  # Scenario k: clients heartbeat at least every 8s (0.4 x 20s), so the living
+  # ones are back soon after the restart, long before the engine lease of
+  # their connections (60s) runs out. The gateway probes the connections that
+  # no client asks for once that lease has run out: 75s after the restart
+  # (backendHeartbeatTimeout plus heartbeatGrace).
+  maxHeartbeatTimeout: 20s
+  backendHeartbeatTimeout: 60s
 
 engine:
   checkInterval: 2s
+  # Static engines need the switch for scenario k. gateway-idle uses the same
+  # engines and leaves it off, as it never restarts; the probes of gateway
+  # leave its sessions alone, since gateway-idle keeps their engine leases
+  # alive.
+  closeOrphanedConnections: true
 
 provider:
   type: static
@@ -58,6 +70,11 @@ provider:
 profiles:
   default:
     description: DuckDB 2.0 engines run by docker compose (engine-shared, engine-analytics)
+
+overrides:
+  # Scenario h: bob's queries are cancelled after 5s, alice's have no limit.
+  - users: [bob]
+    queryTimeout: 5s
 
 audit:
   # Exercise the audit log with real PREPARE requests.

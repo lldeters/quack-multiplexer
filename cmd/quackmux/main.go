@@ -370,7 +370,12 @@ func cmdServe(args []string) error {
 		}
 		rd.standby = func() (bool, string) { return ha.StandbyReady(elector, labeler) }
 	}
-	gw := proxy.New(proxy.Options{Config: cfg, Auth: authn, Engines: engines, Sessions: sessions, Upstream: up, Log: log, Metrics: met, Ready: serving})
+	var fence func() bool
+	if elector != nil {
+		fence = elector.Fresh // the query time limit cancels queries on engines
+	}
+	gw := proxy.New(proxy.Options{Config: cfg, Auth: authn, Engines: engines, Sessions: sessions, Upstream: up, Log: log, Metrics: met,
+		Ready: serving, Fence: fence})
 
 	adminToken, err := readTokenFile(cfg.Admin.TokenFile)
 	if err != nil {
@@ -398,6 +403,10 @@ func cmdServe(args []string) error {
 			return err
 		}
 		go sessions.Run(ctx)
+		// The connections that the recovered engines hold as this process
+		// takes over: the sweep probes those that no session adopts once
+		// their engine lease has run out.
+		sessions.SweepOrphans(ctx, engines.RecoveredTargets())
 		started.Store(true)
 		if labeler != nil {
 			labeler.Kick() // label the pod now: from then on the Service routes to it
