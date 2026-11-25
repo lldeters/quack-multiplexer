@@ -188,7 +188,7 @@ type queryRequest struct {
 	// its query still waited.
 	early bool
 	abort context.CancelFunc // cancels the request to the engine
-	body  *countingReader    // the body of a PREPARE_REQUEST
+	body  *bodyGate          // the body of a PREPARE_REQUEST
 }
 
 // requestEvent is how the engine answered a followed request.
@@ -344,14 +344,14 @@ func (l *queryLimits) sessionClosed(s *session.Session, _ bool) <-chan struct{} 
 // track starts following a request of sess right before the gateway
 // forwards it. body is the body after the header if the gateway buffered
 // it, head the start of the body otherwise, scan watches a PREPARE body that
-// streams; abort cancels the request to the engine, and in is the body as
-// the transport reads it. The result is nil if the limit does not follow
-// the request. local is set if the gateway must answer with that query's
+// streams; abort cancels the request to the engine, and in is the body of a
+// PREPARE as the transport reads it. The result is nil if the limit does not
+// follow the request. local is set if the gateway must answer with that query's
 // timeout error instead of forwarding the request. err reports that ctx
 // ended, or that the gateway shut down, while a PREPARE waited for the
 // gateway to finish with an earlier query, or errTooManyQueries.
 func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Session, body, head []byte,
-	scan *prepareUUIDSink, abort context.CancelFunc, in *countingReader) (r *queryRequest, local *trackedQuery, err error) {
+	scan *prepareUUIDSink, abort context.CancelFunc, in *bodyGate) (r *queryRequest, local *trackedQuery, err error) {
 	if body != nil {
 		head = body
 	}
@@ -394,7 +394,7 @@ func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Se
 // transaction. It first waits until the gateway is done with the queries of
 // the session that reached their limit.
 func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, clientQueryID wire.OptionalIdx,
-	uuid wire.Hugeint, known, endsTxn bool, abort context.CancelFunc, in *countingReader) (*queryRequest, error) {
+	uuid wire.Hugeint, known, endsTxn bool, abort context.CancelFunc, in *bodyGate) (*queryRequest, error) {
 	limit, source := l.limitFor(sess)
 	if limit <= 0 {
 		return nil, nil

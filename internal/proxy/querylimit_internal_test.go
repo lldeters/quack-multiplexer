@@ -246,7 +246,7 @@ func TestRunningQueryIsNeverForgotten(t *testing.T) {
 	running = l2.testPrepare(t, s2, wire.Hugeint{Upper: 1})
 	running.finish(evResult)
 	for i := 1; i < maxSessionQueries; i++ {
-		in := &countingReader{size: 100} // nothing of it sent yet
+		in := &bodyGate{size: 100} // nothing of it sent yet
 		r, err := l2.beginPrepare(context.Background(), s2, wire.OptionalIdx{}, wire.Hugeint{Upper: 2, Lower: uint64(i)}, true, false, func() {}, in)
 		if r == nil || err != nil {
 			t.Fatalf("PREPARE %d: %v, %v", i, r, err)

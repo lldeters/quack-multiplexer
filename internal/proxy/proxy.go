@@ -572,7 +572,12 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	// must never reach past the client's message and the byte count is
 	// atomic.
 	var in io.Reader
-	var cr *countingReader           // what the transport has read of in
+	var sent func() int64
+	// Only the body of a PREPARE that the query time limit follows passes a
+	// gate (the limit cuts off a body the engine has not got whole); every
+	// other body is read as without a limit.
+	gated := g.limits != nil && h.Type == wire.TypePrepareRequest
+	var gate *bodyGate
 	var body []byte                  // the body after the header, if buffered
 	var prepareScan *prepareUUIDSink // finds the uuid of a PREPARE that streams
 	if contentLength >= 0 && uc.MaxBufferedRequestBytes > 0 && contentLength <= uc.MaxBufferedRequestBytes && g.buffers.TryAcquire(contentLength) {
@@ -590,22 +595,28 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 		// wait long for the engine under backpressure.
 		release := sync.OnceFunc(func() { g.buffers.Release(contentLength) })
 		defer release()
-		cr = &countingReader{r: bytes.NewReader(buf), size: contentLength}
-		in = &releasingReader{Reader: cr, release: release}
+		if gated {
+			gate = &bodyGate{r: bytes.NewReader(buf), size: contentLength, release: release}
+			in = gate
+		} else {
+			in = &releasingReader{Reader: bytes.NewReader(buf), release: release}
+		}
+		sent = func() int64 { return contentLength }
 		body = buf[len(newHeader):]
 	} else {
 		var rest io.Reader = br
 		if r.ContentLength >= 0 {
 			rest = io.LimitReader(br, r.ContentLength-int64(hlen))
 		}
-		if g.limits != nil && h.Type == wire.TypePrepareRequest {
+		if gated {
 			prepareScan = &prepareUUIDSink{}
-			rest = io.TeeReader(rest, prepareScan)
+			gate = &bodyGate{r: io.MultiReader(bytes.NewReader(newHeader), io.TeeReader(rest, prepareScan)), size: contentLength}
+			in, sent = gate, gate.sent
+		} else {
+			cr := &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest)}
+			in, sent = cr, cr.n.Load
 		}
-		cr = &countingReader{r: io.MultiReader(bytes.NewReader(newHeader), rest), size: contentLength}
-		in = cr
 	}
-	sent := cr.n.Load
 	upCtx := r.Context()
 	stopAbort := func() bool { return true }
 	if h.Type == wire.TypePrepareRequest || g.limits != nil {
@@ -626,7 +637,7 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 			stopAbort = context.AfterFunc(g.abortCtx, cancelUp)
 		}
 		if g.limits != nil {
-			qr, timedOut, err := g.limits.track(r.Context(), h, sess, body, queryHead, prepareScan, cancelUp, cr)
+			qr, timedOut, err := g.limits.track(r.Context(), h, sess, body, queryHead, prepareScan, cancelUp, gate)
 			if err != nil || timedOut != nil {
 				stopAbort()
 			}
@@ -869,7 +880,7 @@ func mayHoldCredentials(sql string) bool {
 // releasingReader is a request body that runs release once the transport
 // closes it (after sending it, or on failure).
 type releasingReader struct {
-	io.Reader
+	*bytes.Reader
 	release func()
 }
 
@@ -878,57 +889,88 @@ func (r *releasingReader) Close() error {
 	return nil
 }
 
-// countingReader is the body of a request to the engine, as the HTTP
-// transport reads it (in its own goroutine). It counts the bytes read
-// through it, and stop can cut it off.
+// countingReader counts the bytes read through it. The count is atomic: the
+// HTTP transport reads in its own goroutine.
 type countingReader struct {
-	r    io.Reader
-	size int64 // the length of the body; negative: unknown, it ends at EOF
-	n    atomic.Int64
+	r io.Reader
+	n atomic.Int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+// bodyGate is the body of a PREPARE_REQUEST that the query time limit
+// follows, as the HTTP transport reads it (in its own goroutine). It counts
+// what the transport read, and stop cuts it off unless the transport has
+// read all of it.
+type bodyGate struct {
+	r       io.Reader
+	size    int64  // the length of the body; negative: unknown, it ends at EOF
+	release func() // run by Close if set: the budget of a buffered body
 
 	mu       sync.Mutex
-	complete bool // the transport has read all of the body
-	stopped  bool // stop cut it off
+	n        int64 // what the transport has read
+	complete bool  // the transport has read all of the body
+	stopped  bool  // stop cut it off
 }
 
 // errBodyCut is what the transport reads from a body that stop cut off.
 var errBodyCut = errors.New("quackmux: the request body was cut off")
 
-func (c *countingReader) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	stopped := c.stopped
-	c.mu.Unlock()
+func (b *bodyGate) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	stopped := b.stopped
+	b.mu.Unlock()
 	if stopped {
 		return 0, errBodyCut
 	}
-	n, err := c.r.Read(p)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stopped {
+	n, err := b.r.Read(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stopped {
 		return 0, errBodyCut // the transport never gets these bytes
 	}
-	total := c.n.Add(int64(n))
-	if err == io.EOF || (c.size >= 0 && total >= c.size) {
-		c.complete = true
+	b.n += int64(n)
+	if err == io.EOF || (b.size >= 0 && b.n >= b.size) {
+		b.complete = true
 	}
 	return n, err
 }
 
+// Close runs release once the transport is done with the body (after
+// sending it, or on failure).
+func (b *bodyGate) Close() error {
+	if b.release != nil {
+		b.release()
+	}
+	return nil
+}
+
+// sent returns how many bytes the transport has read.
+func (b *bodyGate) sent() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
+}
+
 // stop cuts the body off unless the transport has read all of it, and
 // reports whether it did: the engine cannot get the whole message then.
-func (c *countingReader) stop() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.complete {
-		c.stopped = true
+func (b *bodyGate) stop() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.complete {
+		b.stopped = true
 	}
-	return c.stopped
+	return b.stopped
 }
 
 // sentAll reports whether the transport has read all of the body, so that
 // the engine may have the whole message.
-func (c *countingReader) sentAll() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.complete
+func (b *bodyGate) sentAll() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.complete
 }
