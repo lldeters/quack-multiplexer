@@ -10,6 +10,7 @@ import (
 
 	"quackmux/internal/metrics"
 	"quackmux/internal/proxy"
+	"quackmux/internal/session"
 	"quackmux/internal/wire"
 )
 
@@ -188,24 +189,48 @@ func TestAbandonedPrepareIsCancelledAtItsLimit(t *testing.T) {
 	mustType(t, h.prepare(c, "SELECT 1", uuidC), wire.TypePrepareResponse)
 }
 
-// The session closes while the gateway's CANCEL is on its way, and the
-// engine refuses the CANCEL then: the query ended with the session, which
-// is no failure to cancel it (the gateway once counted and logged one).
+// The session closes while the gateway's CANCEL is on its way. A client's
+// DISCONNECT reaches the engine only after the engine answered the CANCEL,
+// which therefore still meets the query. A close after which the engine no
+// longer has the connection (its engine is gone) ends the query with it:
+// the engine's refusal of the CANCEL then is no failure to cancel it (the
+// gateway once counted and logged one).
 func TestSessionClosingDuringTheCancel(t *testing.T) {
-	h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
-	c := h.connect("tok?user=alice", nil)
-	srv := h.prov.Server(h.sessionEngine(c))
-	srv.CancelDelay = 700 * time.Millisecond
-	srv.CancelError = "something went wrong"
-	answer := make(chan []byte, 1)
-	go func() { answer <- h.prepare(c, "SLEEP 5000", uuidA) }()
-	time.Sleep(500 * time.Millisecond) // the CANCEL left at 300ms
-	mustType(t, h.disconnect(c), wire.TypeSuccessResponse)
-	wait(t, "the PREPARE", answer)
-	waitCancels(t, srv, uuidA) // the engine answered the CANCEL
-	time.Sleep(200 * time.Millisecond)
-	if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
-		t.Fatalf("%v timeouts counted for a query whose session closed", n)
+	for _, tc := range []struct {
+		name  string
+		close func(h *harness, c string)
+	}{
+		{"client disconnect", func(h *harness, c string) { mustType(h.t, h.disconnect(c), wire.TypeSuccessResponse) }},
+		{"engine gone", func(h *harness, c string) {
+			h.sessions.Close(sessionIDOf(h.t, h, c), "engine terminated", session.CloseMode{Force: true, MustInvalidate: true})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, "limits: {queryTimeout: 300ms}\n", nil)
+			c := h.connect("tok?user=alice", nil)
+			srv := h.prov.Server(h.sessionEngine(c))
+			srv.CancelDelay = 700 * time.Millisecond
+			gone := tc.name == "engine gone"
+			if gone {
+				srv.CancelError = "something went wrong"
+			}
+			answer := make(chan []byte, 1)
+			go func() { answer <- h.prepare(c, "SLEEP 3000", uuidA) }()
+			time.Sleep(500 * time.Millisecond) // the CANCEL left at 300ms
+			tc.close(h, c)
+			body := wait(t, "the PREPARE", answer)
+			waitCancels(t, srv, uuidA) // the engine answered the CANCEL
+			if gone {
+				time.Sleep(200 * time.Millisecond)
+				if n := timeouts(t, h.met, "failed") + timeouts(t, h.met, "cancelled"); n != 0 {
+					t.Fatalf("%v timeouts counted for a query whose engine is gone", n)
+				}
+				return
+			}
+			mustTimeout(t, body, "300ms", "limits.queryTimeout")
+			waitTimeouts(t, h.met, "cancelled", 1)
+			disconnectedAfterCancel(t, srv)
+		})
 	}
 }
 

@@ -652,6 +652,16 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 				_, _ = io.Copy(io.Discard, in)
 				writeError(w, tooManyQueriesMessage, wire.ExceptionInvalidInput, false)
 				return "too_many_queries"
+			case errors.Is(err, errSessionClosed):
+				// The session closed after the request arrived: answer as if
+				// it had come after the close.
+				_, _ = io.Copy(io.Discard, in)
+				c, _ := sess.Closed()
+				if c == nil {
+					c = &session.Closed{Reason: "closed"}
+				}
+				writeError(w, closedMessage(c), wire.ExceptionConnection, c.MustInvalidate)
+				return "session_closed"
 			case err != nil:
 				return "client_gone"
 			case timedOut != nil:

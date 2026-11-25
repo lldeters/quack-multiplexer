@@ -69,11 +69,12 @@ type Session struct {
 	requests    atomic.Int64
 	queries     atomic.Int64
 
-	mu          sync.Mutex
-	state       State
-	inFlight    int
-	closeReason string
-	closedAt    time.Time
+	mu               sync.Mutex
+	state            State
+	inFlight         int
+	closeReason      string
+	closeInvalidates bool
+	closedAt         time.Time
 }
 
 // Closed describes why a session is no longer usable.
@@ -426,7 +427,7 @@ func (s *Session) Closed() (*Closed, bool) {
 	if s.state != StateClosed {
 		return nil, false
 	}
-	return &Closed{Reason: s.closeReason, ClosedAt: s.closedAt}, true
+	return &Closed{Reason: s.closeReason, MustInvalidate: s.closeInvalidates, ClosedAt: s.closedAt}, true
 }
 
 // Begin marks a request of the session as in flight. It fails if the
@@ -512,7 +513,7 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 		s.mu.Unlock()
 		return false
 	}
-	s.state, s.closeReason, s.closedAt = StateClosed, reason, now
+	s.state, s.closeReason, s.closeInvalidates, s.closedAt = StateClosed, reason, mode.MustInvalidate, now
 	s.mu.Unlock()
 
 	m.mu.Lock()

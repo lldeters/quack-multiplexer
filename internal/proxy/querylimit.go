@@ -66,6 +66,15 @@ import (
 // the gateway is done with the query: a CANCEL could otherwise meet them.
 // COMMIT and ROLLBACK have no limit: DuckDB does not interrupt a commit, and
 // the engine would report it as interrupted although it committed.
+//
+// The Quack server lets the requests of a connection that are in flight
+// finish after a DISCONNECT, and their statement runs on with them, while a
+// CANCEL no longer reaches it. When a session closes while the limit may
+// still have to cancel a query of it, the gateway therefore keeps following
+// the session's queries and holds the DISCONNECT to the engine until it is
+// done with them (the client's DISCONNECT is answered at once all the same).
+// Requests of the session that it has not forwarded yet are not forwarded
+// any more.
 
 // msgCancelOther starts the engine's answer to a CANCEL for a query that is
 // not the statement of the connection (quack_server.cpp).
@@ -110,6 +119,11 @@ var errNotFresh = errors.New("this gateway does not hold a fresh lease")
 // it follows maxSessionQueries queries of the session already.
 var errTooManyQueries = errors.New("too many queries of the session are not over")
 
+// errSessionClosed reports a request the gateway does not forward because
+// its session closed after the request arrived: forwarded now, it could keep
+// a query of the session running on the engine past the DISCONNECT.
+var errSessionClosed = errors.New("the session is closed")
+
 // tooManyQueriesMessage is the client's error for errTooManyQueries.
 var tooManyQueriesMessage = fmt.Sprintf("quackmux: the session has %d queries that are not over, the most the "+
 	"gateway follows; it did not forward this request. Cancel those queries or reconnect.", maxSessionQueries)
@@ -138,6 +152,10 @@ type sessionQueries struct {
 	// a uuid the gateway does not know then starts following that query. It
 	// ends once the engine has shown what it runs.
 	adopting bool
+	// closed is set once the session closed; hold, while set, holds its
+	// DISCONNECT to the engine (see sessionClosed).
+	closed bool
+	hold   chan struct{}
 }
 
 // trackedQuery is one query of a session.
@@ -189,6 +207,9 @@ type queryRequest struct {
 	early bool
 	abort context.CancelFunc // cancels the request to the engine
 	body  *bodyGate          // the body of a PREPARE_REQUEST
+	// client is the context of the client's request of a PREPARE that
+	// outlives its client (outlivesClient).
+	client context.Context
 }
 
 // requestEvent is how the engine answered a followed request.
@@ -286,11 +307,35 @@ func (l *queryLimits) endLocked(q *trackedQuery) {
 }
 
 // forgetIdleLocked drops the state of a session that has nothing left to
-// follow. An adopted session keeps it once it no longer adopts queries.
+// follow. An adopted session keeps it once it no longer adopts queries. A
+// closed session keeps it, and its DISCONNECT waits, only while the limit
+// may still have to cancel one of its queries.
 func (l *queryLimits) forgetIdleLocked(sq *sessionQueries) {
+	if sq.closed {
+		if !sq.holdsLocked() {
+			l.dropLocked(sq)
+		}
+		return
+	}
 	if len(sq.queries) == 0 && sq.cancels == 0 && (!sq.sess.Adopted || sq.adopting) && l.sessions[sq.sess.ID] == sq {
 		delete(l.sessions, sq.sess.ID)
 	}
+}
+
+// holdsLocked reports whether the limit may still have to cancel a query of
+// sq on its engine: an enforcement runs, or a query with a clock that has
+// not run out of time waits for the engine, or got no answer to its PREPARE
+// although the engine got all of it (the engine may run it).
+func (sq *sessionQueries) holdsLocked() bool {
+	if sq.cancels > 0 {
+		return true
+	}
+	for _, q := range sq.queries {
+		if q.limit > 0 && !q.timedOut && (len(q.waiting) > 0 || q.unanswered) {
+			return true
+		}
+	}
+	return false
 }
 
 // roomLocked makes room for one more query of sq and reports whether there
@@ -317,27 +362,51 @@ func (l *queryLimits) roomLocked(sq *sessionQueries) bool {
 	return len(kept) < maxSessionQueries
 }
 
-// dropLocked forgets a session and its queries.
+// dropLocked forgets a session and its queries, and lets its DISCONNECT go
+// if it holds it. A PREPARE of the session that waits for the engine
+// although its client went away ends with its client again: nothing
+// follows its query any more.
 func (l *queryLimits) dropLocked(sq *sessionQueries) {
 	for _, q := range sq.queries {
 		q.ended, q.dropped = true, true
 		if q.timer != nil {
 			q.timer.Stop()
 		}
+		for r := range q.waiting {
+			if r.client != nil {
+				context.AfterFunc(r.client, r.abort)
+			}
+		}
 	}
 	sq.queries = nil
 	if l.sessions[sq.sess.ID] == sq {
 		delete(l.sessions, sq.sess.ID)
 	}
+	if sq.hold != nil {
+		close(sq.hold)
+		sq.hold = nil
+	}
 }
 
-// sessionClosed is the session manager's close hook.
-func (l *queryLimits) sessionClosed(s *session.Session, _ bool) <-chan struct{} {
+// sessionClosed is the session manager's close hook. keep reports that the
+// engine still has the session's connection and is about to get its
+// DISCONNECT. While the limit may still have to cancel a query of the
+// session on the engine (holdsLocked), and only then, the gateway keeps
+// following the session's queries and returns a channel that holds the
+// DISCONNECT; the channel is closed once nothing holds it any more.
+func (l *queryLimits) sessionClosed(s *session.Session, keep bool) <-chan struct{} {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if sq := l.sessions[s.ID]; sq != nil && sq.sess == s {
-		l.dropLocked(sq)
+	sq := l.sessions[s.ID]
+	if sq == nil || sq.sess != s {
+		return nil
 	}
+	sq.closed = true
+	if keep && sq.holdsLocked() {
+		sq.hold = make(chan struct{})
+		return sq.hold
+	}
+	l.dropLocked(sq)
 	return nil
 }
 
@@ -406,8 +475,8 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 	defer l.mu.Unlock()
 	for {
 		sq := l.sessionLocked(sess, true)
-		if sq == nil {
-			return nil, nil
+		if sq == nil || sq.closed {
+			return nil, errSessionClosed
 		}
 		if done := sq.cancelsDone; done != nil {
 			l.mu.Unlock()
@@ -430,6 +499,9 @@ func (l *queryLimits) beginPrepare(ctx context.Context, sess *session.Session, c
 		q := l.newQueryLocked(sq, uuid, known, clientQueryID, limit, source)
 		q.seq = sq.prepares
 		r := &queryRequest{l: l, sess: sess, kind: wire.TypePrepareRequest, q: q, abort: abort, body: in}
+		if limit > 0 {
+			r.client = ctx // see outlivesClient
+		}
 		q.prepare, q.prepared, q.preparing = r, make(chan struct{}), true
 		q.waiting[r] = struct{}{}
 		return r, nil
@@ -463,6 +535,10 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 	l.mu.Lock()
 	for {
 		sq := l.sessionLocked(sess, false)
+		if l.closedLocked(sess, sq) {
+			l.mu.Unlock()
+			return nil, nil, errSessionClosed
+		}
 		var q *trackedQuery
 		if sq != nil {
 			q = sq.findLocked(uuid)
@@ -508,6 +584,22 @@ func (l *queryLimits) beginReading(ctx context.Context, sess *session.Session, u
 		l.mu.Unlock()
 		return r, nil, nil
 	}
+}
+
+// closedLocked reports whether the session sess, whose state is sq (nil:
+// none), closed while the limit applies to it: its requests are not
+// forwarded any more then. The close hook marks the state of a session
+// after the session itself, under l.mu: a session that the hook has not
+// seen yet was open when its requests began to be followed.
+func (l *queryLimits) closedLocked(sess *session.Session, sq *sessionQueries) bool {
+	if sq != nil {
+		return sq.closed
+	}
+	if _, closed := sess.Closed(); !closed {
+		return false
+	}
+	limit, _ := l.limitFor(sess)
+	return limit > 0
 }
 
 // adoptLocked starts following the query that a FETCH for a uuid the gateway
@@ -633,6 +725,10 @@ func (r *queryRequest) finish(ev requestEvent) {
 		return
 	}
 	sq := q.sq
+	if sq.closed {
+		// The DISCONNECT of the session may have waited for this request.
+		defer l.forgetIdleLocked(sq)
+	}
 	switch r.kind {
 	case wire.TypePrepareRequest:
 		switch ev {
