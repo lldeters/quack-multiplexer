@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -352,5 +353,46 @@ func TestEndsTransaction(t *testing.T) {
 		if got := endsTransaction(body[n:]); got != want {
 			t.Errorf("endsTransaction(%q) = %v, want %v", sql, got, want)
 		}
+	}
+}
+
+// FETCHes that no query claims change hands while their handlers look at
+// them: a PREPARE of their uuid takes them, and they move on when its query
+// ends. All of it happens under the lock (run with -race).
+func TestStraysChangeHandsSafely(t *testing.T) {
+	l, s := newTestLimits(t, false)
+	l.testPrepare(t, s, wire.Hugeint{Upper: 99}) // unanswered, so nothing replaces it: the state stays
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		u := wire.Hugeint{Upper: 5, Lower: uint64(i % 3)}
+		f, local, err := l.beginReading(context.Background(), s, &u, true, func() {})
+		if f == nil || local != nil || err != nil {
+			t.Fatalf("FETCH %d: %v, %v, %v", i, f, local, err)
+		}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			f.timeoutError()
+			f.outlivesClient()
+			f.finish(evBatch)
+		}()
+		go func() {
+			defer wg.Done()
+			p, err := l.beginPrepare(context.Background(), s, wire.OptionalIdx{}, u, true, false, func() {}, nil)
+			if err != nil || p == nil {
+				t.Errorf("PREPARE %d: %v, %v", i, p, err)
+				return
+			}
+			p.finish(evResult)
+			l.mu.Lock()
+			l.endLocked(p.q)
+			l.mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if sq := l.sessions[s.ID]; sq == nil || len(sq.strays) != 0 {
+		t.Fatalf("state after the FETCHes: %+v", sq)
 	}
 }

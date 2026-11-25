@@ -208,7 +208,7 @@ type queryRequest struct {
 	l    *queryLimits
 	sess *session.Session
 	kind wire.MessageType
-	q    *trackedQuery // nil for CANCEL_REQUEST and a stray
+	q    *trackedQuery // nil for CANCEL_REQUEST and a stray; guarded by queryLimits.mu
 	// sq follows a stray (a FETCH or an upload that no query claims), uuid
 	// is the uuid of a FETCH.
 	sq   *sessionQueries
@@ -541,7 +541,8 @@ func (l *queryLimits) sessionClosed(s *session.Session, keep bool) <-chan struct
 // follow the request. local is set if the gateway must answer with that query's
 // timeout error instead of forwarding the request. err reports that ctx
 // ended, or that the gateway shut down, while a PREPARE waited for the
-// gateway to finish with an earlier query, or errTooManyQueries.
+// gateway to finish with an earlier query, or errTooManyQueries, or
+// errSessionClosed.
 func (l *queryLimits) track(ctx context.Context, h wire.Header, sess *session.Session, body, head []byte,
 	scan *prepareUUIDSink, abort context.CancelFunc, in *bodyGate) (r *queryRequest, local *trackedQuery, err error) {
 	if body != nil {
@@ -826,22 +827,24 @@ func (r *queryRequest) setUUID(uuid wire.Hugeint) {
 // the query until its limit, and cancel it then whatever the engine had
 // done. The limit bounds the wait.
 func (r *queryRequest) outlivesClient() bool {
-	return r != nil && r.q != nil && r.kind == wire.TypePrepareRequest && r.q.limit > 0
+	// The query of a PREPARE never changes (others can, see rehomeLocked).
+	return r != nil && r.kind == wire.TypePrepareRequest && r.q != nil && r.q.limit > 0
 }
 
 // timeoutError returns the error the gateway answers with instead of the
 // engine's answer to r: the query of r ran out of time.
 func (r *queryRequest) timeoutError() (string, bool) {
-	if r == nil || r.q == nil {
+	if r == nil {
 		return "", false
 	}
 	r.l.mu.Lock()
 	defer r.l.mu.Unlock()
-	if !r.q.timedOut {
+	q := r.q
+	if q == nil || !q.timedOut {
 		return "", false
 	}
-	r.q.reported = true
-	return r.q.messageLocked(), true
+	q.reported = true
+	return q.messageLocked(), true
 }
 
 // finish ends a followed request with what the engine answered.
