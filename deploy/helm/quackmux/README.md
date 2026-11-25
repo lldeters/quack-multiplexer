@@ -90,7 +90,7 @@ zurück.
 | `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | keine; mit `ha.enabled` eine bevorzugte `podAntiAffinity` | Scheduling des Gateways (nicht der Engines: die stehen im Profil) |
 | `serviceAccount.create`, `.name`, `.annotations`, `rbac.create` | an, `<name>-gateway` | ServiceAccount, Role und RoleBinding im Namespace des Releases |
 | `service.type`, `service.annotations` | `ClusterIP` | Service mit Quack-Port 9494 und Admin-Port 9495 |
-| `externalService.*` | aus | zweiter Service nur mit dem Quack-Port, Typ `LoadBalancer`, `externalTrafficPolicy: Local` |
+| `externalService.*` | aus | zweiter Service nur mit dem Quack-Port, Typ `LoadBalancer` (oder `NodePort`, dann ohne `loadBalancerSourceRanges` und `loadBalancerClass`), `externalTrafficPolicy: Local` |
 | `networkPolicy.enabled`, `.adminFrom`, `.engineEgress` | an, keine, wie `base` | NetworkPolicies; `adminFrom` öffnet den Admin-Port etwa für Prometheus aus einem anderen Namespace |
 | `fullnameOverride` | leer | Name der Objekte |
 

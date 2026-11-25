@@ -204,6 +204,8 @@ service:
 # "Verbinden"). With ha.enabled it selects the leader alone, too.
 externalService:
   enabled: false
+  # LoadBalancer or NodePort (loadBalancerSourceRanges and loadBalancerClass
+  # need LoadBalancer).
   type: LoadBalancer
   # A FETCH request carries no bytes while the engine computes: raise the
   # load balancer's idle timeout (provider specific), e.g. on Azure:

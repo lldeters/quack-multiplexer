@@ -4,6 +4,11 @@ balancer (the variant in deploy/kubernetes/base/service.yaml). The admin port
 stays internal. With ha.enabled it selects the leader alone.
 */ -}}
 {{- if .Values.externalService.enabled -}}
+{{- with .Values.externalService -}}
+{{- if and (ne .type "LoadBalancer") (or .loadBalancerSourceRanges .loadBalancerClass) -}}
+{{- fail (printf "externalService: loadBalancerSourceRanges and loadBalancerClass need type LoadBalancer; the API refuses them for type %s" .type) -}}
+{{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: Service
 metadata:

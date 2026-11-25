@@ -218,6 +218,10 @@ func TestChartRefuses(t *testing.T) {
 		{"configuration that is no map", "quackmux", []string{"--set", "configYaml=- a"}, "not a YAML map"},
 		{"service account without a name", "quackmux", []string{"--set", "serviceAccount.create=false"}, "serviceAccount.name is required"},
 		{"unknown value", "quackmux", []string{"--set", "ha.enable=true"}, "enable"},
+		// The API refuses externalTrafficPolicy for ClusterIP and the
+		// loadBalancer* fields for every type but LoadBalancer.
+		{"external Service of type ClusterIP", "quackmux", []string{"--set", "externalService.enabled=true", "--set", "externalService.type=ClusterIP"}, "/externalService/type"},
+		{"source ranges of a NodePort", "quackmux", []string{"--set", "externalService.enabled=true", "--set", "externalService.type=NodePort", "--set", "externalService.loadBalancerSourceRanges[0]=203.0.113.0/24"}, "need type LoadBalancer"},
 		// More cases, compared with the gateway's own check: TestChartUsersMatchGateway.
 		{"unknown field of a user", "quackmux", []string{"--set", "users[0].name=alice", "--set", "users[0].disable=true"}, "'disable' not allowed"},
 		{"sha256 that is not hex", "quackmux", []string{"--set", "users[0].name=alice", "--set", "users[0].tokens[0].sha256=zz"}, "/users/0/tokens/0/sha256"},
@@ -374,4 +378,18 @@ func TestChartOptions(t *testing.T) {
 	if sa := mustFind(t, objs, "ServiceAccount", "quackmux-gateway"); mapAt(sa, "metadata", "annotations")["iam.example.com/role"] != "quackmux" {
 		t.Errorf("ServiceAccount annotations %v", mapAt(sa, "metadata", "annotations"))
 	}
+
+	t.Run("NodePort", func(t *testing.T) {
+		ext := mustFind(t, render(t, "quackmux", "--set", "externalService.enabled=true", "--set", "externalService.type=NodePort"),
+			"Service", "quackmux-external")
+		spec := mapAt(ext, "spec")
+		if spec["type"] != "NodePort" || spec["externalTrafficPolicy"] != "Local" {
+			t.Errorf("spec %v: want type NodePort with externalTrafficPolicy Local", spec)
+		}
+		for _, f := range []string{"loadBalancerSourceRanges", "loadBalancerClass"} {
+			if _, ok := spec[f]; ok {
+				t.Errorf("a NodePort Service with %s: the API refuses it", f)
+			}
+		}
+	})
 }

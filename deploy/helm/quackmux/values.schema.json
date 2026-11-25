@@ -88,7 +88,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {"type": "boolean"},
-        "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+        "type": {"enum": ["NodePort", "LoadBalancer"]},
         "annotations": {"$ref": "#/definitions/stringMap"},
         "port": {"type": "integer", "minimum": 1, "maximum": 65535},
         "externalTrafficPolicy": {"enum": ["", "Cluster", "Local"]},
