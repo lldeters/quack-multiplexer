@@ -8,6 +8,8 @@
 #                      settings, images/engine/README.md)
 #   gateway            quackmux in front of both (provider static, auth static)
 #   gateway-idle       the same with session.idleTimeout 15s
+#   gateway-tls        the same with server.tls (profile "tls": run.sh creates
+#                      the certificate in E2E_TLS_DIR)
 #   client             DuckDB 2.0 CLI from the engine image (profile "client",
 #                      started with "docker compose run")
 #
@@ -99,6 +101,31 @@ services:
     ports:
       - "127.0.0.1:${E2E_IDLE_QUACK_PORT:-19594}:9494"
       - "127.0.0.1:${E2E_IDLE_ADMIN_PORT:-19595}:9495"
+    depends_on: [engine-shared, engine-analytics]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges=true"]
+    networks: [e2e]
+
+  # Scenario l: the Quack port with server.tls. run.sh creates a self-signed
+  # certificate for the host name gateway-tls in E2E_TLS_DIR and enables the
+  # profile; a plain "docker compose up" leaves the service out.
+  gateway-tls:
+    image: ${E2E_GATEWAY_IMAGE:-quackmux/quackmux:e2e}
+    pull_policy: never
+    restart: "no"
+    profiles: [tls]
+    command: ["serve", "-config", "/etc/quackmux/config.yaml"]
+    environment:
+      QUACKMUX_SESSION_KEY: "${E2E_SESSION_KEY:?run run.sh or pass --env-file e2e.env}"
+    volumes:
+      - ./config/gateway-tls.yaml:/etc/quackmux/config.yaml:ro
+      - ./config/users.yaml:/etc/quackmux/users.yaml:ro
+      - ./config/admin.token:/etc/quackmux/admin.token:ro
+      - ${E2E_TLS_DIR:-./tls}:/etc/quackmux/tls:ro
+    ports:
+      - "127.0.0.1:${E2E_TLS_QUACK_PORT:-19794}:9494"
+      - "127.0.0.1:${E2E_TLS_ADMIN_PORT:-19795}:9495"
     depends_on: [engine-shared, engine-analytics]
     read_only: true
     cap_drop: [ALL]

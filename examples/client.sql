@@ -167,7 +167,23 @@ DETACH bi;
 -- ATTACH 'quack:quackmux.example.com:9494' AS lake (DISABLE_SSL true);
 --
 -- Mit TLS (server.tls oder ein L4-Load-Balancer, der TLS terminiert) ohne
--- DISABLE_SSL; das Zertifikat muss für den Client vertrauenswürdig sein:
+-- DISABLE_SSL; das Zertifikat muss für den Client vertrauenswürdig sein. Eine
+-- eigene CA bekommt er global, sonst scheitern größere Ergebnisse (docs/tls.md):
+-- SET GLOBAL ca_cert_file = '/pfad/zu/ca.crt';
+-- ATTACH 'quack:quackmux.example.com:9494' AS lake;
+--
+-- Ein selbstsigniertes Zertifikat kann der Client stattdessen pinnen
+-- (docs/tls.md). Dann prüft er nur den Fingerprint, sendet keine
+-- EXTRA_HTTP_HEADERS (Optionen in den Token) und bricht Requests nach
+-- http_timeout ab (Default 30 s), auch das ATTACH während eines Engine-Starts;
+-- nur der globale Wert zählt:
+-- SET GLOBAL http_timeout = 86400;
+-- CREATE OR REPLACE SECRET quackmux (
+--     TYPE quack,
+--     TOKEN 'mein-token?subdomain=bi',
+--     SSL_FINGERPRINT 'F8:C0:31:...:BB:7D',
+--     SCOPE 'quack:quackmux.example.com:9494'
+-- );
 -- ATTACH 'quack:quackmux.example.com:9494' AS lake;
 
 

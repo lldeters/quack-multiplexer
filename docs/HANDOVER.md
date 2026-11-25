@@ -1,4 +1,4 @@
-# Übergabe: quackmux weiterbauen (Stand 2026-11-22)
+# Übergabe: quackmux weiterbauen (Stand 2026-11-25, Release 0.1.0)
 
 Diese Datei ist der Übergabeprompt für eine neue Claude-Code-Session in der Cloud. Sie ist vollständig und
 braucht keinen weiteren Kontext.
@@ -22,21 +22,25 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 
 ## Stand
 
-**Verifiziert am 2026-11-20 und 2026-11-21 unter linux/amd64** (Cloud-Sandbox mit Docker und kind):
+**Verifiziert vom 2026-11-20 bis zum 2026-11-25 unter linux/amd64** (Cloud-Sandbox mit Docker und kind):
 
 * `go build ./...`, `go vet ./...` und `gofmt -l .` sind sauber. `go test ./... -count=1` und
   `go test -race ./...` sind grün; drei Race-Läufe hintereinander ohne Befund.
 * Gegen das veröffentlichte DuckDB v2.0.0 (`d54cbbe3df`, quack `f96420ed46`):
   * Engine- und Gateway-Image gebaut (`make docker-engine docker-gateway`), der Selbsttest des Engine-Images
     besteht.
-  * `test/e2e/compose/run.sh`: alle Szenarien grün (seit 2026-11-25 a–k, darunter Query-Zeitlimit, gehärtete Engine und verwaiste
-    Verbindungen).
+  * `test/e2e/compose/run.sh`: alle Szenarien grün (seit 2026-11-25 a–l, darunter Query-Zeitlimit, gehärtete
+    Engine, verwaiste Verbindungen und TLS mit gepinnten und CA-prüfenden Clients).
   * `test/e2e/kind/setup.sh` und `test.sh` (Kubernetes v1.37, Overlay `dev`): alle Szenarien grün (seit
     2026-11-22 k1–k8), auch der Gateway-Neustart mit Session-Adoption und die persistenten Profile.
   * `test/e2e/kind/ha.sh` (Overlay `ha`, zwei Replikas, echte Secrets): alle Szenarien grün (seit 2026-11-22 h1–h6
     und h4b). Geprüft werden Leader-Wahl, geordnete Übergabe, ein eingefrorener und wieder aufgeweckter Leader,
     Rollout, ein hängender Rollout, PodDisruptionBudget und ein persistenter Schlüssel beim Failover, jeweils mit
     zwei angehängten Clients.
+  * Helm-Chart: `go test ./test/helm/` vergleicht es Objekt für Objekt mit `kubectl kustomize` von `base` und
+    `overlays/ha` (mit Helm 3.22 und 4.3); `test/e2e/kind/helm.sh` prüft es in kind (i, o, u, g, h, c, r, d:
+    Installation, ein Gateway pro Namespace, Upgrade mit erhaltenen Secrets, Umstieg auf HA, hängender Rollout,
+    Rollback, Deinstallation), dazu `test.sh` k1–k8 gegen ein Helm-Release.
   * Wire-Codec: 400 mitgeschnittene Nachrichten (Client ↔ Server, Client ↔ Gateway, Gateway ↔ Engine) dekodieren
     und kodieren byte-genau (`internal/wire/testdata/duckdb-v2.0.0`, `realtraffic_test.go`).
   * Der `process`-Provider läuft mit der echten CLI.
@@ -58,6 +62,8 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 | Binary | `cmd/quackmux` (`serve`, `validate`, `token`, `hash-token`, `version`) | fertig |
 | Engine-Image (tini, FIFO-Entrypoint, quack/httpfs vorinstalliert), Gateway-Image | `images/engine`, `Dockerfile` | gebaut und mit DuckDB v2.0.0 geprüft |
 | Kustomize (base, overlays `dev` und `ha`), Beispielkonfigurationen | `deploy/kubernetes`, `examples` | `dev` und `ha` in kind deployt und getestet; `base` per `kubectl apply --dry-run=server` geprüft |
+| Helm-Chart (gleichwertig zu `base` und `overlays/ha`) | `deploy/helm/quackmux`, `test/helm` | in kind installiert, aktualisiert, auf HA umgestellt und deinstalliert; CI prüft Lint, Schemas und den Abgleich mit Kustomize |
+| CI, Nightly-HA, Release (Binaries, Images auf GHCR, Chart-Paket) | `.github/workflows`, `scripts`, [docs/releasing.md](releasing.md) | in Betrieb; 0.1.0 ist das erste Release |
 | E2E-Tests (Docker Compose, kind, kind-HA) | `test/e2e` | ausgeführt und grün (siehe oben) |
 
 ## Harte Randbedingungen
@@ -169,8 +175,22 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    lesen. Alles in `deploy/kubernetes/README.md`, „Härtung geteilter Engines“.
 5. **Die Schwärzung im Audit-Log ist eine Heuristik** (Schlüsselwörter wie `secret`, `passw`, `token`, URLs mit
    Passwort). Das Audit-Log bleibt vertraulich.
-6. **Spill-Platz** begrenzt nur die Konfiguration (`settings.max_temp_directory_size` plus
-   `resources.limits.ephemeral-storage`); die Beispiele setzen keine Defaults.
+6. **Spill-Platz:** Die mitgelieferten Profile begrenzen ihn (`settings.max_temp_directory_size` gleich dem Doppelten
+   von `limits.memory`, `resources.limits.ephemeral-storage` 2 GiB darüber, kleine Requests). Die Grenze von DuckDB
+   hält nur, solange keine Session sie per `SET GLOBAL` verschiebt (dagegen `lock_configuration`); darüber räumt das
+   Kubelet die ganze Engine. Die kleinen Requests überbuchen die Platte des Nodes, und ein Node mit weniger freiem
+   Platz als die Grenze läuft voll, bevor sie greift. Alles in `deploy/kubernetes/README.md`, „Plattenplatz für
+   Auslagerungen“.
+7. **Query-Zeitlimit** (`limits.queryTimeout`, Default aus): Das Gateway bricht eine Query ab, sobald nach dem Limit
+   ein Request für sie auf die Engine wartet. Eine beantwortete Query, deren Ergebnis niemand abholt
+   (`inline_rows 0`, die späteren Anweisungen eines PREPARE mit mehreren Anweisungen), kann auf der Engine
+   weiterlaufen; der DuckDB-Client holt sein Ergebnis ab und bleibt unter der Uhr. Eine harte Grenze setzt
+   `SET GLOBAL max_execution_time` mit `lock_configuration` im `initSQL`. Alles in [docs/design.md](design.md),
+   Abschnitt 5.3.
+8. **Helm-Chart:** Ein Gateway pro Namespace. Erzeugte Secrets und die Prüfungen beim Umstieg auf HA beruhen auf
+   `lookup`: `helm template`, `--dry-run=client` und GitOps-Werkzeuge erzeugen die Secrets bei jedem Rendern neu
+   (dort `existingSecret` nehmen), und `helm rollback`, `--atomic` und Argo CD prüft das Chart über `ha.enabled`
+   hinweg nicht. Alles in [deploy/helm/quackmux/README.md](../deploy/helm/quackmux/README.md).
 
 ## Nächste Schritte (priorisiert)
 
@@ -179,13 +199,26 @@ der HA-Test nächtlich in CI, PVCs pro Engine-Schlüssel (`persistence`, kind-Sz
 allen Replikas ready (Leader-Label, `ha.deregistrationDelay`, kind-Szenarien h1–h5 und h4b), die Härtung
 geteilter Engines (`postStartSQL`, Autorisierungs-Makro mit 224 Testfällen im Selbsttest des Images; dabei
 zwei Lecks im Engine-Image geschlossen: das Engine-Token über `FROM _` und Befehle über `/proc/self/fd/0`),
-ein optionales Zeitlimit pro Query (`limits.queryTimeout`, CANCEL auf der Engine, Compose-Szenario h) und das
-Aufräumen verwaister Verbindungen nach einem Neustart (`engine.closeOrphanedConnections`, Compose-Szenario k).
+ein optionales Zeitlimit pro Query (`limits.queryTimeout`, CANCEL auf der Engine, Compose-Szenario h), das
+Aufräumen verwaister Verbindungen nach einem Neustart (`engine.closeOrphanedConnections`, Compose-Szenario k), die
+TLS-Doku für Clients ([docs/tls.md](tls.md), Compose-Szenario l), Spill-Grenzen in den mitgelieferten Profilen,
+das Helm-Chart (`deploy/helm/quackmux`) und das Release 0.1.0.
 
-1. Optional:
-   * Helm-Chart
-   * TLS-Doku für Clients mit `ssl_fingerprint` (die haben nur 30 s `http_timeout`, deshalb Warm-Pool nutzen)
-   * Spill-Defaults in den Beispielprofilen
+1. **Lizenz festlegen.** Das Repository hat noch keine `LICENSE`; ohne sie darf niemand den Code oder die Images
+   nutzen. Die Wahl trifft der Maintainer.
+2. **Nach dem ersten Release:** die Pakete `quackmux` und `duckdb-engine` auf GHCR öffentlich stellen
+   ([docs/releasing.md](releasing.md)), sonst brauchen Cluster ein Pull-Secret.
+3. **Upstream-Bug in client-go einreichen:** Der Entwurf liegt in
+   [docs/upstream/client-go-leaderelection-release.md](upstream/client-go-leaderelection-release.md) (ein
+   Leader, der nach einer Pause aufwacht, gibt die Lease des neuen Leaders frei; quackmux umgeht das schon).
+4. Optional:
+   * TLS-Zertifikat ohne Neustart neu laden (das Gateway liest `server.tls` nur beim Start). Gepinnte Clients
+     (`ssl_fingerprint`) haben 30 s `http_timeout` nur mit geladenem httpfs, sonst 300 s; statt eines Warm-Pools
+     hilft `SET GLOBAL http_timeout = 86400` vor dem `ATTACH` ([docs/tls.md](tls.md)).
+   * Das Helm-Chart zusätzlich als OCI-Artefakt auf GHCR veröffentlichen (bisher hängt es am GitHub-Release), und
+     `helm.sh` in CI auch mit Helm 4 laufen lassen (lokal grün).
+   * Eine Sperre im Gateway gegen zwei Gateways beim Rollback über `ha.enabled` hinweg (etwa: auch ein Gateway
+     ohne HA hält die Lease); das Chart kann das nicht prüfen.
 
 ## Arbeiten im Repo
 
@@ -198,8 +231,8 @@ make help   # oder Makefile ansehen: build, test, docker-engine, docker-gateway,
 
 * Die Unit- und Integrationstests brauchen weder Docker noch DuckDB. `internal/proxy/harness_test.go` baut ein
   komplettes Gateway mit Fake-Engines und Fake-Uhr.
-* E2E: `test/e2e/compose/run.sh` und `test/e2e/kind/setup.sh` plus `test.sh` (Overlay `dev`) und `ha.sh`
-  (Overlay `ha`, stellt danach `dev` wieder her); Voraussetzungen und Variablen in
+* E2E: `test/e2e/compose/run.sh` und `test/e2e/kind/setup.sh` plus `test.sh` (Overlay `dev`), `ha.sh`
+  (Overlay `ha`, stellt danach `dev` wieder her) und `helm.sh` (das Chart); Voraussetzungen und Variablen in
   [test/e2e/README.md](../test/e2e/README.md).
   * Hinter einem Proxy oder mit Mirrors reicht `DOCKER_BUILD_FLAGS` Flags an beide `docker build` durch (etwa
     `--network host --build-arg GOPROXY=…`). Das Engine-Image nimmt `DUCKDB_EXTENSION_REPOSITORY` als Build-Arg.
@@ -214,5 +247,6 @@ make help   # oder Makefile ansehen: build, test, docker-engine, docker-gateway,
 **Prompt für die nächste Cloud-Session** (zum Einfügen):
 
 > Lies `docs/HANDOVER.md` und die dort verlinkten Dokumente. Arbeite dann die „Nächsten Schritte“ in der
-> angegebenen Reihenfolge ab, beginnend mit CI und Release. Halte dich strikt an die „Harten Randbedingungen“.
+> angegebenen Reihenfolge ab (die Lizenz wählt der Maintainer, frag nach). Halte dich strikt an die „Harten
+> Randbedingungen“.
 > Committe in kleinen Schritten auf einem Feature-Branch und antworte mir auf Deutsch.

@@ -4,11 +4,11 @@
 
 | Workflow | Auslöser | Inhalt |
 |---|---|---|
-| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go vet`, Tests, Tests mit Race-Detector, Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind |
+| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go vet`, Tests, Tests mit Race-Detector, Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), das Helm-Chart mit Helm 3 und 4 (`helm lint`, kubeconform, Vergleich mit den Kustomize-Manifesten in `test/helm`), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind (dort auch das Helm-Chart mit `test/e2e/kind/helm.sh`) |
 | [nightly.yml](../.github/workflows/nightly.yml) | täglich 03:17 UTC auf `main`, von Hand für jeden Branch | HA-Szenarien in kind (`test/e2e/kind/ha.sh`) und die Tests fünfmal mit Race-Detector |
 | [release.yml](../.github/workflows/release.yml) | Tag `vX.Y.Z` | Release (siehe unten) |
 
-Alle Actions sind auf Commit-SHAs gepinnt, die Werkzeuge (kind, kubeconform, actionlint) auf Versionen. Der
+Alle Actions sind auf Commit-SHAs gepinnt, die Werkzeuge (kind, kubeconform, actionlint, helm) auf Versionen. Der
 Engine-Build prüft den DuckDB-Download gegen die Prüfsummen im Makefile (`DUCKDB_SHA256_AMD64`,
 `DUCKDB_SHA256_ARM64`); die E2E-Skripte und Workflows lesen sie von dort.
 
@@ -17,9 +17,10 @@ Engine-Build prüft den DuckDB-Download gegen die Prüfsummen im Makefile (`DUCK
 Ein Tag `vX.Y.Z` startet `release.yml`:
 
 1. Die Checks laufen noch einmal, und `scripts/check-image-refs.sh X.Y.Z` prüft, dass das Repository genau dieses
-   Release referenziert.
-2. Ein GitHub-Release mit den Binaries für linux, darwin und windows (amd64 und arm64) als `tar.gz` bzw. `zip`
-   und `SHA256SUMS`.
+   Release referenziert, auch `version` und `appVersion` des Helm-Charts.
+2. Ein GitHub-Release mit den Binaries für linux, darwin und windows (amd64 und arm64) als `tar.gz` bzw. `zip`,
+   dem Helm-Chart als `quackmux-X.Y.Z.tgz` ([deploy/helm/quackmux](../deploy/helm/quackmux/README.md)) und
+   `SHA256SUMS`.
 3. Images für amd64 und arm64 auf der GitHub Container Registry:
 
 | Image | Tags |
@@ -38,7 +39,7 @@ Engine-Images setzt den Engine-Container-Vertrag um (etwa `QUACKMUX_STOP_TIMEOUT
 ## Ablauf
 
 ```sh
-scripts/set-version.sh 0.2.0     # alle Image-Referenzen auf das neue Release
+scripts/set-version.sh 0.2.0     # alle Image-Referenzen und die Chart-Version auf das neue Release
 git commit -am "release: 0.2.0"  # über einen Pull Request nach main, CI muss grün sein
 ```
 
@@ -66,3 +67,6 @@ brauchen Cluster ein Pull-Secret.
 
 2. `scripts/set-version.sh <nächste quackmux-Version>` setzt auch das Engine-Tag (`<duckdb>-<version>`).
 3. Die Research-Notes und die E2E-Tests gegen die neue Version prüfen (docs/research-notes.md).
+4. docs/tls.md nennt die geprüfte DuckDB- und quack-Version. Szenario l des Compose-Tests prüft die Clients mit
+   `ssl_fingerprint` und mit `ca_cert_file` (Header, Pin-Formate, `localhost`, `http_timeout`, Fehlermeldungen);
+   die Timeouts ohne httpfs und über 30 s deckt es nicht ab: von Hand nachprüfen, dann die Version dort anpassen.

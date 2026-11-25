@@ -1,0 +1,42 @@
+{{- /*
+The Quack port for clients outside the cluster through an L4 (TCP) load
+balancer (the variant in deploy/kubernetes/base/service.yaml). The admin port
+stays internal. With ha.enabled it selects the leader alone.
+*/ -}}
+{{- if .Values.externalService.enabled -}}
+{{- with .Values.externalService -}}
+{{- if and (ne .type "LoadBalancer") (or .loadBalancerSourceRanges .loadBalancerClass) -}}
+{{- fail (printf "externalService: loadBalancerSourceRanges and loadBalancerClass need type LoadBalancer; the API refuses them for type %s" .type) -}}
+{{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "quackmux.fullname" . }}-external
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+  {{- with .Values.externalService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.externalService.type }}
+  {{- with .Values.externalService.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.externalService.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.externalService.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "quackmux.serviceSelector" . | nindent 4 }}
+  ports:
+    - name: quack
+      port: {{ .Values.externalService.port }}
+      targetPort: quack
+      protocol: TCP
+{{- end }}

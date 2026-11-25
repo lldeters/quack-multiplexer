@@ -6,9 +6,12 @@
 #   ghcr.io/lldeters/quackmux:<version>
 #   ghcr.io/lldeters/duckdb-engine:<duckdb>-<version>
 #
-# with <duckdb> the DUCKDB_VERSION of the Makefile. With VERSION (the release
-# workflow passes the tag without its "v"), <version> must be that one.
-# scripts/set-version.sh changes all references at once (docs/releasing.md).
+# with <duckdb> the DUCKDB_VERSION of the Makefile, and that version and
+# appVersion of the Helm chart (deploy/helm/quackmux/Chart.yaml) are that
+# release, too: the chart's gateway image tag defaults to appVersion. With
+# VERSION (the release workflow passes the tag without its "v"), <version>
+# must be that one. scripts/set-version.sh changes all references at once
+# (docs/releasing.md).
 #
 # IMAGE_REGISTRY overrides the registry prefix (default ghcr.io/lldeters).
 set -euo pipefail
@@ -16,6 +19,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 registry=${IMAGE_REGISTRY:-ghcr.io/lldeters}
 want=${1:-}
+chart=deploy/helm/quackmux/Chart.yaml
 duckdb=$(sed -n 's/^DUCKDB_VERSION *?= *//p' Makefile)
 if [ -z "$duckdb" ]; then
 	echo "check-image-refs: no DUCKDB_VERSION in the Makefile" >&2
@@ -60,8 +64,16 @@ elif [ -n "$want" ] && [ "$versions" != "$want" ]; then
 	echo "check-image-refs: the references name release $versions, not $want (run scripts/set-version.sh $want):" >&2
 	git grep -nE "$re" -- ':!.github' ':!scripts' >&2
 	bad=1
+else
+	for field in version appVersion; do
+		v=$(sed -n "s/^$field: *\"\{0,1\}\([^\" ]*\)\"\{0,1\} *\$/\1/p" "$chart")
+		if [ "$v" != "$versions" ]; then
+			echo "check-image-refs: $chart: $field is ${v:-missing}, not $versions (run scripts/set-version.sh $versions)" >&2
+			bad=1
+		fi
+	done
 fi
 if [ "$bad" -ne 0 ]; then
 	exit 1
 fi
-echo "image references: release $versions ($registry/quackmux:$versions, $registry/duckdb-engine:$duckdb-$versions)"
+echo "image references: release $versions ($registry/quackmux:$versions, $registry/duckdb-engine:$duckdb-$versions, chart $chart)"

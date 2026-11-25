@@ -1,0 +1,256 @@
+# Values of the quackmux chart. The defaults render the objects of
+# deploy/kubernetes/base, with ha.enabled those of overlays/ha (README.md,
+# "Unterschiede zu Kustomize" lists what differs). Unknown keys are rejected
+# (values.schema.json).
+
+image:
+  # The gateway image; its entrypoint is the quackmux binary. The engine
+  # image is part of the gateway configuration: profiles.<name>.image (the
+  # shipped one names that of the same release; change it with "config").
+  repository: ghcr.io/lldeters/quackmux
+  # Default: the chart's appVersion, the release the chart belongs to.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Pull secrets for the gateway image. Engine images take theirs from the
+# profile (profiles.<name>.imagePullSecrets in the configuration).
+imagePullSecrets: []
+
+# Gateway replicas. Default: 1, with ha.enabled 2. Without leader election
+# exactly one gateway may manage the engines, so more than one replica
+# requires ha.enabled.
+replicas: null
+
+ha:
+  # Leader election (overlays/ha): every healthy replica is ready, the leader
+  # labels its pod quackmux.io/leader=true, and the Service selects that
+  # label. Also selects the shipped HA configuration (files/config-ha.yaml)
+  # and adds the PodDisruptionBudget and a preferred podAntiAffinity. The
+  # configuration's ha.enabled must match. Switching an installed release
+  # from false to true: scale the gateway to 0 first (README.md).
+  enabled: false
+  # Rollouts with ha.enabled: a new pod starts before an old one goes.
+  # Without room for an additional gateway pod: maxSurge 0, maxUnavailable 1.
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# The gateway configuration (config.yaml) as text, for example
+#   helm install ... --set-file configYaml=my-config.yaml
+# Empty: the configuration of deploy/kubernetes/base (files/config.yaml),
+# with ha.enabled that of overlays/ha (files/config-ha.yaml). Engines must
+# run in the release namespace: provider.kubernetes.namespace is empty or
+# the release namespace (the shipped configuration follows the release
+# namespace on its own).
+configYaml: ""
+
+# Changes to that configuration, merged into it: maps are merged, every other
+# value replaces the one there, null removes a key. Example:
+#   config:
+#     limits:
+#       maxEngines: 80
+#     profiles:
+#       default:
+#         image: registry.example.com/duckdb-engine:2.0.0-1.2.3
+#       large: null
+# With changes the ConfigMap holds the merged configuration without the
+# comments of the file.
+config: {}
+
+# Users of auth.mode static: the users file (users.yaml, auth.static.file)
+# of the Secret <fullname>-users. Only sha256 hashes of the tokens belong
+# here (quackmux token, quackmux hash-token); format: examples/users.yaml.
+# A change takes effect without a restart (kubelet sync plus
+# auth.static.reloadInterval, about a minute). Empty: nobody can log in.
+# The chart refuses what the gateway would refuse (unknown fields such as
+# "disable", duplicate users or tokens, a sha256 that is not 64 hex digits):
+# the gateway would keep the previous users and not start after a restart.
+users: []
+# - name: alice
+#   # The first group is the default for share_level=group.
+#   groups: [analytics]
+#   tokens:
+#     - sha256: "<sha256 from quackmux token>"
+#       description: "laptop"
+
+secrets:
+  # Each secret is either an existing Secret (existingSecret, with the key
+  # named below) or a Secret of the chart with a random value (43 characters)
+  # that the chart generates at the first install and keeps on upgrades
+  # (lookup). helm template and other renderings without a cluster, such as
+  # Argo CD, generate new values every time: use existingSecret there.
+  # existingSecret must not name a Secret the chart generates
+  # (<fullname>-session-key, ...): copy the value into a Secret of your own.
+  # Helm keeps the generated session key and admin token on helm uninstall.
+  sessionKey:
+    # server.sessionKeyFile, key "key": seals gateway connection ids, at least
+    # 16 bytes. Changing it ends all sessions.
+    existingSecret: ""
+  adminToken:
+    # admin.tokenFile, key "token": bearer token of the admin API. The gateway
+    # reads it at start-up; restart it after changing an existing Secret.
+    existingSecret: ""
+  users:
+    # auth.static.file, key "users.yaml"; replaces the list "users" above.
+    existingSecret: ""
+
+# GOMEMLIMIT of the gateway: about 10 % below resources.limits.memory. The
+# largest consumer is the message buffer (server.upstream.bufferBudgetBytes,
+# 1 GiB by default); lower it together with the memory limit. Empty: unset.
+goMemLimit: 1800MiB
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# Ready once the engine registry is synced; with ha.enabled every healthy
+# replica is ready (the leader once it serves, a follower once it could take
+# over).
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 3
+  timeoutSeconds: 2
+  successThreshold: 1
+  failureThreshold: 2
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: admin
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+
+# Pod Security "restricted" (the engines the gateway starts comply with it,
+# too). fsGroup makes the mounted Secrets (mode 0440) readable.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# server.shutdownTimeout (30s) bounds the shutdown, plus margin; raise both
+# together. The chart refuses a value that is not greater than
+# server.shutdownTimeout: shortly before it the gateway answers the queries
+# that still wait, and the kubelet must not kill it earlier.
+terminationGracePeriodSeconds: 45
+
+# For Prometheus setups that discover targets by annotation.
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9495"
+  prometheus.io/path: /metrics
+
+podLabels: {}
+
+# Further environment variables of the gateway container.
+extraEnv: []
+
+# Further volumes and mounts, e.g. a TLS certificate for server.tls:
+#   extraVolumes:
+#     - name: tls
+#       secret:
+#         secretName: quackmux-tls
+#         defaultMode: 0440
+#   extraVolumeMounts:
+#     - name: tls
+#       mountPath: /etc/quackmux/tls
+#       readOnly: true
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+# Default: none; with ha.enabled a preferred podAntiAffinity that spreads the
+# replicas over nodes, so that a node failure leaves a follower. It stays
+# next to other affinity rules (nodeAffinity); affinity.podAntiAffinity
+# replaces it, {} turns it off.
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+serviceAccount:
+  # The gateway's identity at the Kubernetes API. Engine pods never run with
+  # it (profiles.<name>.serviceAccountName gives them their own).
+  create: true
+  # Default: <fullname>-gateway. Required with create: false.
+  name: ""
+  annotations: {}
+
+rbac:
+  # Role and RoleBinding in the release namespace: engine pods, their token
+  # Secrets, the data volumes of persistent profiles, events, the lease of
+  # ha.enabled, and patch on the gateway's own pods (leader label).
+  create: true
+
+# The cluster-internal Service: 9494 (Quack) and 9495 (admin API, probes,
+# /metrics). Clients outside the cluster: externalService.
+service:
+  type: ClusterIP
+  annotations: {}
+
+# A second Service for clients outside the cluster: the Quack port only,
+# through an L4 (TCP) load balancer; keep the admin port internal and put no
+# L7 ingress in front of the gateway (deploy/kubernetes/README.md,
+# "Verbinden"). With ha.enabled it selects the leader alone, too.
+externalService:
+  enabled: false
+  # LoadBalancer or NodePort (loadBalancerSourceRanges and loadBalancerClass
+  # need LoadBalancer).
+  type: LoadBalancer
+  # A FETCH request carries no bytes while the engine computes: raise the
+  # load balancer's idle timeout (provider specific), e.g. on Azure:
+  #   service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout: "30"
+  annotations: {}
+  port: 9494
+  # Keeps the client address (logs, audit) and sends traffic only to the
+  # node of the serving gateway pod.
+  externalTrafficPolicy: Local
+  # Clients that may connect, e.g. [203.0.113.0/24].
+  loadBalancerSourceRanges: []
+  loadBalancerClass: ""
+
+networkPolicy:
+  # Enforced only if the cluster's CNI implements NetworkPolicy. Engines
+  # accept Quack traffic from the gateway only; the gateway's admin port is
+  # open for pods of the namespace that are not engines.
+  enabled: true
+  # Further peers for the admin port 9495, e.g. a Prometheus in another
+  # namespace:
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: monitoring
+  adminFrom: []
+  # Egress of the engines: the cluster, and everything else except the cloud
+  # metadata service (every SQL user of an engine can send HTTP requests).
+  engineEgress:
+    - to:
+        - namespaceSelector: {}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [169.254.169.254/32]
+        - ipBlock:
+            cidr: ::/0
+            except: [fd00:ec2::254/128]
+
+# Object names: <fullname>, <fullname>-gateway, <fullname>-config, ...
+# Default: the release name if it contains "quackmux", else
+# <release>-quackmux.
+fullnameOverride: ""

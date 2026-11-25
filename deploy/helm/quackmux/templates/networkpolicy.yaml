@@ -1,0 +1,70 @@
+{{- /*
+Network isolation (deploy/kubernetes/base/networkpolicy.yaml), enforced only
+if the cluster's CNI implements NetworkPolicy.
+
+Engines: Quack traffic from the gateway only, so that clients can never
+bypass authentication, policy and session handling. Egress: networkPolicy.engineEgress.
+
+Gateway: the Quack port is open for every client, the admin port (API,
+probes, /metrics) only for pods of this namespace that are not engines (SQL
+users of an engine could otherwise call the admin API through httpfs) and for
+networkPolicy.adminFrom.
+*/ -}}
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "quackmux.fullname" . }}-engines
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "engine") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: engine
+      app.kubernetes.io/managed-by: quackmux
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "quackmux.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 9494
+  {{- with .Values.networkPolicy.engineEgress }}
+  egress:
+    {{- toYaml . | nindent 4 }}
+  {{- else }}
+  egress: []
+  {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "quackmux.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quackmux.labels" (dict "root" . "component" "gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "quackmux.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 9494
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: NotIn
+                values: [engine]
+        {{- with .Values.networkPolicy.adminFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 9495
+{{- end }}

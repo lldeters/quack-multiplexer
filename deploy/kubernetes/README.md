@@ -1,7 +1,9 @@
 # quackmux auf Kubernetes
 
 Kustomize-Manifeste für das quackmux-Gateway. Das Gateway startet die Engines (DuckDB 2.0 mit
-`quack_serve`) selbst als Pods in seinem Namespace und räumt sie nach Timeouts wieder ab.
+`quack_serve`) selbst als Pods in seinem Namespace und räumt sie nach Timeouts wieder ab. Dieselben Objekte
+installiert das Helm-Chart [deploy/helm/quackmux](../helm/quackmux/README.md) (mit `ha.enabled` die von
+`overlays/ha`); was dort anders ist, steht in dessen README, alles andere gilt für beide.
 
 ```
 deploy/kubernetes/
@@ -173,7 +175,9 @@ DETACH lake;
 ```
 
 `localhost` spricht der Client per HTTP an. Das Token ist das öffentliche Beispiel-Token aus
-`base/secrets/users.yaml`; mit Ihrem eigenen Overlay gilt Ihr eigenes.
+`base/secrets/users.yaml`; mit Ihrem eigenen Overlay gilt Ihr eigenes. Mit `server.tls` scheitert dieses `ATTACH`
+mit `Bad Request`; dann pinnt der Client das Zertifikat, oder er verbindet sich mit `(DISABLE_SSL false)` und
+`DNS:localhost` im Zertifikat ([docs/tls.md](../../docs/tls.md#was-sich-für-bestehende-clients-ändert)).
 
 ### Im Cluster
 
@@ -184,6 +188,9 @@ Andere Pods erreichen das Gateway unter `quackmux.quackmux.svc.cluster.local:949
 CREATE SECRET (TYPE quack, TOKEN '…', SCOPE 'quack:quackmux.quackmux.svc.cluster.local:9494');
 ATTACH 'quack:quackmux.quackmux.svc.cluster.local:9494' AS lake (DISABLE_SSL true);
 ```
+
+Mit `server.tls` entfällt `DISABLE_SSL` (sonst `Bad Request`); dann muss der Name des Service im Zertifikat
+stehen, oder die Clients pinnen es.
 
 ### Von außen: L4-Load-Balancer
 
@@ -227,9 +234,10 @@ Mit Plain HTTP gehen die Tokens im Klartext über das Netz; außerhalb vertrauen
       keyFile: /etc/quackmux/tls/tls.key
   ```
 
-  Das Zertifikat muss zum Hostnamen passen und für den Client vertrauenswürdig sein. Das Gateway lädt es beim
-  Start; nach einer Erneuerung `kubectl -n quackmux rollout restart deployment/quackmux` (im HA-Modus übergibt
-  der Rollout selbst an einen neuen Pod, siehe unten).
+  Das Zertifikat muss zum Hostnamen passen und für den Client vertrauenswürdig sein, oder die Clients pinnen es
+  ([Selbstsigniertes Zertifikat und `ssl_fingerprint`](#selbstsigniertes-zertifikat-und-ssl_fingerprint)). Das
+  Gateway lädt es beim Start; nach einer Erneuerung `kubectl -n quackmux rollout restart deployment/quackmux` (im
+  HA-Modus übergibt der Rollout selbst an einen neuen Pod, siehe unten).
 * **Idle-Timeout des Load Balancers:** Während die Engine rechnet, fließen in einem FETCH-Request keine Bytes.
   Das Idle-Timeout muss deutlich über der längsten erwarteten Rechenzeit liegen (anbieterspezifische
   Annotation, Beispiel in `service.yaml`).
@@ -242,6 +250,36 @@ Mit Plain HTTP gehen die Tokens im Klartext über das Netz; außerhalb vertrauen
 > Body-Limit auf mindestens 100 MiB, Request-Buffering aus (ingress-nginx:
 > `nginx.ingress.kubernetes.io/proxy-read-timeout`, `…/proxy-send-timeout`, `…/proxy-body-size`,
 > `…/proxy-request-buffering: "off"`).
+
+### Selbstsigniertes Zertifikat und `ssl_fingerprint`
+
+Ohne CA genügt ein selbstsigniertes Zertifikat, wenn die Clients seinen SHA-256-Fingerprint pinnen. Zertifikat,
+Secret (für den Patch oben) und Fingerprint (die Namen im `subjectAltName` brauchen nur Clients, die das Zertifikat
+statt eines Pins als CA hinterlegen):
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 730 \
+  -subj '/CN=quackmux.example.com' \
+  -addext 'subjectAltName=DNS:quackmux.example.com,DNS:quackmux.quackmux.svc.cluster.local,DNS:localhost' \
+  -keyout tls.key -out tls.crt
+kubectl -n quackmux create secret tls quackmux-tls --cert=tls.crt --key=tls.key
+kubectl -n quackmux get secret quackmux-tls -o jsonpath='{.data.tls\.crt}' | base64 -d |
+  openssl x509 -noout -fingerprint -sha256 | cut -d= -f2
+```
+
+```sql
+SET GLOBAL http_timeout = 86400;
+CREATE SECRET (TYPE quack, TOKEN 'mein-token?subdomain=bi', SSL_FINGERPRINT 'F8:C0:31:…:BB:7D',
+               SCOPE 'quack:quackmux.example.com:9494');
+ATTACH 'quack:quackmux.example.com:9494' AS lake;
+```
+
+Ein gepinnter Client prüft nur den Fingerprint, nicht Hostname oder Ablaufdatum. Er sendet keine
+`EXTRA_HTTP_HEADERS` (Optionen gehören in den Token) und bricht ohne das `SET GLOBAL http_timeout` jeden Request
+nach 30 s ab, ohne geladenes httpfs nach 300 s: auch ein `ATTACH`, das auf den Start einer Engine wartet, und ein
+FETCH, der auf die Zeilen einer langen Query wartet. Ein neues Zertifikat ändert den Fingerprint; das Gateway
+liefert es mit dem nächsten Neustart aus, die Clients brauchen dann den neuen Pin. Details und Fehlermeldungen:
+[docs/tls.md](../../docs/tls.md).
 
 ## Share-Levels und Optionen
 
@@ -525,11 +563,16 @@ Konfiguration ab.
 
 ## Entwicklung mit kind (`overlays/dev`)
 
-`auth.mode: none`, Admin-API ohne Token, kleine Ressourcen (Gateway bis 512 MiB, Engines 100m/256 MiB
-angefordert, bis 1 CPU/1 GiB), höchstens 8 Engines, Debug-Logs im Textformat. Das Profil `persistent`
-(`TOKEN 'dev?user=alice&profile=persistent'`) gibt jedem Benutzer ein Volume von 1 GiB aus der
-Default-StorageClass von kind. **Nur auf dem eigenen Rechner verwenden:** Jeder Client darf sich jeden
-Benutzernamen aussuchen.
+`auth.mode: none`, Admin-API ohne Token, kleine Ressourcen (Gateway bis 512 MiB, Engines 100m/256 MiB/256 MiB
+Platte angefordert, bis 1 CPU/1 GiB/4 GiB Platte, davon bis 2 GiB Auslagerung), höchstens 8 Engines, Debug-Logs im
+Textformat. Das Profil `persistent` (`TOKEN 'dev?user=alice&profile=persistent'`) gibt jedem Benutzer ein Volume
+von 1 GiB aus der Default-StorageClass von kind. **Nur auf dem eigenen Rechner verwenden:** Jeder Client darf sich
+jeden Benutzernamen aussuchen.
+
+Ein kind-Node meldet als ephemeren Speicher die Größe der Platte des Hosts, nicht ihren freien Platz
+(`kubectl get nodes -o custom-columns=NAME:.metadata.name,EPHEMERAL:.status.allocatable.ephemeral-storage`). Die
+Requests der Engines (zusammen höchstens 2 GiB) passen deshalb praktisch immer; eine auslagernde Engine braucht den
+Platz aber wirklich ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)).
 
 ```sh
 kind create cluster --name quackmux
@@ -787,7 +830,9 @@ Profil entfernt oder das Gateway neu ausgerollt wird. Das Gateway löscht sie ni
 * Plattenplatz begrenzen: Eine ResourceQuota im Namespace (`count/persistentvolumeclaims`, `requests.storage`)
   deckelt alle Volumes. Scheitert das Anlegen an ihr, meldet der Client `… exceeded quota …`.
 * Bei einer Datei-Datenbank lagert DuckDB Zwischenergebnisse neben der Datei aus (`engine.duckdb.tmp`, also auf dem
-  Volume). Mit `settings.temp_directory: /tmp/duckdb-spill` landen sie im `emptyDir` des Pods.
+  Volume). Mit `settings.temp_directory: /tmp/duckdb-spill` (wie im Profil `persistent` von `overlays/dev`) landen
+  sie im `emptyDir` des Pods, unter denselben Grenzen wie bei `:memory:`
+  ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)).
 * Beim Beenden macht der Entrypoint einen `FORCE CHECKPOINT`, höchstens `QUACKMUX_STOP_TIMEOUT` lang (Grace Period
   minus 5 s). Große Datenbanken brauchen eine längere `provider.kubernetes.deleteGracePeriod`; sonst spielt die
   nächste Engine das WAL beim Start ein, was gegen `startupTimeout` zählt. Das Bereitstellen eines neuen Volumes
@@ -853,6 +898,44 @@ Eine einzige schreibbare Datei für alle: ein Profil mit `allowedShareLevels: [S
 `allowedSubdomains: [default]` und `persistence` (Umstieg von einem PVC im `podTemplate`: siehe
 [oben](#umstieg-von-einem-pvc-im-podtemplate)).
 
+## Plattenplatz für Auslagerungen
+
+Reicht `memory_limit` nicht, lagert DuckDB Zwischenergebnisse in sein Temp-Verzeichnis aus: bei `:memory:` nach
+`/tmp/.tmp`, bei einer Datenbankdatei daneben (`<datei>.tmp`). `/tmp` ist ein `emptyDir` auf der Platte des
+Nodes, das das Gateway jedem Engine-Pod mitgibt. Ohne Grenze belegt DuckDB bis zu 90 % des freien Platzes; eine
+einzige Query kann so den Node füllen. Die mitgelieferten Profile setzen deshalb zwei Grenzen:
+
+| Profil | `memory_limit` / `limits.memory` | `settings.max_temp_directory_size` | `ephemeral-storage` Request / Limit |
+|---|---|---|---|
+| `default` (base, ha) | 3GB / 4Gi | 8GiB | 1Gi / 10Gi |
+| `large` (base, ha) | 12GB / 16Gi | 32GiB | 1Gi / 34Gi |
+| `default`, `persistent` (dev) | 700MB / 1Gi | 2GiB | 256Mi / 4Gi |
+
+* **`settings.max_temp_directory_size`**, das Doppelte von `limits.memory`: Braucht eine Query mehr, scheitert nur
+  sie (`Out of Memory Error: failed to offload data block … This limit was set by the 'max_temp_directory_size'
+  setting.`), Session und Engine bleiben.
+* **`resources.limits.ephemeral-storage`**, 2 GiB darüber für das Container-Log und andere Dateien in `/tmp`: Das
+  `emptyDir` hat kein `sizeLimit`, zählt aber zum ephemeren Speicher des Pods. Belegt der Pod mehr, räumt das
+  Kubelet die Engine (Event `Evicted`: `Pod ephemeral local storage usage exceeds the total limit of containers …`),
+  und alle ihre Sessions enden ([Fehlersuche](#fehlersuche)). Das Limit des Pods ist die Summe der Container-Limits;
+  Sidecars aus dem `podTemplate` mit eigenem Limit erhöhen es.
+* **`resources.requests.ephemeral-storage`** bleibt klein: Ohne Auslagern braucht eine Engine kaum Platte, und der
+  kleine Request hält die Profile auch auf Nodes mit wenig Platte planbar. Der Scheduler reserviert aber nur den
+  Request: Lagern mehrere
+  Engines eines Nodes gleichzeitig aus, kann seine Platte volllaufen, und das Kubelet räumt zuerst die Pods, die
+  mehr als ihren Request belegen (kind schaltet diese Schwelle ab). Wer das ausschließen will, setzt den Request
+  auf das Limit und braucht Nodes mit so viel freier Platte.
+* **Eigene Werte:** `max_temp_directory_size` unter `limits.ephemeral-storage` halten (`GiB` bei DuckDB und `Gi`
+  bei Kubernetes sind dieselbe Einheit, `GB` bei DuckDB ist kleiner). Die Nodes brauchen den Platz wirklich: Hat
+  ein Node weniger frei als `max_temp_directory_size`, läuft er voll, bevor eine der Grenzen greift.
+* **Persistente Profile:** Mit einer Datenbankdatei lagert DuckDB auf dem Volume aus und belegt dort den Platz der
+  Daten. Das Profil `persistent` von `overlays/dev` setzt deshalb `settings.temp_directory: /tmp/duckdb-spill`;
+  dann gelten dieselben Grenzen wie bei `:memory:`. Wer doch auf dem Volume auslagert, hält
+  `max_temp_directory_size` unter dessen freiem Platz, der mit den Daten schrumpft.
+* **Geteilte Engines:** Ohne `lock_configuration` kann jede Session die Grenze von DuckDB per `SET GLOBAL
+  max_temp_directory_size` verschieben; dann bleibt nur das Limit des Kubelets, und es trifft alle Sessions der
+  Engine. Eine gehärtete Engine sperrt das ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)).
+
 ## Härtung geteilter Engines
 
 Das Gateway authentifiziert, wählt die Engine und setzt Limits durch. **SQL prüft es nicht**: Innerhalb einer
@@ -893,12 +976,10 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   Query, deren Ergebnis kein Client abholt, kann auf der Engine weiterrechnen, bis die nächste Query der Session sie
   ersetzt oder die Session endet; eine Grenze, die kein Client umgeht, setzt `SET GLOBAL max_execution_time`
   ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines), „Laufzeit der Engine begrenzen“).
-* **Plattenplatz:** Bei Speicherdruck lagert DuckDB Zwischenergebnisse aus: bei `:memory:` nach `/tmp/.tmp` (ein
-  `emptyDir` auf der Platte des Nodes), bei einer Datei daneben (`<datei>.tmp`, also auf deren Volume). Ohne
-  Grenze darf das bis zu 90 % des freien Platzes belegen; eine einzige Query kann so den Node füllen und andere
-  Pods verdrängen. Setzen Sie je Profil `settings.max_temp_directory_size` und darüber
-  `resources.limits.ephemeral-storage` (mit passendem `requests`-Wert): Dann scheitert die Query mit einem
-  Fehler, statt dass der Node volläuft, und im Notfall räumt das Kubelet nur diese Engine.
+* **Plattenplatz:** Die Auslagerungen aller Sessions einer Engine teilen sich ihre Grenzen
+  ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)): Eine Session, die viel auslagert, lässt die
+  Queries der anderen scheitern. Ohne `lock_configuration` kann sie zudem `max_temp_directory_size` anheben; dann
+  räumt das Kubelet die Engine samt allen Sessions.
 * **Sandbox:** Wo vorhanden, isoliert eine Sandbox-Runtime die Engines zusätzlich
   (`profiles.<name>.podTemplate.spec.runtimeClassName`, z. B. gVisor).
 * **Namespace:** Pod Security `restricted` ist aktiv. Das Gateway darf alle Secrets des Namespace lesen;
@@ -1099,7 +1180,9 @@ Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nic
 
 | Symptom | Ursache und Abhilfe |
 |---|---|
-| Engine-Pod bleibt `Pending`; Client: `quackmux: could not provide an engine: engine did not become ready in time (3m0s)` | Zu wenig CPU oder Speicher für die Requests des Profils, ResourceQuota, NodeSelector oder Taints passen nicht. `kubectl describe pod` zeigt den Grund in den Events. Requests verkleinern, Nodes ergänzen oder `startupTimeout` erhöhen (etwa wenn der Cluster-Autoscaler erst einen Node startet). |
+| Engine-Pod bleibt `Pending`; Client: `quackmux: could not provide an engine: engine did not become ready in time (3m0s)` | Zu wenig CPU, Speicher oder ephemerer Speicher für die Requests des Profils (Events: `Insufficient cpu`, `Insufficient memory`, `Insufficient ephemeral-storage`), ResourceQuota, NodeSelector oder Taints passen nicht. `kubectl describe pod` zeigt den Grund in den Events. Requests verkleinern, Nodes ergänzen oder `startupTimeout` erhöhen (etwa wenn der Cluster-Autoscaler erst einen Node startet). |
+| `Out of Memory Error: failed to offload data block … This limit was set by the 'max_temp_directory_size' setting.` | Die Query braucht mehr Platz zum Auslagern, als `settings.max_temp_directory_size` des Profils erlaubt. Nur sie scheitert, Session und Engine bleiben; auf einer geteilten Engine zählen die Auslagerungen aller Sessions zusammen. Mehr Speicher (`memory_limit` und `limits.memory`) oder die Grenze zusammen mit `limits.ephemeral-storage` anheben ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)). |
+| `quackmux: session closed: engine failed: engine container terminated: Completed (exit code 0)` oder `… engine failed: pod failed: Evicted: …`; Event `Evicted` am Engine-Pod: `Pod ephemeral local storage usage exceeds the total limit of containers …` | Das Kubelet hat die Engine geräumt: Der Pod belegte mehr als `limits.ephemeral-storage` (Auslagerungen und andere Dateien in `/tmp`, Container-Log). Die Engine beendet sich dabei sauber; in Kubernetes 1.37 endet der Pod deshalb als `Succeeded` ohne Grund, und nur sein Event nennt die Räumung (`kubectl -n quackmux get events --field-selector involvedObject.name=<pod>`). Setzt Kubernetes den Grund am Pod, steht er in der Meldung (`pod failed: Evicted: …`). Alle Sessions der Engine enden, das nächste `ATTACH` startet eine neue. Meist hat auf einer Engine ohne `lock_configuration` eine Session die Grenze per `SET GLOBAL max_temp_directory_size` angehoben oder selbst Dateien nach `/tmp` geschrieben; sonst liegt `max_temp_directory_size` zu nah am Limit. Mit `The node was low on resource: ephemeral-storage` war stattdessen die Platte des Nodes voll: Die kleinen Requests überbuchen sie, und das Kubelet räumt zuerst Pods, die mehr als ihren Request belegen ([Plattenplatz für Auslagerungen](#plattenplatz-für-auslagerungen)). Der geräumte Pod bleibt `engine.failedRetention` lang stehen. |
 | `ImagePullBackOff` / `ErrImagePull` | Image-Name oder Tag falsch, Registry nicht erreichbar, private Registry ohne `imagePullSecrets`. Gateway: Deployment patchen; Engines: `profiles.<name>.image` und `imagePullSecrets`. kind: Images mit `kind load docker-image` laden. Fehlgeschlagene Engine-Pods bleiben `engine.failedRetention` (10 min) zur Analyse stehen. |
 | Gateway-Log: `launch failed: … violates PodSecurity "restricted…"` | Ein Pod-Template des Profils enthält einen Container ohne gehärteten Security-Context (z. B. einen Sidecar). Template anpassen oder den Namespace bewusst auf `enforce: baseline` stellen. |
 | Gateway-Pod in `CrashLoopBackOff` | `kubectl -n quackmux logs deployment/quackmux --previous` (mit `overlays/ha`: `kubectl -n quackmux logs <pod> --previous`, sonst wählt kubectl einen bereiten Pod): Konfigurationsfehler (unbekanntes Feld), fehlende oder ungültige `users.yaml`, Session-Key kürzer als 16 Bytes. |
@@ -1111,7 +1194,7 @@ Mit `overlays/ha` zeigt `logs deployment/quackmux` irgendeinen bereiten Pod, nic
 | `quackmux: session closed: the engine no longer knows this connection. DETACH and ATTACH again to reconnect.` | Nach einem Neustart oder einer Übernahme fand das Gateway die Verbindung des Clients nicht mehr auf seiner Engine: Die Engine hat inzwischen neu gestartet, oder der Client war länger fort als die Engine-Lease seiner Verbindung (`session.backendHeartbeatTimeout`), und die Engine hat sie entfernt ([Neustarts und verwaiste Verbindungen](#neustarts-und-verwaiste-verbindungen)). `DETACH` und erneut `ATTACH`. |
 | Gateway-Log: `cannot list the connections of a recovered engine: its orphaned connections stay open` | Das Gateway kann die verwaisten Verbindungen dieser Engine nicht schließen; sie bleiben bis zum Ende der Engine. Mit `hint` zu 2048: Die Engine hat mehr als 2048 Verbindungen. Sonst war die Engine nicht erreichbar. |
 | Gateway-Log: `not closing orphaned connections: the authorization function of the engine refuses the listing` | Die gehärtete Engine läuft mit `quackmux_authorize` (oder einem älteren oder eigenen Makro), das das Listing ablehnt; ihre verwaisten Verbindungen bleiben bis zum Ende der Engine. Erreicht außer dem Gateway niemand ihren Port, lässt `quackmux_authorize_listing` das Listing durch ([Gehärtete geteilte Engines](#gehärtete-geteilte-engines)). |
-| `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
+| `Failed to send message` oder SSL-Fehler beim `ATTACH` | HTTPS und HTTP passen nicht zusammen. Ohne `server.tls` spricht das Gateway Plain HTTP; für jeden Host außer `localhost` braucht der Client dann `(DISABLE_SSL true)`. Umgekehrt darf `DISABLE_SSL` nicht gesetzt sein, wenn Gateway oder Load Balancer TLS sprechen (das Gateway antwortet sonst mit HTTP 400); `localhost` (Port-Forward) braucht dann einen Pin oder `(DISABLE_SSL false)` ([docs/tls.md](../../docs/tls.md#fehlermeldungen)). Steht ein L7-Proxy davor, sind auch dessen Timeouts und Body-Limits verdächtig (siehe „Verbinden“). |
 | `quackmux: gateway is not ready: not the leader` | Der Request landet bei einem Follower: ein Port-Forward auf einen bestimmten Pod oder, mit `overlays/ha`, ein Service ohne `quackmux.io/leader: "true"` im Selektor. `svc/quackmux` verwenden bzw. den Selektor ergänzen; `quackmux_requests_total{outcome="not_leader"}` zählt solche Requests. Der Request lief nicht. |
 | HA: Gateway-Pod bleibt `0/1 READY`, `/readyz` meldet `label quackmux.io/leader of pod … not yet removed: …` | Der Pod kann sein Leader-Label nicht entfernen, meist weil die API nicht erreichbar ist; bis dahin bekommt er keinen Traffic. `waiting to campaign for leadership` ist in den ersten `3 × ha.retryPeriod` nach dem Start normal, `stepping down: the lease is no longer fresh` bei einem Leader, der seine Lease verloren hat, bis zu seinem Neustart als Follower. |
 | HA: Follower bleibt `0/1 READY`, `/readyz` meldet `no request for lease … has succeeded …`, Log: `Error retrieving lease lock … forbidden` | Der Follower darf die Lease nicht nutzen oder erreicht die API nicht und könnte nie übernehmen: Im Namespace der Lease (`ha.namespace`, sonst der Engine-Namespace) fehlen Role und RoleBinding aus `base/rbac.yaml`. |

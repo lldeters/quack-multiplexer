@@ -1,0 +1,14 @@
+# Values of helm.sh for the dev setup: a small gateway like
+# deploy/kubernetes/overlays/dev/deployment-patch.yaml. helm.sh adds the
+# images that setup.sh loaded, the configuration of overlays/dev
+# (--set-file configYaml) and the namespace of its engines.
+image:
+  pullPolicy: IfNotPresent
+goMemLimit: 450MiB
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi

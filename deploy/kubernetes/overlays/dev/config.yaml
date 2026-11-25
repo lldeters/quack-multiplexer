@@ -58,7 +58,8 @@ engine:
 
 limits:
   # Enough for a few users and the end-to-end tests (test/e2e/kind), small
-  # enough for a laptop: every engine requests 100m CPU and 256 MiB.
+  # enough for a laptop: every engine requests 100m CPU, 256 MiB of memory
+  # and 256 MiB of disk.
   maxSessions: 100
   maxSessionsPerUser: 20
   maxEngines: 8
@@ -78,16 +79,23 @@ profiles:
     #   kind load docker-image quackmux/duckdb-engine:2.0.0
     image: quackmux/duckdb-engine:2.0.0
     imagePullPolicy: IfNotPresent
+    # Spill space twice limits.memory; the disk limit adds 2 GiB for the log
+    # and other files in /tmp (see ../../base/config.yaml). The requests keep
+    # eight engines schedulable on a kind node, which reports the size of the
+    # host's disk.
     settings:
       memory_limit: 700MB
       threads: "1"
+      max_temp_directory_size: 2GiB
     resources:
       requests:
         cpu: 100m
         memory: 256Mi
+        ephemeral-storage: 256Mi
       limits:
         cpu: "1"
         memory: 1Gi
+        ephemeral-storage: 4Gi
 
   persistent:
     description: "Development engine with a data volume per user"
@@ -100,16 +108,23 @@ profiles:
     # ReadWriteOncePod. The database is /data/engine.duckdb.
     persistence:
       size: 1Gi
+    # Spill into the emptyDir at /tmp, as with the default profile: DuckDB
+    # would put it next to the database file (/data/engine.duckdb.tmp), where
+    # it takes the space of the data.
     settings:
       memory_limit: 700MB
       threads: "1"
+      max_temp_directory_size: 2GiB
+      temp_directory: /tmp/duckdb-spill
     resources:
       requests:
         cpu: 100m
         memory: 256Mi
+        ephemeral-storage: 256Mi
       limits:
         cpu: "1"
         memory: 1Gi
+        ephemeral-storage: 4Gi
 
 audit:
   enabled: true

@@ -20,8 +20,12 @@ Everything quackmux relies on is listed here. File paths refer to
   (up to about 32 MiB each), HEARTBEAT, CANCEL and catalog PREPAREs (`query_uuid {0,0}`) run in parallel as well.
   Requests must be routed by the header `connection_id` only.
 - **Timeouts.** Client requests time out after 86400 s (`HTTP_TIMEOUT_SECONDS`). Clients that pin
-  `ssl_fingerprint` use `http_timeout`, 30 s by default, which matters for engine cold starts. There are no
-  Quack-level retries. libcurl may resend a POST when a reused socket was closed before any answer, which would
+  `ssl_fingerprint` use their own cpp-httplib client (`PinnedHttpsQuackClient`, no httpfs): its connect, read and
+  write timeouts are the global value of `http_timeout` (30 s by default) when httpfs is loaded, else the
+  cpp-httplib defaults (300 s connect and read, 5 s write). That bounds every request, the handshake during an
+  engine cold start and the long-polled PREPAREs and FETCHes alike. `SET GLOBAL http_timeout = 86400` before
+  ATTACH lifts it; a session-scoped `SET http_timeout` does not (verified with DuckDB v2.0.0, see docs/tls.md).
+  There are no Quack-level retries. libcurl may resend a POST when a reused socket was closed before any answer, which would
   re-run a PREPARE. **Never close a connection after reading a request without answering it.**
 - **Heartbeats** run at `timeout/3 · [0.8, 1.2]`, and failures are swallowed. A hung heartbeat blocks DETACH.
   DETACH sends DISCONNECT with a 2 s timeout.
@@ -29,7 +33,15 @@ Everything quackmux relies on is listed here. File paths refer to
   pinned path (`PinnedHttpsQuackClient`) sends none. Routing options travel in the token (`secret?share_level=…`)
   or in those headers, not as ATTACH options: quack `main` rejects unknown ATTACH options (`quack_storage.cpp`),
   the version shipped with DuckDB 2.0.0 ignores them silently.
-- **TLS default.** The client assumes HTTPS for every non-localhost host unless `DISABLE_SSL true`.
+- **TLS default.** The client assumes HTTPS for every non-localhost host unless `DISABLE_SSL true`; for
+  `localhost`, `127.0.0.1` and `::1` it uses HTTP unless `DISABLE_SSL false` or a pinned `ssl_fingerprint`.
+- **CA file on the httpfs path.** The fetch-ahead (`quack_fetch_ahead.cpp`) sends FETCHes with up to
+  `quack_fetch_read_ahead` (default: `async_threads`) extra HTTP clients, whose parameters are built without a
+  `ClientContext` from the global settings only. A session-scoped `SET ca_cert_file` therefore covers the
+  handshake and small results, but a result that needs FETCHes fails with `SSL peer certificate or SSH remote key
+  was not OK`; the failed clients return to the attachment's pool, so later queries fail too. `SET GLOBAL
+  ca_cert_file` works. A set `ca_cert_file` replaces the system CA bundle (`httpfs_certificates.cpp`). Verified
+  with DuckDB v2.0.0, see docs/tls.md.
 - **Content-Type** is not reliable: curl sends `application/octet-stream`. curl sends `Expect: 100-continue` for
   bodies over 1 MiB.
 

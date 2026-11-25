@@ -1,0 +1,36 @@
+# Values of helm.sh for ha.enabled: the shipped HA configuration of the chart
+# (static users, generated admin token) with a small gateway and small
+# engines for kind. helm.sh adds the images that setup.sh loaded and a
+# static user.
+ha:
+  enabled: true
+image:
+  pullPolicy: IfNotPresent
+goMemLimit: 450MiB
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+config:
+  server:
+    upstream:
+      # Fits the 512 MiB container (the default of 1 GiB would not).
+      bufferBudgetBytes: 268435456
+  limits:
+    maxEngines: 8
+  profiles:
+    default:
+      settings:
+        memory_limit: 700MB
+        threads: "1"
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+    large: null
