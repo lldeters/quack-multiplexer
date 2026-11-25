@@ -3,8 +3,10 @@ package proxy_test
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -277,5 +279,50 @@ func TestFailedCancelsDoNotFillTheSession(t *testing.T) {
 	mustType(t, h.prepare(c, "SELECT 1", uuidA), wire.TypePrepareResponse)
 	if n := requestCount(t, h.met, "too_many_queries"); n != 0 {
 		t.Fatalf("%v requests refused as too_many_queries", n)
+	}
+}
+
+// A DuckDB-like client: one query at a time, 16 read-aheads per query that
+// straggle past the end of the result, executions of prepared statements,
+// catalog queries with the zero uuid, COMMITs, and scans it stops early
+// without a CANCEL. The session never comes near the bound.
+func TestDuckDBLikeClientStaysFarFromTheBound(t *testing.T) {
+	h := newHarness(t, "limits: {queryTimeout: 1m}\n", nil)
+	c := h.connect("tok?user=alice", nil)
+	most := 0
+	for i := 0; i < 300; i++ {
+		u := wire.Hugeint{Upper: rand.Int64(), Lower: rand.Uint64()}
+		switch i % 5 {
+		case 0: // a catalog query with the zero uuid, answered inline
+			mustType(t, h.prepare(c, "SELECT 1", wire.Hugeint{}), wire.TypePrepareResponse)
+		case 1: // a streamed result read to its end with 16 read-aheads
+			mustType(t, h.prepare(c, "STREAM 20 1", u), wire.TypePrepareResponse)
+			var wg sync.WaitGroup
+			for b := uint64(1); b <= 21; b++ {
+				wg.Add(1)
+				go func() { defer wg.Done(); h.fetch(c, u, b) }()
+				if b%16 == 0 {
+					wg.Wait()
+				}
+			}
+			wg.Wait()
+		case 2: // a scan with LIMIT: two batches, then the next query
+			mustType(t, h.prepare(c, "STREAM 50 1", u), wire.TypePrepareResponse)
+			h.fetch(c, u, 1)
+			h.fetch(c, u, 2)
+		case 3: // an execution of a prepared statement, answered inline
+			mustType(t, h.prepare(c, fmt.Sprintf("SELECT %d", i), u), wire.TypePrepareResponse)
+		case 4:
+			mustType(t, h.prepare(c, "COMMIT", wire.Hugeint{}), wire.TypePrepareResponse)
+		}
+		if _, q := proxy.TrackedQueries(h.gw); q > most {
+			most = q
+		}
+	}
+	if most > 3 {
+		t.Errorf("a client with one query at a time had %d queries followed at once", most)
+	}
+	if n := requestCount(t, h.met, "too_many_queries"); n != 0 {
+		t.Errorf("%v requests refused as too_many_queries", n)
 	}
 }
