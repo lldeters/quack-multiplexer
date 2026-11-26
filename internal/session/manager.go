@@ -156,6 +156,9 @@ type Manager struct {
 	bgMu       sync.Mutex     // orders spawn against Shutdown
 	bgClosed   bool
 	stop       chan struct{} // closed by Shutdown
+	// disconnectRetries are the waits before the retries of a DISCONNECT
+	// that failed (see disconnect).
+	disconnectRetries []time.Duration
 
 	// adoptions confirms each adopted session with the engine once, also
 	// when many requests of it arrive at the same time.
@@ -177,6 +180,8 @@ func NewManager(cfg *config.Config, engines Engines, backend Backend, sealer *Se
 		perUser:    map[string]int{},
 		pending:    map[string]int{},
 		stop:       make(chan struct{}),
+
+		disconnectRetries: []time.Duration{time.Second, 3 * time.Second},
 	}
 }
 
@@ -557,17 +562,16 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 		m.spawn(func() {
 			ctx := context.Background()
 			if mode.Cancel {
-				if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil {
-					m.log.Debug("cancel on close failed", "session", s.ID, "err", err)
+				if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil && !sessionGone(err) {
+					m.log.Warn("cancelling the query of a closed session failed; it may keep running on the engine",
+						"session", s.ID, "engine", s.EngineID, "err", err)
 				}
 			}
 			if mode.Disconnect {
 				if hold != nil {
 					m.awaitRelease(s, target, hold)
 				}
-				if err := m.backend.Disconnect(ctx, target.Endpoint, s.BackendConnID); err != nil {
-					m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
-				}
+				m.disconnect(s, target)
 				if hold != nil {
 					m.setHeld(s.ID, false)
 				}
@@ -575,6 +579,41 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 		})
 	}
 	return true
+}
+
+// disconnect sends the DISCONNECT of a closed session to its engine and
+// retries it after a failure (m.disconnectRetries). A connection the engine
+// keeps would bring the session back if the client is still attached when
+// a gateway restart forgets the tombstone (adoption confirms the session
+// with the engine), until its engine lease runs out. A connection the engine
+// no longer knows counts as closed. A shutdown ends the retries.
+func (m *Manager) disconnect(s *Session, target engine.Target) {
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = m.backend.Disconnect(context.Background(), target.Endpoint, s.BackendConnID)
+		if err == nil || sessionGone(err) {
+			return
+		}
+		if attempt >= len(m.disconnectRetries) {
+			break
+		}
+		select {
+		case <-time.After(m.disconnectRetries[attempt]):
+		case <-m.stop:
+			m.log.Warn("closing the engine connection of a closed session was cut short by the shutdown",
+				"session", s.ID, "engine", s.EngineID, "err", err)
+			return
+		}
+	}
+	m.log.Warn("closing the engine connection of a closed session failed; the engine keeps it until its lease runs out",
+		"session", s.ID, "engine", s.EngineID, "attempts", len(m.disconnectRetries)+1, "err", err)
+}
+
+// sessionGone reports whether err is the engine's answer for a connection
+// it no longer has.
+func sessionGone(err error) bool {
+	var ee *upstream.EngineError
+	return errors.As(err, &ee) && upstream.IsSessionGone(ee.Response.Message)
 }
 
 // setHeld marks the tombstone of a closed session as held (see tombstone).
