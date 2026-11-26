@@ -59,8 +59,10 @@ server:
     # engine until the next batch is ready, so a limit must exceed the
     # longest expected wait for the first rows of a query.
     responseHeaderTimeout: 0s
-    # Idle keep-alive connections kept per engine.
-    maxIdleConnsPerEngine: 64
+    # Idle keep-alive connections kept per engine. A DuckDB client keeps up
+    # to 256 FETCH long-polls open per session; the engine serves up to 1024
+    # connections, one thread each.
+    maxIdleConnsPerEngine: 256
     # Idle keep-alive connections are closed after this long.
     idleConnTimeout: 90s
     # Timeout of requests the gateway sends on its own (DISCONNECT and
@@ -82,6 +84,10 @@ server:
     maxBufferedRequestBytes: 104857600
     maxBufferedResponseBytes: 67108864
     bufferBudgetBytes: 1073741824
+    # One user's messages take at most this share of the budget at a time
+    # (default a quarter of it): a single user cannot push everyone else
+    # onto streaming. Their further messages are streamed. -1 disables it.
+    maxBufferedBytesPerUser: 268435456
     # Larger requests are rejected up front with a Quack error (100 MiB, the
     # engine's own limit).
     maxRequestBytes: 104857600
@@ -117,7 +123,10 @@ auth:
     defaultGroups: []
 
   # mode static: YAML file with users, groups and the sha256 of their tokens
-  # (format: examples/users.yaml).
+  # (format: examples/users.yaml). Changes also apply to open sessions: at
+  # each session.checkInterval the gateway closes the sessions of removed or
+  # disabled users, of removed or expired tokens and of users who left the
+  # group of a GROUP session.
   static:
     # Required for mode static (no default).
     file: /etc/quackmux/users/users.yaml
@@ -154,6 +163,10 @@ auth:
     jwksRefresh: 15m
     # Tolerated clock skew for exp, nbf and iat.
     leeway: 30s
+    # A JWT is checked when a session opens; the session then runs past
+    # "exp". true closes it at the first session check after "exp" (not
+    # for sessions adopted after a gateway restart).
+    closeSessionsAtExpiry: false
 
 # -----------------------------------------------------------------------------
 # Routing of a session unless the client asks for something else. Priority:

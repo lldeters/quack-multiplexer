@@ -53,6 +53,8 @@ type jwtAuthenticator struct {
 	jwks        *jwksSource
 	userClaim   string
 	groupsClaim string
+	// closeAtExpiry sets Identity.Expires (auth.jwt.closeSessionsAtExpiry).
+	closeAtExpiry bool
 }
 
 func newJWT(cfg config.JWTAuthConfig, log *slog.Logger, o jwtOptions) (*jwtAuthenticator, error) {
@@ -139,6 +141,8 @@ func newJWT(cfg config.JWTAuthConfig, log *slog.Logger, o jwtOptions) (*jwtAuthe
 		jwks:        jwks,
 		userClaim:   cmp.Or(strings.TrimSpace(cfg.UserClaim), defaultUserClaim),
 		groupsClaim: cmp.Or(strings.TrimSpace(cfg.GroupsClaim), defaultGroupsClaim),
+
+		closeAtExpiry: cfg.CloseSessionsAtExpiry,
 	}
 	attrs := []any{"algorithms", algs, "fileKeys", len(files.keys), "issuer", issuer, "audience", audience,
 		"userClaim", a.userClaim, "groupsClaim", a.groupsClaim, "leeway", leeway}
@@ -232,7 +236,14 @@ func (a *jwtAuthenticator) Authenticate(ctx context.Context, req Request) (Ident
 	if err != nil {
 		return Identity{}, unauthenticated("%v", err)
 	}
-	return Identity{User: user, Groups: groups, Method: MethodJWT}, nil
+	id := Identity{User: user, Groups: groups, Method: MethodJWT}
+	if a.closeAtExpiry {
+		// The parser required exp.
+		if exp, err := claims.GetExpirationTime(); err == nil && exp != nil {
+			id.Expires = exp.Time
+		}
+	}
+	return id, nil
 }
 
 // Close implements Authenticator. It stops the JWKS refresh.

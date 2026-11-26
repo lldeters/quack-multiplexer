@@ -90,6 +90,12 @@ const (
 // The upstream client applies its own (shorter) control timeout as well.
 const cancelTimeout = 30 * time.Second
 
+// MaxRequestDuration is the longest an admin request takes (cancelTimeout,
+// volumeTimeout). The ReadTimeout of the admin listener must be longer:
+// net/http cancels the request context when the read deadline passes, also
+// while the handler runs.
+const MaxRequestDuration = max(cancelTimeout, volumeTimeout)
+
 // Options wires a Server.
 type Options struct {
 	// Sessions and Engines are the managers the API inspects and controls.

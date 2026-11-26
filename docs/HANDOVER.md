@@ -56,7 +56,7 @@ den Research-Notes, die gegen DuckDB v2.0.0 geprüften im Abschnitt „Verified 
 | Sessions (versiegelte IDs ≤ 140 Zeichen, Timeouts, Lease, Keepalive, Adoption, Tombstones) | `internal/session` | fertig |
 | Engine-Manager (Single-Flight-Start, Pools, Warm-Pool, Drain, Spec-Drift, Recovery-Grace, permanente Static-Engines) | `internal/engine` | fertig |
 | Provider: Kubernetes, process (lokal), static, fake | `internal/engine/*` | fertig; Kubernetes in kind, process mit echter CLI geprüft |
-| Auth: static (SHA-256-Token-Datei, Hot-Reload, SIGHUP), jwt (HS/RS/ES/EdDSA, JWKS), none | `internal/auth` | fertig |
+| Auth: static (SHA-256-Token-Datei, Hot-Reload, SIGHUP, Widerruf beendet offene Sessions), jwt (HS/RS/ES/EdDSA, JWKS, optional Session-Ende bei `exp`), none | `internal/auth` | fertig |
 | Policy (Optionen, Defaults, Overrides, Rechte), Config (YAML-Schema, Defaults, Validierung) | `internal/policy`, `internal/config` | fertig |
 | Admin-API, Metriken, Leader-Election | `internal/admin`, `internal/metrics`, `internal/ha` | fertig; Leader-Election in kind mit Failover geprüft |
 | Binary | `cmd/quackmux` (`serve`, `validate`, `token`, `hash-token`, `version`) | fertig |
@@ -191,6 +191,16 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    `lookup`: `helm template`, `--dry-run=client` und GitOps-Werkzeuge erzeugen die Secrets bei jedem Rendern neu
    (dort `existingSecret` nehmen), und `helm rollback`, `--atomic` und Argo CD prüft das Chart über `ha.enabled`
    hinweg nicht. Alles in [deploy/helm/quackmux/README.md](../deploy/helm/quackmux/README.md).
+9. **Widerruf:** Mit `auth.mode: static` beendet eine Änderung der Token-Datei offene Sessions (entfernte oder
+   gesperrte Benutzer, entfernte oder abgelaufene Tokens, die Gruppe einer `GROUP`-Session verlassen), mit
+   `auth.mode: jwt` nicht: Dort laufen Sessions weiter, mit `auth.jwt.closeSessionsAtExpiry` bis zum `exp` des
+   Tokens (außer nach einer Übernahme). Eine geänderte Policy gilt in beiden Modi nur für neue Sessions. Ein nur
+   entferntes Token kann nach einem Failover zurückkommen, wenn das `DISCONNECT` scheiterte; sicher sperrt
+   `disabled: true`. Alles in [docs/design.md](design.md), Abschnitte 8 und 10.
+10. **Gateway und Engines sprechen unverschlüsseltes HTTP** (Provider `kubernetes` und `process`): Engine-Token,
+    SQL und Ergebnisse gehen im Klartext durch das Pod-Netz. Gegen Mitlesen auf den Nodes hilft nur ein
+    Service-Mesh mit mTLS oder ein CNI mit Verschlüsselung. Alles in `deploy/kubernetes/README.md`, „Härtung
+    geteilter Engines“.
 
 ## Nächste Schritte (priorisiert)
 
@@ -204,6 +214,14 @@ Aufräumen verwaister Verbindungen nach einem Neustart (`engine.closeOrphanedCon
 TLS-Doku für Clients ([docs/tls.md](tls.md), Compose-Szenario l), Spill-Grenzen in den mitgelieferten Profilen,
 das Helm-Chart (`deploy/helm/quackmux`), die Lizenz (Apache 2.0, `LICENSE` und `NOTICE`; Lizenzen Dritter in den
 Release-Archiven und unter `/licenses` in den Images) und das Release 0.1.0.
+
+Nach 0.1.0 aus einer Security-, Performance- und Bug-Analyse: Eine Änderung der Token-Datei beendet offene Sessions
+(`auth.mode: static`), optional enden JWT-Sessions bei `exp` (`auth.jwt.closeSessionsAtExpiry`); ein Benutzer belegt
+höchstens einen Anteil des Pufferbudgets (`server.upstream.maxBufferedBytesPerUser`); ein gescheitertes `DISCONNECT`
+an die Engine wird wiederholt; der Admin-Port begrenzt Lese- und Idle-Zeiten; bis zu 256 Idle-Verbindungen pro
+Engine (`server.upstream.maxIdleConnsPerEngine`); ein Lesepuffer pro Engine-Antwort aus einem Pool (etwa 20 % weniger
+CPU und 60 % weniger Allokation pro Request); unbekannte Nachrichtentypen zählen unter einem Metrik-Label; Tests für
+den JWT-Authenticator und Fuzz-Tests für alle Decoder; `govulncheck` in CI und nachts, Dependabot, `make tidy-check`.
 
 1. **Nach dem ersten Release:** die Pakete `quackmux` und `duckdb-engine` auf GHCR öffentlich stellen
    ([docs/releasing.md](releasing.md)), sonst brauchen Cluster ein Pull-Secret.

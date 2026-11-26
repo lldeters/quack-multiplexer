@@ -64,6 +64,11 @@ type Session struct {
 	CreatedAt        time.Time
 	Adopted          bool
 
+	// credential and credentialExpires are auth.Identity.Credential and
+	// Expires of the client (unknown for adopted sessions): see Revoker.
+	credential        string
+	credentialExpires time.Time
+
 	lastSeen    atomic.Int64 // unix nanos, any message
 	lastActive  atomic.Int64 // unix nanos, any message but heartbeats
 	lastBackend atomic.Int64 // unix nanos, last request that reached the engine
@@ -124,6 +129,10 @@ type tombstone struct {
 	// engine still has its connection, so the session must stay closed
 	// whatever the age of the tombstone.
 	held bool
+	// until, if later than ClosedAt plus session.tombstoneTTL, keeps the
+	// tombstone that long: the DISCONNECT failed, and the engine keeps the
+	// connection until its lease runs out.
+	until time.Time
 }
 
 // Errors.
@@ -143,6 +152,9 @@ type Manager struct {
 	now     func() time.Time
 	// fence, if set, must report true for Reap to act (see SetFence).
 	fence func() bool
+	// revoker, if set, decides at each Reap whether sessions may keep
+	// running (see SetRevoker).
+	revoker Revoker
 	// closeHook, if set, runs after every close (see SetCloseHook).
 	closeHook func(s *Session, keep bool) <-chan struct{}
 
@@ -156,6 +168,9 @@ type Manager struct {
 	bgMu       sync.Mutex     // orders spawn against Shutdown
 	bgClosed   bool
 	stop       chan struct{} // closed by Shutdown
+	// disconnectRetries are the waits before the retries of a DISCONNECT
+	// that failed (see disconnect).
+	disconnectRetries []time.Duration
 
 	// adoptions confirms each adopted session with the engine once, also
 	// when many requests of it arrive at the same time.
@@ -177,11 +192,42 @@ func NewManager(cfg *config.Config, engines Engines, backend Backend, sealer *Se
 		perUser:    map[string]int{},
 		pending:    map[string]int{},
 		stop:       make(chan struct{}),
+
+		disconnectRetries: []time.Duration{time.Second, 3 * time.Second},
 	}
 }
 
 // SetClock replaces the clock (tests).
 func (m *Manager) SetClock(now func() time.Time) { m.now = now }
+
+// Revoker tells whether a session may keep running (auth.Revalidator): the
+// user and its credential may have been revoked since the session opened.
+type Revoker interface {
+	// Revoked returns why a session of user may no longer run, or "".
+	// credential is empty for adopted sessions; group is the group of a
+	// GROUP session, else "".
+	Revoked(user, credential, group string, now time.Time) string
+}
+
+// SetRevoker makes Reap close the sessions that r revokes. Call it before
+// Run.
+func (m *Manager) SetRevoker(r Revoker) { m.revoker = r }
+
+// revoked reports why s may no longer run: its credential expired or the
+// revoker revoked it. "" means it may run.
+func (m *Manager) revoked(s *Session, now time.Time) string {
+	if !s.credentialExpires.IsZero() && !now.Before(s.credentialExpires) {
+		return "the credentials expired"
+	}
+	if m.revoker == nil {
+		return ""
+	}
+	group := ""
+	if s.EngineKey.ShareLevel == engine.ShareGroup {
+		group = s.EngineKey.Owner
+	}
+	return m.revoker.Revoked(s.User, s.credential, group, now)
+}
 
 // SetFence makes Reap do nothing while fence reports false. With leader
 // election it reports whether this process still holds a fresh lease
@@ -267,6 +313,10 @@ type OpenParams struct {
 	ClientVersion    string
 	ClientPlatform   string
 	RemoteAddr       string
+	// Credential and CredentialExpires come from auth.Identity: a Revoker
+	// checks the credential, and the session ends when it expires.
+	Credential        string
+	CredentialExpires time.Time
 }
 
 // Open registers a session and returns the client-facing connection id.
@@ -289,7 +339,7 @@ func (r *Reservation) Open(p OpenParams) (*Session, string, error) {
 		ID: p.SessionID, User: p.User, Groups: p.Groups, EngineID: p.EngineID, EngineKey: p.EngineKey,
 		BackendConnID: p.BackendConnID, ClientID: p.ClientID, ClientVersion: p.ClientVersion,
 		ClientPlatform: p.ClientPlatform, RemoteAddr: p.RemoteAddr, HeartbeatTimeout: p.HeartbeatTimeout,
-		CreatedAt: now, state: StateOpen,
+		CreatedAt: now, state: StateOpen, credential: p.Credential, credentialExpires: p.CredentialExpires,
 	}
 	s.lastSeen.Store(now.UnixNano())
 	s.lastActive.Store(now.UnixNano())
@@ -356,6 +406,11 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 		}
 		return nil, &Closed{Reason: fmt.Sprintf("engine is %s", st), MustInvalidate: true, ClosedAt: m.now()}, nil
 	}
+	// Requests carry no credential: a session whose access was revoked
+	// never becomes visible, not even to requests that come at once.
+	if why := m.revoked(&Session{User: route.User, EngineKey: target.Key}, m.now()); why != "" {
+		return m.refuseRevoked(route, engineID, target, "access revoked: "+why)
+	}
 	// Adopt only connections the engine still has. The gateway disconnects
 	// every session it closes, so this keeps a closed session from coming
 	// back once its tombstone expired or a restart forgot it (DuckDB clients
@@ -420,6 +475,40 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	m.metricOpened(s)
 	m.log.Info("session adopted", "session", s.ID, "user", s.User, "engine", s.EngineID)
 	return s, nil, nil
+}
+
+// refuseRevoked answers the adoption of a session whose access was revoked:
+// it leaves a tombstone and closes the engine connection, which the gateway
+// that opened the session may have left behind.
+func (m *Manager) refuseRevoked(route Route, engineID string, target engine.Target, reason string) (*Session, *Closed, error) {
+	c := Closed{Reason: reason, ClosedAt: m.now()}
+	m.mu.Lock()
+	if s := m.sessions[route.SessionID]; s != nil { // adopted just before the revocation
+		m.mu.Unlock()
+		m.close(s, reason, CloseMode{Disconnect: true, Cancel: true, Force: true}, nil)
+		if closed, ok := s.Closed(); ok {
+			return nil, closed, nil
+		}
+		return nil, &c, nil
+	}
+	if t, dead := m.tombstones[route.SessionID]; dead {
+		m.mu.Unlock()
+		closed := t.Closed
+		return nil, &closed, nil
+	}
+	m.tombstones[route.SessionID] = tombstone{Closed: c, user: route.User}
+	m.mu.Unlock()
+	m.log.Info("refused to adopt a session whose access was revoked", "session", route.SessionID,
+		"user", route.User, "engine", engineID, "reason", reason)
+	conn := &Session{ID: route.SessionID, User: route.User, EngineID: engineID, BackendConnID: route.BackendConnID}
+	m.spawn(func() {
+		if err := m.backend.CancelAll(context.Background(), target.Endpoint, conn.BackendConnID); err != nil && !sessionGone(err) {
+			m.log.Warn("cancelling the query of a revoked session failed; it may keep running on the engine",
+				"session", conn.ID, "engine", engineID, "err", err)
+		}
+		m.disconnect(conn, target)
+	})
+	return nil, &c, nil
 }
 
 // Closed reports why the session was closed, and false while it is open.
@@ -557,17 +646,16 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 		m.spawn(func() {
 			ctx := context.Background()
 			if mode.Cancel {
-				if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil {
-					m.log.Debug("cancel on close failed", "session", s.ID, "err", err)
+				if err := m.backend.CancelAll(ctx, target.Endpoint, s.BackendConnID); err != nil && !sessionGone(err) {
+					m.log.Warn("cancelling the query of a closed session failed; it may keep running on the engine",
+						"session", s.ID, "engine", s.EngineID, "err", err)
 				}
 			}
 			if mode.Disconnect {
 				if hold != nil {
 					m.awaitRelease(s, target, hold)
 				}
-				if err := m.backend.Disconnect(ctx, target.Endpoint, s.BackendConnID); err != nil {
-					m.log.Debug("disconnect on close failed", "session", s.ID, "err", err)
-				}
+				m.disconnect(s, target)
 				if hold != nil {
 					m.setHeld(s.ID, false)
 				}
@@ -575,6 +663,50 @@ func (m *Manager) close(s *Session, reason string, mode CloseMode, check func(*S
 		})
 	}
 	return true
+}
+
+// disconnect sends the DISCONNECT of a closed session to its engine and
+// retries it after a failure (m.disconnectRetries). A connection the engine
+// keeps would bring the session back if the client is still attached when
+// a gateway restart forgets the tombstone (adoption confirms the session
+// with the engine), until its engine lease runs out. A connection the engine
+// no longer knows counts as closed. A shutdown ends the retries.
+func (m *Manager) disconnect(s *Session, target engine.Target) {
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = m.backend.Disconnect(context.Background(), target.Endpoint, s.BackendConnID)
+		if err == nil || sessionGone(err) {
+			return
+		}
+		if attempt >= len(m.disconnectRetries) {
+			break
+		}
+		select {
+		case <-time.After(m.disconnectRetries[attempt]):
+		case <-m.stop:
+			m.log.Warn("closing the engine connection of a closed session was cut short by the shutdown",
+				"session", s.ID, "engine", s.EngineID, "err", err)
+			return
+		}
+	}
+	m.log.Warn("closing the engine connection of a closed session failed; the engine keeps it until its lease runs out",
+		"session", s.ID, "engine", s.EngineID, "attempts", len(m.disconnectRetries)+1, "err", err)
+	// Nothing renews the lease any more. Until it runs out, a request with
+	// the session's id would adopt the connection again.
+	until := m.now().Add(m.cfg.Session.BackendHeartbeatTimeout.Duration + m.cfg.Session.HeartbeatGrace.Duration)
+	m.mu.Lock()
+	if t, ok := m.tombstones[s.ID]; ok && until.After(t.until) {
+		t.until = until
+		m.tombstones[s.ID] = t
+	}
+	m.mu.Unlock()
+}
+
+// sessionGone reports whether err is the engine's answer for a connection
+// it no longer has.
+func sessionGone(err error) bool {
+	var ee *upstream.EngineError
+	return errors.As(err, &ee) && upstream.IsSessionGone(ee.Response.Message)
 }
 
 // setHeld marks the tombstone of a closed session as held (see tombstone).
@@ -645,7 +777,7 @@ func (m *Manager) Shutdown() {
 
 func reasonLabel(reason string) string {
 	for _, p := range []string{"client disconnect", "idle timeout", "max lifetime", "heartbeat lease expired",
-		"engine", "admin", "backend"} {
+		"engine", "admin", "backend", "access revoked"} {
 		if len(reason) >= len(p) && reason[:len(p)] == p {
 			return p
 		}
@@ -708,6 +840,12 @@ func (m *Manager) Reap() {
 	m.mu.RUnlock()
 
 	for _, s := range all {
+		if why := m.revoked(s, now); why != "" {
+			// Also while requests run: a running query of a user whose
+			// access was revoked is cancelled.
+			m.close(s, "access revoked: "+why, CloseMode{Disconnect: true, Cancel: true, Force: true}, nil)
+			continue
+		}
 		lease := s.HeartbeatTimeout + sc.HeartbeatGrace.Duration
 		if now.Sub(time.Unix(0, s.lastSeen.Load())) > lease {
 			m.close(s, fmt.Sprintf("heartbeat lease expired (no message for %s)", lease), CloseMode{Disconnect: true},
@@ -741,7 +879,7 @@ func (m *Manager) Reap() {
 	ttl := sc.TombstoneTTL.Duration
 	m.mu.Lock()
 	for id, t := range m.tombstones {
-		if !t.held && now.Sub(t.ClosedAt) > ttl {
+		if !t.held && now.Sub(t.ClosedAt) > ttl && !now.Before(t.until) {
 			delete(m.tombstones, id)
 		}
 	}

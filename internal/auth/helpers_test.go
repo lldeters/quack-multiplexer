@@ -210,7 +210,6 @@ type jwksServer struct {
 	mu     sync.Mutex
 	status int
 	body   []byte
-	block  chan struct{} // non-nil: requests wait until it is closed
 }
 
 func newJWKSServer(t *testing.T, body []byte) *jwksServer {
@@ -219,15 +218,8 @@ func newJWKSServer(t *testing.T, body []byte) *jwksServer {
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.hits.Add(1)
 		s.mu.Lock()
-		status, body, block := s.status, s.body, s.block
+		status, body := s.status, s.body
 		s.mu.Unlock()
-		if block != nil {
-			select {
-			case <-block:
-			case <-r.Context().Done():
-				return
-			}
-		}
 		w.Header().Set("Content-Type", "application/jwk-set+json")
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
@@ -240,12 +232,6 @@ func (s *jwksServer) set(status int, body []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status, s.body = status, body
-}
-
-func (s *jwksServer) setBlock(ch chan struct{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.block = ch
 }
 
 // signJWT signs claims; header entries are added to the JOSE header.

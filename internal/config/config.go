@@ -81,6 +81,9 @@ type UpstreamConfig struct {
 	// engine until a batch is ready, so a limit must exceed the longest
 	// expected wait for the first rows of a query.
 	ResponseHeaderTimeout Duration `json:"responseHeaderTimeout,omitempty"`
+	// MaxIdleConnsPerEngine bounds the idle keep-alive connections kept per
+	// engine (default 256: a DuckDB client keeps up to 256 FETCH long-polls
+	// open per session; below that, a burst opens and closes connections).
 	MaxIdleConnsPerEngine int      `json:"maxIdleConnsPerEngine,omitempty"`
 	IdleConnTimeout       Duration `json:"idleConnTimeout,omitempty"`
 	// ControlTimeout bounds requests the gateway sends on its own
@@ -101,6 +104,11 @@ type UpstreamConfig struct {
 	MaxBufferedRequestBytes  int64 `json:"maxBufferedRequestBytes,omitempty"`
 	MaxBufferedResponseBytes int64 `json:"maxBufferedResponseBytes,omitempty"`
 	BufferBudgetBytes        int64 `json:"bufferBudgetBytes,omitempty"`
+	// MaxBufferedBytesPerUser is the share of the budget one user's messages
+	// may take at a time (default a quarter of BufferBudgetBytes): one user
+	// cannot push everyone else onto streaming. A negative value disables
+	// the share.
+	MaxBufferedBytesPerUser int64 `json:"maxBufferedBytesPerUser,omitempty"`
 	// MaxRequestBytes rejects larger messages up front (default 100 MiB, the
 	// engine's own limit). 0 disables the check.
 	MaxRequestBytes int64 `json:"maxRequestBytes,omitempty"`
@@ -161,6 +169,10 @@ type JWTAuthConfig struct {
 	JWKSRefresh Duration `json:"jwksRefresh,omitempty"`
 	// Leeway tolerates clock skew for exp/nbf/iat (default 30s).
 	Leeway Duration `json:"leeway,omitempty"`
+	// CloseSessionsAtExpiry ends a session when the JWT it was opened with
+	// expires (default false: the token is checked when the session opens,
+	// and clients with short-lived tokens keep their attachment).
+	CloseSessionsAtExpiry bool `json:"closeSessionsAtExpiry,omitempty"`
 }
 
 // SessionOptions are the per-session routing options a client may request.
@@ -549,7 +561,7 @@ func (c *Config) ApplyDefaults() {
 	}
 	u := &s.Upstream
 	setDur(&u.DialTimeout, 5*time.Second)
-	setInt(&u.MaxIdleConnsPerEngine, 64)
+	setInt(&u.MaxIdleConnsPerEngine, 256)
 	setDur(&u.IdleConnTimeout, 90*time.Second)
 	setDur(&u.ControlTimeout, 10*time.Second)
 	setDur(&u.HandshakeTimeout, 30*time.Second)
@@ -561,6 +573,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if u.BufferBudgetBytes == 0 {
 		u.BufferBudgetBytes = 1 << 30
+	}
+	if u.MaxBufferedBytesPerUser == 0 {
+		u.MaxBufferedBytesPerUser = max(u.BufferBudgetBytes/4, 0)
 	}
 	if u.MaxRequestBytes == 0 {
 		u.MaxRequestBytes = 100 << 20

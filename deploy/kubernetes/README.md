@@ -72,7 +72,9 @@ Session-Key); nur gerade laufende Requests brechen ab. Zwei Replikas: siehe
 
 Ressourcen des Gateways: Requests 250m CPU / 512 MiB, Limits 2 CPU / 2 GiB, `GOMEMLIMIT=1800MiB`. Der größte
 Verbraucher ist der Nachrichtenpuffer (`server.upstream.bufferBudgetBytes`, 1 GiB). Wer das Speicherlimit
-senkt, senkt das Budget und `GOMEMLIMIT` mit (Beispiel: `overlays/dev`).
+senkt, senkt das Budget und `GOMEMLIMIT` mit (Beispiel: `overlays/dev`). Ein Benutzer belegt davon höchstens
+`server.upstream.maxBufferedBytesPerUser` (Default ein Viertel des Budgets); seine weiteren Nachrichten streamt
+das Gateway, statt sie zu puffern, damit ein einzelner Benutzer die anderen nicht vom Puffer verdrängt.
 
 ## Echte Secrets erzeugen
 
@@ -154,7 +156,13 @@ kubectl apply -k meine-umgebung
 * **users.yaml:** Dieses Secret hat keinen Hash-Suffix. `kubectl apply` aktualisiert es an Ort und Stelle;
   Kubelet und Gateway (`auth.static.reloadInterval`) übernehmen die Änderung nach etwa einer Minute, ohne
   Neustart. Eine ungültige Datei wird abgelehnt und die bisherigen Benutzer bleiben aktiv; der Grund steht im
-  Gateway-Log.
+  Gateway-Log. Die Änderung gilt auch für offene Sessions: Wer entfernt oder gesperrt wird, ein entferntes oder
+  abgelaufenes Token benutzt oder die Gruppe einer `GROUP`-Session verlässt, verliert seine Sessions innerhalb
+  von `session.checkInterval` (5 s); eine laufende Query wird abgebrochen. Eine leere Liste (`users: []`)
+  beendet alle Sessions. Wer einen Benutzer sicher aussperren will (etwa nach einem geleakten Token), setzt
+  `disabled: true`: Das prüft das Gateway auch nach einem Neustart oder Failover, ein entferntes Token nicht. Mit
+  `auth.mode: jwt` laufen offene Sessions dagegen weiter, mit `auth.jwt.closeSessionsAtExpiry: true` bis zum
+  `exp` des Tokens.
 * Leerzeichen und Zeilenumbrüche am Dateiende ignoriert das Gateway.
 * Die Base lässt sich auch remote einbinden, z. B.
   `https://github.com/<org>/quack-multiplexer//deploy/kubernetes/base?ref=<tag>`.
@@ -960,6 +968,10 @@ Engine darf jede Session alles, was DuckDB dort erlaubt.
   anhalten, mit `quack_serve(…)` weitere Server öffnen und mit `getenv('QUACK_TOKEN')` das Engine-Token lesen. Die
   NetworkPolicy lässt nur das Gateway an Port 9494 der Engines; ein ausgelesenes Token oder ein zusätzlicher
   Server nützt deshalb von außen nichts. Gegen `quack_stop` hilft sie nicht.
+* **Gateway und Engines sprechen unverschlüsseltes HTTP.** Das Engine-Token, das SQL und die Ergebnisse aller
+  Sessions gehen im Klartext durch das Pod-Netz. Die NetworkPolicy hält andere Pods fern, nicht aber, wer das
+  Netz des Nodes mitliest. Wer das ausschließen muss, nimmt ein Service-Mesh mit mTLS oder ein CNI mit
+  Verschlüsselung zwischen Nodes (etwa WireGuard).
 * **Init- und Post-Start-SQL:** Beide stehen im Secret der Engine (`<pod>-token`, Schlüssel `init.sql` und
   `post-start.sql`), nicht in der Pod-Spec; wer nur Pods lesen darf, sieht sie nicht. Mit Dateizugriff, dem
   DuckDB-Default, kann sie aber jede Session in der Engine aus der Umgebung lesen

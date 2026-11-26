@@ -56,7 +56,7 @@ func (a noneAuth) Authenticate(_ context.Context, r auth.Request) (auth.Identity
 	if u == "" {
 		u = "anonymous"
 	}
-	return auth.Identity{User: u, Groups: a.groups[u], Method: "test"}, nil
+	return auth.Identity{User: u, Groups: a.groups[u], Method: "test", Credential: "cred-" + u}, nil
 }
 
 func (noneAuth) Close() error { return nil }

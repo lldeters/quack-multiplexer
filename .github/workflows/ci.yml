@@ -1,8 +1,8 @@
 # Checks for every pull request and every push to main: formatting, vet, the
-# tests (also with the race detector), cross builds, the shipped
-# configurations and manifests, the Helm chart, shell scripts and workflows,
-# and the end to end tests against the released DuckDB with Docker Compose
-# and kind.
+# tests (also with the race detector), known vulnerabilities in the code and
+# its modules, cross builds, the shipped configurations and manifests, the
+# Helm chart, shell scripts and workflows, and the end to end tests against
+# the released DuckDB with Docker Compose and kind.
 name: CI
 
 on:
@@ -24,6 +24,7 @@ env:
   KIND_VERSION: v0.33.0
   KUBECONFORM_VERSION: v0.8.0
   ACTIONLINT_VERSION: v1.7.12
+  GOVULNCHECK_VERSION: v1.10.0
 
 jobs:
   checks:
@@ -39,12 +40,32 @@ jobs:
           go-version-file: go.mod
       - name: gofmt
         run: make fmt-check
+      - name: go mod tidy
+        run: make tidy-check
       - name: go vet
         run: make vet
       - name: Tests
         run: go test -count=1 ./...
       - name: Tests with the race detector
         run: go test -race -count=1 ./...
+
+  # Vulnerabilities in the Go version of go.mod and in the modules that the
+  # code calls (vuln.go.dev); the nightly run repeats it for new entries.
+  vulncheck:
+    name: Known vulnerabilities (govulncheck)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: |
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          "$(go env GOPATH)/bin/govulncheck" ./...
 
   cross-build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}

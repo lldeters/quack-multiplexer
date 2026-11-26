@@ -1,0 +1,34 @@
+# Weekly update pull requests for the Go modules, the pinned GitHub Actions
+# and the base images of the gateway image. A release must be a week old
+# before Dependabot proposes it (cooldown), so that a compromised release is
+# likely withdrawn first; security updates come at once (repository setting
+# "Dependabot security updates"). The CI of each pull request runs the tests,
+# govulncheck and the end-to-end tests.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      # client-go, api and apimachinery are released together.
+      kubernetes:
+        patterns: ["k8s.io/*", "sigs.k8s.io/*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The engine image takes its base as a build argument, which Dependabot
+  # does not read; it is rebuilt with every release.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

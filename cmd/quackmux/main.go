@@ -317,6 +317,12 @@ func cmdServe(args []string) error {
 	engines := engine.NewManager(cfg, prov, log, met)
 	sessions := session.NewManager(cfg, engines, up, sealer, log, met)
 	engines.SetSessionCloser(sessions)
+	if rv, ok := authn.(auth.Revalidator); ok {
+		// Removing a user or token, disabling a user or taking a user out of
+		// the group of a GROUP session also ends the sessions that are open
+		// (session.checkInterval).
+		sessions.SetRevoker(rv)
+	}
 
 	var elector *ha.Elector
 	var podNamespace, podName string
@@ -429,7 +435,12 @@ func cmdServe(args []string) error {
 	go func() { errc <- serve(quackSrv, cfg.Server.TLS, "quack", log) }()
 	var adminSrv *http.Server
 	if cfg.Admin.Listen != "" {
-		adminSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+		// The admin API answers small requests: bounded reads and idle
+		// keep-alive connections keep a client that only opens connections
+		// from tying up file descriptors. The read deadline also cancels the
+		// context of a running request, so it lies past the longest one.
+		adminSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout: admin.MaxRequestDuration + 30*time.Second, IdleTimeout: 2 * time.Minute}
 		go func() { errc <- serve(adminSrv, cfg.Admin.TLS, "admin", log) }()
 	}
 

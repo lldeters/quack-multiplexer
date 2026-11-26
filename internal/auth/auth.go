@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Identity is an authenticated principal.
@@ -15,6 +16,13 @@ type Identity struct {
 	Groups []string
 	// Method names the authenticator that produced the identity.
 	Method string
+	// Credential identifies the credential among those of the user, for
+	// Revalidator.Revoked (auth.mode=static: the SHA-256 of the token). It
+	// is never shown to anyone. Empty if the authenticator has none.
+	Credential string
+	// Expires is when the credential expires and the sessions opened with
+	// it should end (zero: never, or not enforced).
+	Expires time.Time
 }
 
 // Authentication methods (Identity.Method).
@@ -55,6 +63,23 @@ type Authenticator interface {
 	Authenticate(ctx context.Context, req Request) (Identity, error)
 	// Close releases background resources (file watchers, JWKS refresh).
 	Close() error
+}
+
+// Revalidator is implemented by authenticators that can tell later whether
+// a session opened with one of their identities may keep running
+// (auth.mode=static: the users file as it is now). The gateway asks it for
+// every open session at each session check (session.checkInterval), so that
+// removing a user or a token, disabling a user or taking a user out of a
+// group also ends the sessions that are already open.
+type Revalidator interface {
+	// Revoked returns why a session of user may no longer run, or "" if it
+	// may. credential is the session's Identity.Credential; it is empty for
+	// a session adopted after a gateway restart, whose credential is not
+	// known, and then only the user is checked. group is the group of a
+	// GROUP session ("" for other share levels): the user must still be a
+	// member. user may be the stored form of a long name (session.StoredUser)
+	// for adopted sessions. The reason is shown to the client.
+	Revoked(user, credential, group string, now time.Time) string
 }
 
 // Reloader is implemented by authenticators that can re-read their

@@ -50,7 +50,7 @@ KIND_HA     ?= test/e2e/kind/ha.sh
 KIND_DOWN   ?= test/e2e/kind/teardown.sh
 
 .DEFAULT_GOAL := build
-.PHONY: build test vet fmt-check check docker docker-gateway docker-engine \
+.PHONY: build test vet fmt-check tidy-check check docker docker-gateway docker-engine \
 	e2e-compose kind-up kind-test kind-ha kind-down clean help
 
 build: export CGO_ENABLED := 0
@@ -71,7 +71,10 @@ fmt-check: ## Fail if a Go file is not gofmt-formatted
 		exit 1; \
 	fi
 
-check: fmt-check vet test ## Run fmt-check, vet and test
+tidy-check: ## Fail if go.mod or go.sum is not tidy
+	$(GO) mod tidy -diff
+
+check: fmt-check tidy-check vet test ## Run fmt-check, tidy-check, vet and test
 
 docker: docker-gateway docker-engine ## Build the gateway and the engine image
 

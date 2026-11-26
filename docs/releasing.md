@@ -4,13 +4,22 @@
 
 | Workflow | Auslöser | Inhalt |
 |---|---|---|
-| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go vet`, Tests, Tests mit Race-Detector, Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), das Helm-Chart mit Helm 3 und 4 (`helm lint`, kubeconform, Vergleich mit den Kustomize-Manifesten in `test/helm`), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind (dort auch das Helm-Chart mit `test/e2e/kind/helm.sh`) |
-| [nightly.yml](../.github/workflows/nightly.yml) | täglich 03:17 UTC auf `main`, von Hand für jeden Branch | HA-Szenarien in kind (`test/e2e/kind/ha.sh`) und die Tests fünfmal mit Race-Detector |
+| [ci.yml](../.github/workflows/ci.yml) | jeder Pull Request, jeder Push auf `main`, von Hand | `gofmt`, `go mod tidy`, `go vet`, Tests, Tests mit Race-Detector, bekannte Schwachstellen (`govulncheck`), Builds für linux/amd64, linux/arm64, darwin/arm64, windows/amd64 und windows/386, `quackmux validate` für alle mitgelieferten Konfigurationen, die gerenderten Kustomize-Overlays gegen die Kubernetes-Schemas (kubeconform), das Helm-Chart mit Helm 3 und 4 (`helm lint`, kubeconform, Vergleich mit den Kustomize-Manifesten in `test/helm`), Image-Referenzen, shellcheck, actionlint, E2E mit Docker Compose und mit kind (dort auch das Helm-Chart mit `test/e2e/kind/helm.sh`) |
+| [nightly.yml](../.github/workflows/nightly.yml) | täglich 03:17 UTC auf `main`, von Hand für jeden Branch | HA-Szenarien in kind (`test/e2e/kind/ha.sh`), die Tests fünfmal mit Race-Detector und `govulncheck` für neu gemeldete Schwachstellen |
 | [release.yml](../.github/workflows/release.yml) | ein veröffentlichtes GitHub-Release `vX.Y.Z`; von Hand als Probelauf | Release (siehe unten) |
 
-Alle Actions sind auf Commit-SHAs gepinnt, die Werkzeuge (kind, kubeconform, actionlint, helm) auf Versionen. Der
-Engine-Build prüft den DuckDB-Download gegen die Prüfsummen im Makefile (`DUCKDB_SHA256_AMD64`,
+Alle Actions sind auf Commit-SHAs gepinnt, die Werkzeuge (kind, kubeconform, actionlint, helm, govulncheck) auf
+Versionen. Der Engine-Build prüft den DuckDB-Download gegen die Prüfsummen im Makefile (`DUCKDB_SHA256_AMD64`,
 `DUCKDB_SHA256_ARM64`); die E2E-Skripte und Workflows lesen sie von dort.
+
+`govulncheck` meldet nur Schwachstellen in Code, den quackmux aufruft, und in der Go-Version aus `go.mod`. Schlägt es
+an, das betroffene Modul (`go get <modul>@<version>`, `go mod tidy`) oder die Go-Version in `go.mod` anheben. Die
+Images betrifft das nicht: Ihre Basis (`golang`, `distroless`, `debian:bookworm-slim`) holt erst der nächste Build.
+Nach einer Sicherheitslücke in der Basis also ein Patch-Release bauen.
+
+[Dependabot](../.github/dependabot.yml) schlägt wöchentlich Updates für die Go-Module, die Actions und die Basis des
+Gateway-Images vor, frühestens eine Woche nach dem Erscheinen einer Version. Sofortige Sicherheitsupdates schaltet
+man in den Einstellungen des Repositorys ein („Dependabot security updates“).
 
 ## Was ein Release veröffentlicht
 

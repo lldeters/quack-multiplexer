@@ -150,7 +150,9 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
    unverändert weitergeben, `Content-Length` anpassen.
    * Die Engine (cpp-httplib) bricht Verbindungen ab, die mehr als 5 s stocken. Deshalb puffert das Gateway
      Requests bis 100 MiB und Responses bis 64 MiB komplett im Speicher. Das Gesamtbudget liegt bei 1 GiB. Damit
-     bringt ein langsamer Client die Engine nie in den Timeout.
+     bringt ein langsamer Client die Engine nie in den Timeout. Ein Benutzer belegt davon höchstens
+     `server.upstream.maxBufferedBytesPerUser` (Default ein Viertel des Budgets), damit ein einzelner Benutzer
+     mit vielen großen Uploads die anderen nicht ins Streaming drängt.
    * Größere Nachrichten oder ein erschöpftes Budget werden gestreamt.
    * Requests über 100 MiB, also über dem Engine-Limit, lehnt das Gateway sofort mit einem Quack-Fehler ab.
 6. Antwort weitergeben. Ein FETCH kann serverseitig lange blockieren, deshalb gibt es kein Response-Timeout. Die
@@ -171,7 +173,7 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 ```
            connect ok                     DISCONNECT ok / Fehler „Invalid connection id“
  (neu) ───────────────▶ OPEN ─────────────────────────────────────────────▶ CLOSED (Tombstone, TTL 1h)
-                         │  idle timeout | max lifetime | Admin-Kill | Engine-Drain-Timeout
+                         │  idle timeout | max lifetime | Admin-Kill | Engine-Drain-Timeout | Zugang entzogen
                          ├──────────────▶ CLOSING ── CANCEL(wildcard) + DISCONNECT an Engine ──▶ CLOSED
                          │  keine Nachricht seit heartbeatTimeout + heartbeatGrace (Client tot)
                          └──────────────▶ CLOSING ── DISCONNECT an Engine (räumt Backend auf) ──▶ CLOSED
@@ -183,6 +185,12 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 * Lease-Ablauf: keine Nachricht (auch kein Heartbeat) für `heartbeatTimeout + heartbeatGrace` bei
   `inFlight == 0`.
 * Bei jedem Schließen wird die Session von der Engine abgemeldet (`sessions--`).
+* Scheitert das `DISCONNECT` an die Engine (Engine kurz nicht erreichbar), wiederholt das Gateway es nach 1 s und
+  nach 3 s und loggt danach eine Warnung. Eine Engine, die die Verbindung nicht mehr kennt, gilt als erledigt.
+  Bleibt die Verbindung auf der Engine, läuft sie wie eine verwaiste Verbindung bis zum Ende ihrer Lease aus
+  (Abschnitt 6).
+* Wird der Zugang entzogen (Abschnitt 8), schließt das Gateway die Session bei der nächsten Prüfung, auch während
+  eines Requests, und bricht ihre Query ab.
 * Mit Query-Zeitlimit kann das `DISCONNECT` an die Engine warten, bis das Limit mit den Queries der Session fertig ist
   (Abschnitt 5.3, „Schließen der Session“).
 
@@ -535,8 +543,19 @@ Weitere Provider:
 ## 8. Authentifizierung, Optionen, Policy
 
 * `auth.mode`:
-  * `static`: YAML-Datei mit Benutzern, Gruppen und SHA-256-Hashes der Tokens; Hot-Reload.
-  * `jwt`: HS*/RS*/ES*/EdDSA über Datei-Keys oder JWKS; Claims für User und Gruppen konfigurierbar.
+  * `static`: YAML-Datei mit Benutzern, Gruppen und SHA-256-Hashes der Tokens; Hot-Reload. Eine Änderung gilt
+    auch für offene Sessions: Bei jeder Session-Prüfung (`session.checkInterval`, Default 5 s) schließt das
+    Gateway jede Session, deren Benutzer entfernt oder gesperrt wurde, deren Token entfernt wurde oder abgelaufen
+    ist oder deren Benutzer nicht mehr in der Gruppe einer `GROUP`-Session ist. Eine laufende Query bricht es
+    dabei auf der Engine ab, der Client bekommt beim nächsten Request „access revoked: …“. Nach einer Änderung
+    der Datei dauert das höchstens `auth.static.reloadInterval` plus `session.checkInterval`. Eine ungültige
+    Datei ändert nichts, eine gültige leere Liste (`users: []`) schließt alle Sessions. Bei Sessions, die nach
+    einem Neustart übernommen wurden, kennt das Gateway das Token nicht und prüft nur Benutzer und Gruppe, das
+    aber schon beim ersten Request, bevor ein Request die Session benutzen kann.
+  * `jwt`: HS*/RS*/ES*/EdDSA über Datei-Keys oder JWKS; Claims für User und Gruppen konfigurierbar. Das Gateway
+    prüft das Token beim Verbindungsaufbau; offene Sessions laufen danach weiter, auch über `exp` hinaus. Mit
+    `auth.jwt.closeSessionsAtExpiry: true` schließt es eine Session bei der ersten Session-Prüfung nach `exp`
+    (ohne `leeway`); für Sessions, die nach einem Neustart übernommen wurden, kennt es `exp` nicht.
   * `none`: nur Entwicklung; der Benutzer kommt aus der Option `user`. In den anderen Modi wird diese Option
     abgelehnt.
 * Optionen, die Clients setzen dürfen:
@@ -655,3 +674,15 @@ Weitere Provider:
   Zeilen in einen Vektor und scheitert über 2048 Verbindungen; solche Engines räumt das Gateway nicht auf.
 * Der Client verlangt eine exakte Protokollversion (3). Neue Quack-Versionen erfordern ein Gateway-Update. Das
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.
+* Entzug des Zugangs (Abschnitt 8): Mit `auth.mode: jwt` gibt es keinen Widerruf, offene Sessions laufen bis zu
+  ihrem Ende, mit `closeSessionsAtExpiry` bis `exp`. Mit beiden Modi wendet das Gateway eine geänderte Policy
+  (Profile, Overrides, Limits) nicht auf offene Sessions an, nur auf neue. Verlässt ein Benutzer eine Gruppe, enden
+  nur seine `GROUP`-Sessions dieser Gruppe, nicht Sessions, für die die Gruppe ein Profil oder ein Override
+  freigab. Wird nur ein Token entfernt und erreicht das `DISCONNECT` die Engine nicht, kann die Session nach einem
+  Neustart oder Failover des Gateways zurückkommen: Das neue Gateway kennt weder Tombstone noch Token und prüft nur
+  den Benutzer. Sicher sperrt `disabled: true` oder das Entfernen des Benutzers.
+* Der Verkehr zwischen Gateway und Engines der Provider `kubernetes` und `process` ist unverschlüsselt (HTTP),
+  mit dem Engine-Token im Klartext. Er enthält das SQL und die Ergebnisse aller Sessions. Gateway und Engines
+  gehören deshalb in ein Netz, in dem sonst niemand mitlesen kann (in Kubernetes: die NetworkPolicy aus
+  `deploy/kubernetes/base` mit einem CNI, das sie durchsetzt, bei Bedarf ein Service-Mesh mit mTLS). Der
+  `static`-Provider spricht externe Quack-Server auch per `https://` an.
