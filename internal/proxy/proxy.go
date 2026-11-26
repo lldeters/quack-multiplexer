@@ -684,6 +684,9 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	return g.forward(w, r, h, sess, target, in, sent, contentLength, upCtx, stopAbort, nil)
 }
 
+// responseReaders are the read buffers of engine answers (see forward).
+var responseReaders = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 32<<10) }}
+
 // forward sends a request of a session to its engine and relays the answer.
 // qr is how the query time limit follows the request (nil: not at all).
 func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header, sess *session.Session, target engine.Target,
@@ -740,7 +743,15 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 		return "engine_status"
 	}
 
-	rb := bufio.NewReaderSize(resp.Body, 32<<10)
+	// The read buffer of the answer is pooled: it was the largest
+	// allocation of a request (32 KiB of about 50). Nothing keeps it past
+	// this function, also not on the abort below (deferred calls run).
+	rb := responseReaders.Get().(*bufio.Reader)
+	rb.Reset(resp.Body)
+	defer func() {
+		rb.Reset(nil)
+		responseReaders.Put(rb)
+	}()
 	respType := wire.TypeInvalid
 	peek := 3
 	if qr != nil && h.Type == wire.TypeFetchRequest {
