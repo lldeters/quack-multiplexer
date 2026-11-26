@@ -169,6 +169,10 @@ type JWTAuthConfig struct {
 	JWKSRefresh Duration `json:"jwksRefresh,omitempty"`
 	// Leeway tolerates clock skew for exp/nbf/iat (default 30s).
 	Leeway Duration `json:"leeway,omitempty"`
+	// CloseSessionsAtExpiry ends a session when the JWT it was opened with
+	// expires (default false: the token is checked when the session opens,
+	// and clients with short-lived tokens keep their attachment).
+	CloseSessionsAtExpiry bool `json:"closeSessionsAtExpiry,omitempty"`
 }
 
 // SessionOptions are the per-session routing options a client may request.

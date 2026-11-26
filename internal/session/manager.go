@@ -64,6 +64,11 @@ type Session struct {
 	CreatedAt        time.Time
 	Adopted          bool
 
+	// credential and credentialExpires are auth.Identity.Credential and
+	// Expires of the client (unknown for adopted sessions): see Revoker.
+	credential        string
+	credentialExpires time.Time
+
 	lastSeen    atomic.Int64 // unix nanos, any message
 	lastActive  atomic.Int64 // unix nanos, any message but heartbeats
 	lastBackend atomic.Int64 // unix nanos, last request that reached the engine
@@ -143,6 +148,9 @@ type Manager struct {
 	now     func() time.Time
 	// fence, if set, must report true for Reap to act (see SetFence).
 	fence func() bool
+	// revoker, if set, decides at each Reap whether sessions may keep
+	// running (see SetRevoker).
+	revoker Revoker
 	// closeHook, if set, runs after every close (see SetCloseHook).
 	closeHook func(s *Session, keep bool) <-chan struct{}
 
@@ -187,6 +195,35 @@ func NewManager(cfg *config.Config, engines Engines, backend Backend, sealer *Se
 
 // SetClock replaces the clock (tests).
 func (m *Manager) SetClock(now func() time.Time) { m.now = now }
+
+// Revoker tells whether a session may keep running (auth.Revalidator): the
+// user and its credential may have been revoked since the session opened.
+type Revoker interface {
+	// Revoked returns why a session of user may no longer run, or "".
+	// credential is empty for adopted sessions; group is the group of a
+	// GROUP session, else "".
+	Revoked(user, credential, group string, now time.Time) string
+}
+
+// SetRevoker makes Reap close the sessions that r revokes. Call it before
+// Run.
+func (m *Manager) SetRevoker(r Revoker) { m.revoker = r }
+
+// revoked reports why s may no longer run: its credential expired or the
+// revoker revoked it. "" means it may run.
+func (m *Manager) revoked(s *Session, now time.Time) string {
+	if !s.credentialExpires.IsZero() && !now.Before(s.credentialExpires) {
+		return "the credentials expired"
+	}
+	if m.revoker == nil {
+		return ""
+	}
+	group := ""
+	if s.EngineKey.ShareLevel == engine.ShareGroup {
+		group = s.EngineKey.Owner
+	}
+	return m.revoker.Revoked(s.User, s.credential, group, now)
+}
 
 // SetFence makes Reap do nothing while fence reports false. With leader
 // election it reports whether this process still holds a fresh lease
@@ -272,6 +309,10 @@ type OpenParams struct {
 	ClientVersion    string
 	ClientPlatform   string
 	RemoteAddr       string
+	// Credential and CredentialExpires come from auth.Identity: a Revoker
+	// checks the credential, and the session ends when it expires.
+	Credential        string
+	CredentialExpires time.Time
 }
 
 // Open registers a session and returns the client-facing connection id.
@@ -294,7 +335,7 @@ func (r *Reservation) Open(p OpenParams) (*Session, string, error) {
 		ID: p.SessionID, User: p.User, Groups: p.Groups, EngineID: p.EngineID, EngineKey: p.EngineKey,
 		BackendConnID: p.BackendConnID, ClientID: p.ClientID, ClientVersion: p.ClientVersion,
 		ClientPlatform: p.ClientPlatform, RemoteAddr: p.RemoteAddr, HeartbeatTimeout: p.HeartbeatTimeout,
-		CreatedAt: now, state: StateOpen,
+		CreatedAt: now, state: StateOpen, credential: p.Credential, credentialExpires: p.CredentialExpires,
 	}
 	s.lastSeen.Store(now.UnixNano())
 	s.lastActive.Store(now.UnixNano())
@@ -424,6 +465,14 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	m.mu.Unlock()
 	m.metricOpened(s)
 	m.log.Info("session adopted", "session", s.ID, "user", s.User, "engine", s.EngineID)
+	if why := m.revoked(s, now); why != "" {
+		// Requests carry no credential: do not let one run until the next
+		// Reap closes the session.
+		m.close(s, "access revoked: "+why, CloseMode{Disconnect: true, Cancel: true, Force: true}, nil)
+		if c, closed := s.Closed(); closed {
+			return nil, c, nil
+		}
+	}
 	return s, nil, nil
 }
 
@@ -684,7 +733,7 @@ func (m *Manager) Shutdown() {
 
 func reasonLabel(reason string) string {
 	for _, p := range []string{"client disconnect", "idle timeout", "max lifetime", "heartbeat lease expired",
-		"engine", "admin", "backend"} {
+		"engine", "admin", "backend", "access revoked"} {
 		if len(reason) >= len(p) && reason[:len(p)] == p {
 			return p
 		}
@@ -747,6 +796,12 @@ func (m *Manager) Reap() {
 	m.mu.RUnlock()
 
 	for _, s := range all {
+		if why := m.revoked(s, now); why != "" {
+			// Also while requests run: a running query of a user whose
+			// access was revoked is cancelled.
+			m.close(s, "access revoked: "+why, CloseMode{Disconnect: true, Cancel: true, Force: true}, nil)
+			continue
+		}
 		lease := s.HeartbeatTimeout + sc.HeartbeatGrace.Duration
 		if now.Sub(time.Unix(0, s.lastSeen.Load())) > lease {
 			m.close(s, fmt.Sprintf("heartbeat lease expired (no message for %s)", lease), CloseMode{Disconnect: true},

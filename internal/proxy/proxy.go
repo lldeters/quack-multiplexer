@@ -457,7 +457,7 @@ func (g *Gateway) handleConnect(w http.ResponseWriter, r *http.Request, br *bufi
 		SessionID: sessionID, User: id.User, Groups: id.Groups, EngineID: lease.ID, EngineKey: lease.Key,
 		BackendConnID: rh.ConnectionID, HeartbeatTimeout: hb,
 		ClientID: req.ClientID, ClientVersion: req.ClientDuckDBVersion, ClientPlatform: req.ClientPlatform,
-		RemoteAddr: r.RemoteAddr,
+		RemoteAddr: r.RemoteAddr, Credential: id.Credential, CredentialExpires: id.Expires,
 	})
 	if err != nil {
 		g.engines.DetachSession(lease.ID)

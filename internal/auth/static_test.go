@@ -115,6 +115,7 @@ func TestStaticAuthenticate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			tt.want.Credential = HashToken(tt.credential)
 			if !reflect.DeepEqual(id, tt.want) {
 				t.Fatalf("identity = %+v, want %+v", id, tt.want)
 			}

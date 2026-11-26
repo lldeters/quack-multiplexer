@@ -317,6 +317,11 @@ func cmdServe(args []string) error {
 	engines := engine.NewManager(cfg, prov, log, met)
 	sessions := session.NewManager(cfg, engines, up, sealer, log, met)
 	engines.SetSessionCloser(sessions)
+	if rv, ok := authn.(auth.Revalidator); ok {
+		// Removing a user or token, disabling a user or taking a user out of
+		// a group also ends the sessions that are open (session.checkInterval).
+		sessions.SetRevoker(rv)
+	}
 
 	var elector *ha.Elector
 	var podNamespace, podName string

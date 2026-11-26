@@ -105,6 +105,9 @@ type staticState struct {
 	users  int
 	// byName maps a user name to the user (see GroupsOf).
 	byName map[string]*staticUser
+	// byStored maps the stored form of long user names (session.StoredUser)
+	// to the user: sessions adopted after a restart know only that form.
+	byStored map[string]*staticUser
 	// digest of the file content, to skip reloads that change nothing.
 	digest [sha256.Size]byte
 }
@@ -126,7 +129,7 @@ func parseUsersFile(data []byte, now time.Time) (*staticState, []logEntry, error
 	if f.Users == nil {
 		return nil, nil, errors.New(`users file has no "users" list (write "users: []" to reject everybody)`)
 	}
-	st := &staticState{tokens: map[string]*staticToken{}, byName: map[string]*staticUser{}}
+	st := &staticState{tokens: map[string]*staticToken{}, byName: map[string]*staticUser{}, byStored: map[string]*staticUser{}}
 	var (
 		errs     []error
 		warnings []logEntry
@@ -153,6 +156,9 @@ func parseUsersFile(data []byte, now time.Time) (*staticState, []logEntry, error
 		user := &staticUser{name: u.Name, groups: dedupe(u.Groups), disabled: u.Disabled}
 		st.users++
 		st.byName[u.Name] = user
+		if stored := storedName(u.Name); stored != u.Name {
+			st.byStored[stored] = user
+		}
 		for ti, t := range u.Tokens {
 			twhere := fmt.Sprintf("%s tokens[%d]", where, ti)
 			hash, plain, err := tokenHash(t)
@@ -315,7 +321,52 @@ func (a *staticAuthenticator) Authenticate(_ context.Context, req Request) (Iden
 	case !tok.expires.IsZero() && !a.now().Before(tok.expires):
 		return Identity{}, unauthenticated("token %q of user %q expired at %s", tok.label, tok.user.name, tok.expires.Format(time.RFC3339))
 	}
-	return Identity{User: tok.user.name, Groups: slices.Clone(tok.user.groups), Method: MethodStatic}, nil
+	// No Expires: Revoked checks the expiry in the users file as it is then,
+	// so extending a token there keeps its sessions open.
+	return Identity{User: tok.user.name, Groups: slices.Clone(tok.user.groups), Method: MethodStatic,
+		Credential: HashToken(req.Credential)}, nil
+}
+
+// Revoked implements Revalidator with the users file as it is now: a
+// session ends when its user was removed or disabled, its token was removed
+// or expired, or (GROUP) its user left the group. A users file that fails
+// to load keeps the previous version, and with it the sessions.
+func (a *staticAuthenticator) Revoked(user, credential, group string, now time.Time) string {
+	st := a.state.Load()
+	u := st.byName[user]
+	if u == nil {
+		u = st.byStored[user]
+	}
+	switch {
+	case u == nil:
+		return "the user was removed"
+	case u.disabled:
+		return "the user is disabled"
+	}
+	if credential != "" {
+		tok := st.tokens[credential]
+		switch {
+		case tok == nil || tok.user != u:
+			return "the token was removed"
+		case !tok.expires.IsZero() && !now.Before(tok.expires):
+			return "the token expired"
+		}
+	}
+	if group != "" && !slices.Contains(u.groups, group) {
+		return fmt.Sprintf("the user is no longer a member of group %q", group)
+	}
+	return ""
+}
+
+// storedName is the form of a user name that a gateway connection id holds
+// (session.StoredUser; TestStoredNameMatchesSession checks that both agree):
+// names over 40 bytes are stored as a digest.
+func storedName(user string) string {
+	if len(user) <= 40 {
+		return user
+	}
+	sum := sha256.Sum256([]byte(user))
+	return "~" + hex.EncodeToString(sum[:12])
 }
 
 // Reload implements Reloader: it re-reads the users file even if it looks

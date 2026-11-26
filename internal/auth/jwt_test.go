@@ -250,3 +250,25 @@ func TestJWTNestedGroupsClaim(t *testing.T) {
 		t.Fatalf("identity %+v, want bob with analytics", id)
 	}
 }
+
+func TestJWTCloseSessionsAtExpiry(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	file := writeFile(t, t.TempDir(), "hmac", secret)
+	tok := signJWT(t, jwt.SigningMethodHS256, secret, nil, stdClaims(jwtNow))
+
+	id, err := authJWT(newTestJWT(t, config.JWTAuthConfig{HMACSecretFile: file}), tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !id.Expires.IsZero() || id.Credential != "" {
+		t.Fatalf("by default the identity has expiry %v and credential %q, want neither", id.Expires, id.Credential)
+	}
+
+	id, err = authJWT(newTestJWT(t, config.JWTAuthConfig{HMACSecretFile: file, CloseSessionsAtExpiry: true}), tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Unix(jwtNow.Add(time.Hour).Unix(), 0); !id.Expires.Equal(want) {
+		t.Fatalf("with closeSessionsAtExpiry the identity expires at %v, want exp = %v", id.Expires, want)
+	}
+}
