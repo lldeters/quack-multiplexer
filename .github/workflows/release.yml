@@ -1,14 +1,21 @@
-# Release for a tag vX.Y.Z (see docs/releasing.md): the checks, cross-compiled
-# binaries and the Helm chart with SHA256SUMS as a GitHub release, and
-# multi-arch images on GHCR:
+# Release (see docs/releasing.md). Publishing a GitHub release with a tag
+# vX.Y.Z (in the web interface or with gh release create) runs the checks and
+# attaches the cross-compiled binaries and the Helm chart with SHA256SUMS to
+# that release, and pushes multi-arch images to GHCR:
 #   ghcr.io/<owner>/quackmux:X.Y.Z                (also :X.Y and :latest)
 #   ghcr.io/<owner>/duckdb-engine:<duckdb>-X.Y.Z  (also :<duckdb>)
-# Pre-releases (vX.Y.Z-rc.1) get only the full version tags.
+# Pre-releases (vX.Y.Z-rc.1) get only the full version tags. A release
+# published without a description gets docs/releases/X.Y.Z.md as its notes.
+#
+# Run by hand (workflow_dispatch) on a branch, it is a dry run for the
+# version in deploy/helm/quackmux/Chart.yaml: the same checks and builds,
+# without a release and without pushing images.
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,6 +35,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      dry_run: ${{ steps.version.outputs.dry_run }}
       duckdb: ${{ steps.version.outputs.duckdb }}
       sha256_amd64: ${{ steps.version.outputs.sha256_amd64 }}
       sha256_arm64: ${{ steps.version.outputs.sha256_arm64 }}
@@ -41,16 +49,24 @@ jobs:
       - name: Version from the tag, DuckDB from the Makefile
         id: version
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
-            exit 1
+          dry_run=false
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if ! [[ $GITHUB_REF_NAME == v* && $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
+              exit 1
+            fi
+          else
+            dry_run=true
+            version=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' deploy/helm/quackmux/Chart.yaml)
+            echo "dry run for version $version (deploy/helm/quackmux/Chart.yaml) on $GITHUB_REF_NAME: no release, no image push"
           fi
           prerelease=false
           if [[ $version == *-* ]]; then prerelease=true; fi
           {
             echo "version=$version"
             echo "prerelease=$prerelease"
+            echo "dry_run=$dry_run"
             echo "duckdb=$(sed -n 's/^DUCKDB_VERSION *?= *//p' Makefile)"
             echo "sha256_amd64=$(sed -n 's/^DUCKDB_SHA256_AMD64 *?= *//p' Makefile)"
             echo "sha256_arm64=$(sed -n 's/^DUCKDB_SHA256_ARM64 *?= *//p' Makefile)"
@@ -112,14 +128,42 @@ jobs:
         run: |
           (cd dist && sha256sum -- * >SHA256SUMS)
           cat dist/SHA256SUMS
-      - name: GitHub release
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          notes=docs/releases/$VERSION.md
+          if [ -f "$notes" ]; then
+            echo "release notes: $notes"
+          else
+            echo "::warning::no $notes: a release published without a description keeps an empty one"
+          fi
+      - name: Attach to the GitHub release
+        if: needs.verify.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          flags=(--verify-tag --title "quackmux $GITHUB_REF_NAME" --generate-notes)
+          tag=$GITHUB_REF_NAME
+          release=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json name,body)
+          name=$(jq -r '.name' <<<"$release")
+          body=$(jq -r '.body' <<<"$release")
+          flags=()
+          if [ -z "$name" ] || [ "$name" = "$tag" ]; then flags+=(--title "quackmux $tag"); fi
+          if [ -z "${body//[[:space:]]/}" ] && [ -f "docs/releases/$VERSION.md" ]; then
+            flags+=(--notes-file "docs/releases/$VERSION.md")
+          fi
           if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${flags[@]}" dist/*
+          if [ "${#flags[@]}" -gt 0 ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+      - name: Dry run
+        if: needs.verify.outputs.dry_run == 'true'
+        run: |
+          echo "dry run: a release would get these files:"
+          ls -l dist
 
   images:
     name: Images on GHCR
@@ -136,6 +180,7 @@ jobs:
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: needs.verify.outputs.dry_run != 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -165,7 +210,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ needs.verify.outputs.dry_run != 'true' }}
           tags: ${{ steps.tags.outputs.gateway }}
           build-args: VERSION=${{ needs.verify.outputs.version }}
           labels: |
@@ -177,7 +222,7 @@ jobs:
         with:
           context: images/engine
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ needs.verify.outputs.dry_run != 'true' }}
           tags: ${{ steps.tags.outputs.engine }}
           build-args: |
             DUCKDB_VERSION=${{ needs.verify.outputs.duckdb }}
