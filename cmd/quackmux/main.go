@@ -429,7 +429,11 @@ func cmdServe(args []string) error {
 	go func() { errc <- serve(quackSrv, cfg.Server.TLS, "quack", log) }()
 	var adminSrv *http.Server
 	if cfg.Admin.Listen != "" {
-		adminSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second}
+		// The admin API answers small requests at once: bounded reads and
+		// idle keep-alive connections keep a client that only opens
+		// connections from tying up file descriptors.
+		adminSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
 		go func() { errc <- serve(adminSrv, cfg.Admin.TLS, "admin", log) }()
 	}
 
