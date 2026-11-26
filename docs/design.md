@@ -535,8 +535,19 @@ Weitere Provider:
 ## 8. Authentifizierung, Optionen, Policy
 
 * `auth.mode`:
-  * `static`: YAML-Datei mit Benutzern, Gruppen und SHA-256-Hashes der Tokens; Hot-Reload.
-  * `jwt`: HS*/RS*/ES*/EdDSA über Datei-Keys oder JWKS; Claims für User und Gruppen konfigurierbar.
+  * `static`: YAML-Datei mit Benutzern, Gruppen und SHA-256-Hashes der Tokens; Hot-Reload. Eine Änderung gilt
+    auch für offene Sessions: Bei jeder Session-Prüfung (`session.checkInterval`, Default 5 s) schließt das
+    Gateway jede Session, deren Benutzer entfernt oder gesperrt wurde, deren Token entfernt wurde oder abgelaufen
+    ist oder deren Benutzer nicht mehr in der Gruppe einer `GROUP`-Session ist. Eine laufende Query bricht es
+    dabei auf der Engine ab, der Client bekommt beim nächsten Request „access revoked: …“. Nach einer Änderung
+    der Datei dauert das höchstens `auth.static.reloadInterval` plus `session.checkInterval`. Eine ungültige
+    Datei ändert nichts, eine gültige leere Liste (`users: []`) schließt alle Sessions. Bei Sessions, die nach
+    einem Neustart übernommen wurden, kennt das Gateway das Token nicht und prüft nur Benutzer und Gruppe, das
+    aber schon beim ersten Request.
+  * `jwt`: HS*/RS*/ES*/EdDSA über Datei-Keys oder JWKS; Claims für User und Gruppen konfigurierbar. Das Gateway
+    prüft das Token beim Verbindungsaufbau; offene Sessions laufen danach weiter, auch über `exp` hinaus. Mit
+    `auth.jwt.closeSessionsAtExpiry: true` schließt es eine Session bei der ersten Session-Prüfung nach `exp`
+    (ohne `leeway`); für Sessions, die nach einem Neustart übernommen wurden, kennt es `exp` nicht.
   * `none`: nur Entwicklung; der Benutzer kommt aus der Option `user`. In den anderen Modi wird diese Option
     abgelehnt.
 * Optionen, die Clients setzen dürfen:
@@ -655,3 +666,11 @@ Weitere Provider:
   Zeilen in einen Vektor und scheitert über 2048 Verbindungen; solche Engines räumt das Gateway nicht auf.
 * Der Client verlangt eine exakte Protokollversion (3). Neue Quack-Versionen erfordern ein Gateway-Update. Das
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.
+* Entzug des Zugangs (Abschnitt 8): Mit `auth.mode: jwt` gibt es keinen Widerruf, offene Sessions laufen bis zu
+  ihrem Ende, mit `closeSessionsAtExpiry` bis `exp`. Mit beiden Modi wendet das Gateway eine geänderte Policy
+  (Profile, Overrides, Limits) nicht auf offene Sessions an, nur auf neue.
+* Der Verkehr zwischen Gateway und Engines der Provider `kubernetes` und `process` ist unverschlüsselt (HTTP),
+  mit dem Engine-Token im Klartext. Er enthält das SQL und die Ergebnisse aller Sessions. Gateway und Engines
+  gehören deshalb in ein Netz, in dem sonst niemand mitlesen kann (in Kubernetes: die NetworkPolicy aus
+  `deploy/kubernetes/base` mit einem CNI, das sie durchsetzt, bei Bedarf ein Service-Mesh mit mTLS). Der
+  `static`-Provider spricht externe Quack-Server auch per `https://` an.

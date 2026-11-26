@@ -123,7 +123,10 @@ auth:
     defaultGroups: []
 
   # mode static: YAML file with users, groups and the sha256 of their tokens
-  # (format: examples/users.yaml).
+  # (format: examples/users.yaml). Changes also apply to open sessions: at
+  # each session.checkInterval the gateway closes the sessions of removed or
+  # disabled users, of removed or expired tokens and of users who left the
+  # group of a GROUP session.
   static:
     # Required for mode static (no default).
     file: /etc/quackmux/users/users.yaml
@@ -160,6 +163,10 @@ auth:
     jwksRefresh: 15m
     # Tolerated clock skew for exp, nbf and iat.
     leeway: 30s
+    # A JWT is checked when a session opens; the session then runs past
+    # "exp". true closes it at the first session check after "exp" (not
+    # for sessions adopted after a gateway restart).
+    closeSessionsAtExpiry: false
 
 # -----------------------------------------------------------------------------
 # Routing of a session unless the client asks for something else. Priority:
