@@ -249,7 +249,9 @@ func (g *Gateway) handleQuack(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.Type.IsClientRequest() {
 		writeError(w, "Unsupported message type for server", wire.ExceptionInvalidInput, false)
-		g.count(h.Type, "unsupported", start)
+		// Not h.Type: every unknown type would become a label value of its
+		// own, and anyone can send them without authenticating.
+		g.count(wire.TypeInvalid, "unsupported", start)
 		return
 	}
 	if h.Type == wire.TypeConnectionRequest {
