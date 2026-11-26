@@ -72,7 +72,9 @@ Session-Key); nur gerade laufende Requests brechen ab. Zwei Replikas: siehe
 
 Ressourcen des Gateways: Requests 250m CPU / 512 MiB, Limits 2 CPU / 2 GiB, `GOMEMLIMIT=1800MiB`. Der größte
 Verbraucher ist der Nachrichtenpuffer (`server.upstream.bufferBudgetBytes`, 1 GiB). Wer das Speicherlimit
-senkt, senkt das Budget und `GOMEMLIMIT` mit (Beispiel: `overlays/dev`).
+senkt, senkt das Budget und `GOMEMLIMIT` mit (Beispiel: `overlays/dev`). Ein Benutzer belegt davon höchstens
+`server.upstream.maxBufferedBytesPerUser` (Default ein Viertel des Budgets); seine weiteren Nachrichten streamt
+das Gateway, statt sie zu puffern, damit ein einzelner Benutzer die anderen nicht vom Puffer verdrängt.
 
 ## Echte Secrets erzeugen
 

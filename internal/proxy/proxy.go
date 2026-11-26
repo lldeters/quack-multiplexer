@@ -22,8 +22,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/semaphore"
-
 	"quackmux/internal/auth"
 	"quackmux/internal/config"
 	"quackmux/internal/engine"
@@ -58,7 +56,7 @@ type Gateway struct {
 	met      *metrics.Metrics
 	now      func() time.Time
 	ready    func() (bool, string)
-	buffers  *semaphore.Weighted
+	buffers  *bufferBudget
 
 	// abortCtx ends when the gateway shuts down: queries still waiting for
 	// their engine are then answered with an error (see AbortQueries).
@@ -104,14 +102,11 @@ type Options struct {
 
 // New creates the gateway handler.
 func New(o Options) *Gateway {
-	budget := o.Config.Server.Upstream.BufferBudgetBytes
-	if budget <= 0 {
-		budget = 0
-	}
+	uc := o.Config.Server.Upstream
 	g := &Gateway{
 		cfg: o.Config, auth: o.Auth, engines: o.Engines, sessions: o.Sessions, up: o.Upstream,
 		log: o.Log.With("component", "proxy"), met: o.Metrics, now: time.Now, ready: o.Ready, fence: o.Fence,
-		buffers: semaphore.NewWeighted(budget),
+		buffers: newBufferBudget(uc.BufferBudgetBytes, uc.MaxBufferedBytesPerUser),
 	}
 	g.abortCtx, g.abort = context.WithCancel(context.Background())
 	if o.Config.Audit.Enabled {
@@ -582,20 +577,20 @@ func (g *Gateway) handleRouted(w http.ResponseWriter, r *http.Request, br *bufio
 	var gate *bodyGate
 	var body []byte                  // the body after the header, if buffered
 	var prepareScan *prepareUUIDSink // finds the uuid of a PREPARE that streams
-	if contentLength >= 0 && uc.MaxBufferedRequestBytes > 0 && contentLength <= uc.MaxBufferedRequestBytes && g.buffers.TryAcquire(contentLength) {
+	if contentLength >= 0 && uc.MaxBufferedRequestBytes > 0 && contentLength <= uc.MaxBufferedRequestBytes && g.buffers.tryAcquire(sess.User, contentLength) {
 		// Read the whole message before talking to the engine, so that a slow
 		// client cannot stall the engine's socket (it gives up after 5s).
 		buf := make([]byte, contentLength)
 		copy(buf, newHeader)
 		_, err := io.ReadFull(br, buf[len(newHeader):])
 		if err != nil {
-			g.buffers.Release(contentLength)
+			g.buffers.release(sess.User, contentLength)
 			return "client_error"
 		}
 		// The budget is returned as soon as the transport has sent the body
 		// (it closes it then), not when the engine answers: an upload can
 		// wait long for the engine under backpressure.
-		release := sync.OnceFunc(func() { g.buffers.Release(contentLength) })
+		release := sync.OnceFunc(func() { g.buffers.release(sess.User, contentLength) })
 		defer release()
 		if gated {
 			gate = &bodyGate{r: bytes.NewReader(buf), size: contentLength, release: release}
@@ -780,7 +775,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 			}
 		}
 	}
-	if n := resp.ContentLength; respType == wire.TypeErrorResponse && n >= 0 && n <= maxInspectedErrorBytes && g.buffers.TryAcquire(n) {
+	if n := resp.ContentLength; respType == wire.TypeErrorResponse && n >= 0 && n <= maxInspectedErrorBytes && g.buffers.tryAcquire(sess.User, n) {
 		// Small errors are read and looked at; larger ones (a huge message
 		// from error()) pass through like any other response, whole.
 		body := make([]byte, n)
@@ -788,7 +783,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 		resp.Body.Close()
 		if err != nil {
 			qr.finish(evFailed)
-			g.buffers.Release(n)
+			g.buffers.release(sess.User, n)
 			// Nothing was sent yet: answer instead of dropping the connection
 			// (a dropped connection can make libcurl resend the request).
 			writeError(w, fmt.Sprintf("quackmux: engine %s broke off its response: %v", target.ID, err), wire.ExceptionConnection, false)
@@ -814,25 +809,25 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, h wire.Header,
 		} else {
 			writeBody(w, body)
 		}
-		g.buffers.Release(n)
+		g.buffers.release(sess.User, n)
 		return outcome
 	}
 
-	if n := resp.ContentLength; n >= 0 && uc.MaxBufferedResponseBytes > 0 && n <= uc.MaxBufferedResponseBytes && g.buffers.TryAcquire(n) {
+	if n := resp.ContentLength; n >= 0 && uc.MaxBufferedResponseBytes > 0 && n <= uc.MaxBufferedResponseBytes && g.buffers.tryAcquire(sess.User, n) {
 		// Drain the engine at full speed, then serve the client from memory.
 		buf := make([]byte, n)
 		_, err := io.ReadFull(rb, buf)
 		resp.Body.Close()
 		if err != nil {
 			qr.finish(evFailed)
-			g.buffers.Release(n)
+			g.buffers.release(sess.User, n)
 			g.log.Warn("engine response broken", "engine", target.ID, "session", sess.ID, "type", h.Type, "err", err)
 			writeError(w, fmt.Sprintf("quackmux: engine %s broke off its response: %v", target.ID, err), wire.ExceptionConnection, false)
 			return "engine_broken"
 		}
 		qr.finish(ev)
 		writeBody(w, buf)
-		g.buffers.Release(n)
+		g.buffers.release(sess.User, n)
 		if g.met != nil {
 			g.met.Bytes.WithLabelValues("out").Add(float64(n))
 		}

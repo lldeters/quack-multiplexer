@@ -104,6 +104,11 @@ type UpstreamConfig struct {
 	MaxBufferedRequestBytes  int64 `json:"maxBufferedRequestBytes,omitempty"`
 	MaxBufferedResponseBytes int64 `json:"maxBufferedResponseBytes,omitempty"`
 	BufferBudgetBytes        int64 `json:"bufferBudgetBytes,omitempty"`
+	// MaxBufferedBytesPerUser is the share of the budget one user's messages
+	// may take at a time (default a quarter of BufferBudgetBytes): one user
+	// cannot push everyone else onto streaming. A negative value disables
+	// the share.
+	MaxBufferedBytesPerUser int64 `json:"maxBufferedBytesPerUser,omitempty"`
 	// MaxRequestBytes rejects larger messages up front (default 100 MiB, the
 	// engine's own limit). 0 disables the check.
 	MaxRequestBytes int64 `json:"maxRequestBytes,omitempty"`
@@ -564,6 +569,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if u.BufferBudgetBytes == 0 {
 		u.BufferBudgetBytes = 1 << 30
+	}
+	if u.MaxBufferedBytesPerUser == 0 {
+		u.MaxBufferedBytesPerUser = max(u.BufferBudgetBytes/4, 0)
 	}
 	if u.MaxRequestBytes == 0 {
 		u.MaxRequestBytes = 100 << 20

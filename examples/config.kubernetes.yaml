@@ -84,6 +84,10 @@ server:
     maxBufferedRequestBytes: 104857600
     maxBufferedResponseBytes: 67108864
     bufferBudgetBytes: 1073741824
+    # One user's messages take at most this share of the budget at a time
+    # (default a quarter of it): a single user cannot push everyone else
+    # onto streaming. Their further messages are streamed. -1 disables it.
+    maxBufferedBytesPerUser: 268435456
     # Larger requests are rejected up front with a Quack error (100 MiB, the
     # engine's own limit).
     maxRequestBytes: 104857600
