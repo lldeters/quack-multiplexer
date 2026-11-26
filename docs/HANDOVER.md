@@ -192,10 +192,11 @@ Nebenbei: Ein Gateway im Shutdown meldet sich jetzt mit dem Signal sofort nicht 
    (dort `existingSecret` nehmen), und `helm rollback`, `--atomic` und Argo CD prüft das Chart über `ha.enabled`
    hinweg nicht. Alles in [deploy/helm/quackmux/README.md](../deploy/helm/quackmux/README.md).
 9. **Widerruf:** Mit `auth.mode: static` beendet eine Änderung der Token-Datei offene Sessions (entfernte oder
-   gesperrte Benutzer, entfernte oder abgelaufene Tokens, verlassene Gruppen), mit `auth.mode: jwt` nicht: Dort
-   laufen Sessions weiter, mit `auth.jwt.closeSessionsAtExpiry` bis zum `exp` des Tokens (außer nach einer
-   Übernahme). Eine geänderte Policy gilt in beiden Modi nur für neue Sessions. Alles in
-   [docs/design.md](design.md), Abschnitt 8.
+   gesperrte Benutzer, entfernte oder abgelaufene Tokens, die Gruppe einer `GROUP`-Session verlassen), mit
+   `auth.mode: jwt` nicht: Dort laufen Sessions weiter, mit `auth.jwt.closeSessionsAtExpiry` bis zum `exp` des
+   Tokens (außer nach einer Übernahme). Eine geänderte Policy gilt in beiden Modi nur für neue Sessions. Ein nur
+   entferntes Token kann nach einem Failover zurückkommen, wenn das `DISCONNECT` scheiterte; sicher sperrt
+   `disabled: true`. Alles in [docs/design.md](design.md), Abschnitte 8 und 10.
 10. **Gateway und Engines sprechen unverschlüsseltes HTTP** (Provider `kubernetes` und `process`): Engine-Token,
     SQL und Ergebnisse gehen im Klartext durch das Pod-Netz. Gegen Mitlesen auf den Nodes hilft nur ein
     Service-Mesh mit mTLS oder ein CNI mit Verschlüsselung. Alles in `deploy/kubernetes/README.md`, „Härtung

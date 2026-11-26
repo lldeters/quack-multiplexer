@@ -551,7 +551,7 @@ Weitere Provider:
     der Datei dauert das höchstens `auth.static.reloadInterval` plus `session.checkInterval`. Eine ungültige
     Datei ändert nichts, eine gültige leere Liste (`users: []`) schließt alle Sessions. Bei Sessions, die nach
     einem Neustart übernommen wurden, kennt das Gateway das Token nicht und prüft nur Benutzer und Gruppe, das
-    aber schon beim ersten Request.
+    aber schon beim ersten Request, bevor ein Request die Session benutzen kann.
   * `jwt`: HS*/RS*/ES*/EdDSA über Datei-Keys oder JWKS; Claims für User und Gruppen konfigurierbar. Das Gateway
     prüft das Token beim Verbindungsaufbau; offene Sessions laufen danach weiter, auch über `exp` hinaus. Mit
     `auth.jwt.closeSessionsAtExpiry: true` schließt es eine Session bei der ersten Session-Prüfung nach `exp`
@@ -676,7 +676,11 @@ Weitere Provider:
   Gateway lehnt unbekannte Felder im Handshake ab, statt sie still zu verfälschen.
 * Entzug des Zugangs (Abschnitt 8): Mit `auth.mode: jwt` gibt es keinen Widerruf, offene Sessions laufen bis zu
   ihrem Ende, mit `closeSessionsAtExpiry` bis `exp`. Mit beiden Modi wendet das Gateway eine geänderte Policy
-  (Profile, Overrides, Limits) nicht auf offene Sessions an, nur auf neue.
+  (Profile, Overrides, Limits) nicht auf offene Sessions an, nur auf neue. Verlässt ein Benutzer eine Gruppe, enden
+  nur seine `GROUP`-Sessions dieser Gruppe, nicht Sessions, für die die Gruppe ein Profil oder ein Override
+  freigab. Wird nur ein Token entfernt und erreicht das `DISCONNECT` die Engine nicht, kann die Session nach einem
+  Neustart oder Failover des Gateways zurückkommen: Das neue Gateway kennt weder Tombstone noch Token und prüft nur
+  den Benutzer. Sicher sperrt `disabled: true` oder das Entfernen des Benutzers.
 * Der Verkehr zwischen Gateway und Engines der Provider `kubernetes` und `process` ist unverschlüsselt (HTTP),
   mit dem Engine-Token im Klartext. Er enthält das SQL und die Ergebnisse aller Sessions. Gateway und Engines
   gehören deshalb in ein Netz, in dem sonst niemand mitlesen kann (in Kubernetes: die NetworkPolicy aus

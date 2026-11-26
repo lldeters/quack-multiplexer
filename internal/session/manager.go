@@ -129,6 +129,10 @@ type tombstone struct {
 	// engine still has its connection, so the session must stay closed
 	// whatever the age of the tombstone.
 	held bool
+	// until, if later than ClosedAt plus session.tombstoneTTL, keeps the
+	// tombstone that long: the DISCONNECT failed, and the engine keeps the
+	// connection until its lease runs out.
+	until time.Time
 }
 
 // Errors.
@@ -402,6 +406,11 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 		}
 		return nil, &Closed{Reason: fmt.Sprintf("engine is %s", st), MustInvalidate: true, ClosedAt: m.now()}, nil
 	}
+	// Requests carry no credential: a session whose access was revoked
+	// never becomes visible, not even to requests that come at once.
+	if why := m.revoked(&Session{User: route.User, EngineKey: target.Key}, m.now()); why != "" {
+		return m.refuseRevoked(route, engineID, target, "access revoked: "+why)
+	}
 	// Adopt only connections the engine still has. The gateway disconnects
 	// every session it closes, so this keeps a closed session from coming
 	// back once its tombstone expired or a restart forgot it (DuckDB clients
@@ -465,15 +474,41 @@ func (m *Manager) adopt(route Route) (*Session, *Closed, error) {
 	m.mu.Unlock()
 	m.metricOpened(s)
 	m.log.Info("session adopted", "session", s.ID, "user", s.User, "engine", s.EngineID)
-	if why := m.revoked(s, now); why != "" {
-		// Requests carry no credential: do not let one run until the next
-		// Reap closes the session.
-		m.close(s, "access revoked: "+why, CloseMode{Disconnect: true, Cancel: true, Force: true}, nil)
-		if c, closed := s.Closed(); closed {
-			return nil, c, nil
-		}
-	}
 	return s, nil, nil
+}
+
+// refuseRevoked answers the adoption of a session whose access was revoked:
+// it leaves a tombstone and closes the engine connection, which the gateway
+// that opened the session may have left behind.
+func (m *Manager) refuseRevoked(route Route, engineID string, target engine.Target, reason string) (*Session, *Closed, error) {
+	c := Closed{Reason: reason, ClosedAt: m.now()}
+	m.mu.Lock()
+	if s := m.sessions[route.SessionID]; s != nil { // adopted just before the revocation
+		m.mu.Unlock()
+		m.close(s, reason, CloseMode{Disconnect: true, Cancel: true, Force: true}, nil)
+		if closed, ok := s.Closed(); ok {
+			return nil, closed, nil
+		}
+		return nil, &c, nil
+	}
+	if t, dead := m.tombstones[route.SessionID]; dead {
+		m.mu.Unlock()
+		closed := t.Closed
+		return nil, &closed, nil
+	}
+	m.tombstones[route.SessionID] = tombstone{Closed: c, user: route.User}
+	m.mu.Unlock()
+	m.log.Info("refused to adopt a session whose access was revoked", "session", route.SessionID,
+		"user", route.User, "engine", engineID, "reason", reason)
+	conn := &Session{ID: route.SessionID, User: route.User, EngineID: engineID, BackendConnID: route.BackendConnID}
+	m.spawn(func() {
+		if err := m.backend.CancelAll(context.Background(), target.Endpoint, conn.BackendConnID); err != nil && !sessionGone(err) {
+			m.log.Warn("cancelling the query of a revoked session failed; it may keep running on the engine",
+				"session", conn.ID, "engine", engineID, "err", err)
+		}
+		m.disconnect(conn, target)
+	})
+	return nil, &c, nil
 }
 
 // Closed reports why the session was closed, and false while it is open.
@@ -656,6 +691,15 @@ func (m *Manager) disconnect(s *Session, target engine.Target) {
 	}
 	m.log.Warn("closing the engine connection of a closed session failed; the engine keeps it until its lease runs out",
 		"session", s.ID, "engine", s.EngineID, "attempts", len(m.disconnectRetries)+1, "err", err)
+	// Nothing renews the lease any more. Until it runs out, a request with
+	// the session's id would adopt the connection again.
+	until := m.now().Add(m.cfg.Session.BackendHeartbeatTimeout.Duration + m.cfg.Session.HeartbeatGrace.Duration)
+	m.mu.Lock()
+	if t, ok := m.tombstones[s.ID]; ok && until.After(t.until) {
+		t.until = until
+		m.tombstones[s.ID] = t
+	}
+	m.mu.Unlock()
 }
 
 // sessionGone reports whether err is the engine's answer for a connection
@@ -835,7 +879,7 @@ func (m *Manager) Reap() {
 	ttl := sc.TombstoneTTL.Duration
 	m.mu.Lock()
 	for id, t := range m.tombstones {
-		if !t.held && now.Sub(t.ClosedAt) > ttl {
+		if !t.held && now.Sub(t.ClosedAt) > ttl && !now.Before(t.until) {
 			delete(m.tombstones, id)
 		}
 	}

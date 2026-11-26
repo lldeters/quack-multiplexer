@@ -159,8 +159,10 @@ kubectl apply -k meine-umgebung
   Gateway-Log. Die Änderung gilt auch für offene Sessions: Wer entfernt oder gesperrt wird, ein entferntes oder
   abgelaufenes Token benutzt oder die Gruppe einer `GROUP`-Session verlässt, verliert seine Sessions innerhalb
   von `session.checkInterval` (5 s); eine laufende Query wird abgebrochen. Eine leere Liste (`users: []`)
-  beendet alle Sessions. Mit `auth.mode: jwt` laufen offene Sessions dagegen weiter, mit
-  `auth.jwt.closeSessionsAtExpiry: true` bis zum `exp` des Tokens.
+  beendet alle Sessions. Wer einen Benutzer sicher aussperren will (etwa nach einem geleakten Token), setzt
+  `disabled: true`: Das prüft das Gateway auch nach einem Neustart oder Failover, ein entferntes Token nicht. Mit
+  `auth.mode: jwt` laufen offene Sessions dagegen weiter, mit `auth.jwt.closeSessionsAtExpiry: true` bis zum
+  `exp` des Tokens.
 * Leerzeichen und Zeilenumbrüche am Dateiende ignoriert das Gateway.
 * Die Base lässt sich auch remote einbinden, z. B.
   `https://github.com/<org>/quack-multiplexer//deploy/kubernetes/base?ref=<tag>`.

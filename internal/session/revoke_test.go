@@ -148,8 +148,8 @@ func TestRevokedSessionIsNotAdopted(t *testing.T) {
 		t.Fatalf("Resolve = %v, %+v, %v; want the session closed as revoked", s, c, err)
 	}
 	m.Wait()
-	if got := b.messages(); !slices.Equal(got, []string{"HEARTBEAT", "CANCEL", "DISCONNECT"}) {
-		t.Fatalf("messages to the engine %q", got)
+	if got := b.messages(); !slices.Equal(got, []string{"CANCEL", "DISCONNECT"}) {
+		t.Fatalf("messages to the engine %q, want CANCEL and DISCONNECT without a confirming HEARTBEAT", got)
 	}
 	if n := m.Count(); n != 0 {
 		t.Fatalf("%d sessions open, want none", n)
@@ -161,6 +161,62 @@ func TestRevokedSessionIsNotAdopted(t *testing.T) {
 		BackendConnID: strings.Repeat("B", 32), User: "alice", CreatedUnix: m.now().Unix(), HeartbeatTimeout: 60})
 	if s, c, err := m.Resolve(id); s == nil || c != nil || err != nil {
 		t.Fatalf("Resolve = %v, %+v, %v; want the session adopted", s, c, err)
+	}
+}
+
+// blockingRevoker revokes everybody; its first call waits for release.
+type blockingRevoker struct {
+	calls   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingRevoker) Revoked(string, string, string, time.Time) string {
+	first := false
+	r.once.Do(func() { first = true })
+	r.calls <- struct{}{}
+	if first {
+		<-r.release
+	}
+	return "the user was removed"
+}
+
+// A request that comes while another one adopts a revoked session does not
+// get the session either: it is never visible.
+func TestConcurrentRequestsDoNotSeeARevokedSession(t *testing.T) {
+	b := &recordingBackend{}
+	m, _ := newTestManager(t, adoptEngines{}, b)
+	rv := &blockingRevoker{calls: make(chan struct{}, 2), release: make(chan struct{})}
+	m.SetRevoker(rv)
+	id, err := m.sealer.Seal(Route{SessionID: NewSessionID(), EngineUID: engine.UIDOf("e1"),
+		BackendConnID: strings.Repeat("A", 32), User: "alice", CreatedUnix: m.now().Unix(), HeartbeatTimeout: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		s *Session
+		c *Closed
+	}
+	first := make(chan result, 1)
+	go func() {
+		s, c, _ := m.Resolve(id)
+		first <- result{s, c}
+	}()
+	<-rv.calls // the first adoption asks the revoker and waits
+	s, c, err := m.Resolve(id)
+	if err != nil || s != nil || c == nil || !strings.HasPrefix(c.Reason, "access revoked") {
+		t.Fatalf("second request: %v, %+v, %v; want the session closed as revoked", s, c, err)
+	}
+	close(rv.release)
+	if r := <-first; r.s != nil || r.c == nil || !strings.HasPrefix(r.c.Reason, "access revoked") {
+		t.Fatalf("first request: %v, %+v; want the session closed as revoked", r.s, r.c)
+	}
+	m.Wait()
+	if got := b.messages(); !slices.Equal(got, []string{"CANCEL", "DISCONNECT"}) {
+		t.Fatalf("messages to the engine %q, want one CANCEL and one DISCONNECT", got)
+	}
+	if n := m.Count(); n != 0 {
+		t.Fatalf("%d sessions open, want none", n)
 	}
 }
 

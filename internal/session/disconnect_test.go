@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"quackmux/internal/engine"
 	"quackmux/internal/upstream"
 	"quackmux/internal/wire"
 )
@@ -86,5 +87,40 @@ func TestShutdownEndsDisconnectRetries(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Shutdown waited for the DISCONNECT retries")
+	}
+}
+
+// After a DISCONNECT that failed, the tombstone stays until the engine lease
+// of the connection ran out, also past session.tombstoneTTL: a request with
+// the session's id would adopt the connection again.
+func TestFailedDisconnectKeepsTheTombstoneForTheLease(t *testing.T) {
+	b := &flakyBackend{failures: 99, err: errors.New("dial tcp: connection refused")}
+	m, open := newTestManager(t, liveEngines{}, b)
+	m.disconnectRetries = []time.Duration{time.Millisecond}
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	m.SetClock(func() time.Time { return now })
+	s := open()
+	id, err := m.sealer.Seal(Route{SessionID: s.ID, EngineUID: engine.UIDOf(s.EngineID), BackendConnID: s.BackendConnID,
+		User: s.User, CreatedUnix: s.CreatedAt.Unix(), HeartbeatTimeout: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Close(s.ID, "admin", CloseMode{Disconnect: true, Force: true})
+	m.Wait()
+
+	sc := m.cfg.Session
+	lease := sc.BackendHeartbeatTimeout.Duration + sc.HeartbeatGrace.Duration
+	if lease <= sc.TombstoneTTL.Duration {
+		t.Fatalf("test needs a lease (%s) longer than the tombstone TTL (%s)", lease, sc.TombstoneTTL.Duration)
+	}
+	now = now.Add(sc.TombstoneTTL.Duration + time.Second)
+	m.Reap()
+	if _, c, err := m.Resolve(id); err != nil || c == nil || c.Reason != "admin" {
+		t.Fatalf("after the tombstone TTL: %+v, %v; want the tombstone (admin)", c, err)
+	}
+	now = now.Add(lease - sc.TombstoneTTL.Duration)
+	m.Reap()
+	if _, c, err := m.Resolve(id); err != nil || c == nil || c.Reason == "admin" {
+		t.Fatalf("after the lease: %+v, %v; want the tombstone gone", c, err)
 	}
 }
