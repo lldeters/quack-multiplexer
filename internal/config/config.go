@@ -81,6 +81,9 @@ type UpstreamConfig struct {
 	// engine until a batch is ready, so a limit must exceed the longest
 	// expected wait for the first rows of a query.
 	ResponseHeaderTimeout Duration `json:"responseHeaderTimeout,omitempty"`
+	// MaxIdleConnsPerEngine bounds the idle keep-alive connections kept per
+	// engine (default 256: a DuckDB client keeps up to 256 FETCH long-polls
+	// open per session; below that, a burst opens and closes connections).
 	MaxIdleConnsPerEngine int      `json:"maxIdleConnsPerEngine,omitempty"`
 	IdleConnTimeout       Duration `json:"idleConnTimeout,omitempty"`
 	// ControlTimeout bounds requests the gateway sends on its own
@@ -549,7 +552,7 @@ func (c *Config) ApplyDefaults() {
 	}
 	u := &s.Upstream
 	setDur(&u.DialTimeout, 5*time.Second)
-	setInt(&u.MaxIdleConnsPerEngine, 64)
+	setInt(&u.MaxIdleConnsPerEngine, 256)
 	setDur(&u.IdleConnTimeout, 90*time.Second)
 	setDur(&u.ControlTimeout, 10*time.Second)
 	setDur(&u.HandshakeTimeout, 30*time.Second)

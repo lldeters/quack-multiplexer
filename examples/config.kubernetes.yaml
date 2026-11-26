@@ -59,8 +59,10 @@ server:
     # engine until the next batch is ready, so a limit must exceed the
     # longest expected wait for the first rows of a query.
     responseHeaderTimeout: 0s
-    # Idle keep-alive connections kept per engine.
-    maxIdleConnsPerEngine: 64
+    # Idle keep-alive connections kept per engine. A DuckDB client keeps up
+    # to 256 FETCH long-polls open per session; the engine serves up to 1024
+    # connections, one thread each.
+    maxIdleConnsPerEngine: 256
     # Idle keep-alive connections are closed after this long.
     idleConnTimeout: 90s
     # Timeout of requests the gateway sends on its own (DISCONNECT and
