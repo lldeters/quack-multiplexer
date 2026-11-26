@@ -319,7 +319,8 @@ func cmdServe(args []string) error {
 	engines.SetSessionCloser(sessions)
 	if rv, ok := authn.(auth.Revalidator); ok {
 		// Removing a user or token, disabling a user or taking a user out of
-		// a group also ends the sessions that are open (session.checkInterval).
+		// the group of a GROUP session also ends the sessions that are open
+		// (session.checkInterval).
 		sessions.SetRevoker(rv)
 	}
 
@@ -434,11 +435,12 @@ func cmdServe(args []string) error {
 	go func() { errc <- serve(quackSrv, cfg.Server.TLS, "quack", log) }()
 	var adminSrv *http.Server
 	if cfg.Admin.Listen != "" {
-		// The admin API answers small requests at once: bounded reads and
-		// idle keep-alive connections keep a client that only opens
-		// connections from tying up file descriptors.
+		// The admin API answers small requests: bounded reads and idle
+		// keep-alive connections keep a client that only opens connections
+		// from tying up file descriptors. The read deadline also cancels the
+		// context of a running request, so it lies past the longest one.
 		adminSrv = &http.Server{Addr: cfg.Admin.Listen, Handler: adm, ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
+			ReadTimeout: admin.MaxRequestDuration + 30*time.Second, IdleTimeout: 2 * time.Minute}
 		go func() { errc <- serve(adminSrv, cfg.Admin.TLS, "admin", log) }()
 	}
 
