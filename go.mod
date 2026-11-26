@@ -3,7 +3,7 @@ module quackmux
 go 1.26.11
 
 require (
-	github.com/go-logr/logr v1.4.3
+	github.com/go-logr/logr v1.4.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/prometheus/client_golang v1.25.0
 	golang.org/x/sync v0.25.0
