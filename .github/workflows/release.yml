@@ -90,7 +90,8 @@ jobs:
             mkdir "dist/$name"
             CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath \
               -ldflags "-s -w -X main.version=$VERSION" -o "dist/$name/quackmux$ext" ./cmd/quackmux
-            cp README.md "dist/$name/"
+            cp README.md LICENSE NOTICE "dist/$name/"
+            GOOS=$goos GOARCH=$goarch bash scripts/third-party-licenses.sh "dist/$name"
             if [ "$goos" = windows ]; then
               (cd dist && zip -qr "$name.zip" "$name")
             else

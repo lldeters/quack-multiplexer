@@ -20,6 +20,7 @@ als einzelner Quack-Server.
 | `/usr/local/share/quackmux/authorize-cases.tsv` | Fälle, die das Makro ablehnen oder durchlassen muss ([`authorize-cases.tsv`](authorize-cases.tsv)) |
 | `/usr/local/bin/quackmux-authorize-test` | Prüft eine gehärtete Engine oder ein Gateway davor mit diesen Fällen ([`authorize-test.sh`](authorize-test.sh)) |
 | `/data` | leerer Mountpoint für Datenbankdateien, gehört dem Engine-Benutzer |
+| `/licenses` | Lizenzen: quackmux (Apache 2.0), DuckDB, `quack` und `httpfs` (MIT); Übersicht in [`licenses/README`](licenses/README) |
 
 Der Prozess läuft als Benutzer `duckdb` (UID/GID 1000) mit `HOME=/tmp` und Arbeitsverzeichnis `/tmp`. Port: 9494.
 Basis ist `debian:bookworm-slim`; das offizielle `duckdb/duckdb`-Image ist distroless und hat keine Shell.
@@ -223,6 +224,8 @@ docker build --build-arg DUCKDB_EXTENSIONS="quack httpfs aws ducklake postgres_s
 ```
 
 Community-Extensions mit `name@community` (z. B. `h3@community`), eigene Repositories mit `name@https://…`.
+Wer das Image mit weiteren Extensions weitergibt, legt deren Lizenzen nach [`licenses/`](licenses/) (die
+Core-Extensions von DuckDB stehen meist unter MIT, Community-Extensions unter eigenen Lizenzen).
 
 Oder als abgeleitetes Image:
 

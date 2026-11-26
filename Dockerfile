@@ -25,6 +25,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
     go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o /out/quackmux ./cmd/quackmux
+# The licenses of quackmux and of the Go modules linked into the binary.
+RUN GOOS=linux GOARCH=$TARGETARCH bash scripts/third-party-licenses.sh /out/licenses ./cmd/quackmux && \
+    cp LICENSE NOTICE /out/licenses/
 
 # -----------------------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
@@ -33,9 +36,11 @@ ARG VERSION=dev
 
 LABEL org.opencontainers.image.title="quackmux" \
       org.opencontainers.image.description="Multiplexing gateway for the DuckDB Quack protocol" \
-      org.opencontainers.image.version="${VERSION}"
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=build /out/quackmux /quackmux
+COPY --from=build /out/licenses /licenses
 
 # 9494: Quack endpoint, 9495: admin API, metrics and health checks.
 EXPOSE 9494 9495
