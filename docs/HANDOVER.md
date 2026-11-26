@@ -214,6 +214,14 @@ TLS-Doku für Clients ([docs/tls.md](tls.md), Compose-Szenario l), Spill-Grenzen
 das Helm-Chart (`deploy/helm/quackmux`), die Lizenz (Apache 2.0, `LICENSE` und `NOTICE`; Lizenzen Dritter in den
 Release-Archiven und unter `/licenses` in den Images) und das Release 0.1.0.
 
+Nach 0.1.0 aus einer Security-, Performance- und Bug-Analyse: Eine Änderung der Token-Datei beendet offene Sessions
+(`auth.mode: static`), optional enden JWT-Sessions bei `exp` (`auth.jwt.closeSessionsAtExpiry`); ein Benutzer belegt
+höchstens einen Anteil des Pufferbudgets (`server.upstream.maxBufferedBytesPerUser`); ein gescheitertes `DISCONNECT`
+an die Engine wird wiederholt; der Admin-Port begrenzt Lese- und Idle-Zeiten; bis zu 256 Idle-Verbindungen pro
+Engine (`server.upstream.maxIdleConnsPerEngine`); ein Lesepuffer pro Engine-Antwort aus einem Pool (etwa 20 % weniger
+CPU und 60 % weniger Allokation pro Request); unbekannte Nachrichtentypen zählen unter einem Metrik-Label; Tests für
+den JWT-Authenticator und Fuzz-Tests für alle Decoder; `govulncheck` in CI und nachts, Dependabot, `make tidy-check`.
+
 1. **Nach dem ersten Release:** die Pakete `quackmux` und `duckdb-engine` auf GHCR öffentlich stellen
    ([docs/releasing.md](releasing.md)), sonst brauchen Cluster ein Pull-Secret.
 2. **Upstream-Bug in client-go einreichen:** Der Entwurf liegt in

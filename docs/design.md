@@ -150,7 +150,9 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
    unverändert weitergeben, `Content-Length` anpassen.
    * Die Engine (cpp-httplib) bricht Verbindungen ab, die mehr als 5 s stocken. Deshalb puffert das Gateway
      Requests bis 100 MiB und Responses bis 64 MiB komplett im Speicher. Das Gesamtbudget liegt bei 1 GiB. Damit
-     bringt ein langsamer Client die Engine nie in den Timeout.
+     bringt ein langsamer Client die Engine nie in den Timeout. Ein Benutzer belegt davon höchstens
+     `server.upstream.maxBufferedBytesPerUser` (Default ein Viertel des Budgets), damit ein einzelner Benutzer
+     mit vielen großen Uploads die anderen nicht ins Streaming drängt.
    * Größere Nachrichten oder ein erschöpftes Budget werden gestreamt.
    * Requests über 100 MiB, also über dem Engine-Limit, lehnt das Gateway sofort mit einem Quack-Fehler ab.
 6. Antwort weitergeben. Ein FETCH kann serverseitig lange blockieren, deshalb gibt es kein Response-Timeout. Die
@@ -171,7 +173,7 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 ```
            connect ok                     DISCONNECT ok / Fehler „Invalid connection id“
  (neu) ───────────────▶ OPEN ─────────────────────────────────────────────▶ CLOSED (Tombstone, TTL 1h)
-                         │  idle timeout | max lifetime | Admin-Kill | Engine-Drain-Timeout
+                         │  idle timeout | max lifetime | Admin-Kill | Engine-Drain-Timeout | Zugang entzogen
                          ├──────────────▶ CLOSING ── CANCEL(wildcard) + DISCONNECT an Engine ──▶ CLOSED
                          │  keine Nachricht seit heartbeatTimeout + heartbeatGrace (Client tot)
                          └──────────────▶ CLOSING ── DISCONNECT an Engine (räumt Backend auf) ──▶ CLOSED
@@ -183,6 +185,12 @@ höchstens ~140 Zeichen und lehnt alles ab, was länger würde.
 * Lease-Ablauf: keine Nachricht (auch kein Heartbeat) für `heartbeatTimeout + heartbeatGrace` bei
   `inFlight == 0`.
 * Bei jedem Schließen wird die Session von der Engine abgemeldet (`sessions--`).
+* Scheitert das `DISCONNECT` an die Engine (Engine kurz nicht erreichbar), wiederholt das Gateway es nach 1 s und
+  nach 3 s und loggt danach eine Warnung. Eine Engine, die die Verbindung nicht mehr kennt, gilt als erledigt.
+  Bleibt die Verbindung auf der Engine, läuft sie wie eine verwaiste Verbindung bis zum Ende ihrer Lease aus
+  (Abschnitt 6).
+* Wird der Zugang entzogen (Abschnitt 8), schließt das Gateway die Session bei der nächsten Prüfung, auch während
+  eines Requests, und bricht ihre Query ab.
 * Mit Query-Zeitlimit kann das `DISCONNECT` an die Engine warten, bis das Limit mit den Queries der Session fertig ist
   (Abschnitt 5.3, „Schließen der Session“).
 
