@@ -202,16 +202,15 @@ zwei Lecks im Engine-Image geschlossen: das Engine-Token über `FROM _` und Befe
 ein optionales Zeitlimit pro Query (`limits.queryTimeout`, CANCEL auf der Engine, Compose-Szenario h), das
 Aufräumen verwaister Verbindungen nach einem Neustart (`engine.closeOrphanedConnections`, Compose-Szenario k), die
 TLS-Doku für Clients ([docs/tls.md](tls.md), Compose-Szenario l), Spill-Grenzen in den mitgelieferten Profilen,
-das Helm-Chart (`deploy/helm/quackmux`) und das Release 0.1.0.
+das Helm-Chart (`deploy/helm/quackmux`), die Lizenz (Apache 2.0, `LICENSE` und `NOTICE`; Lizenzen Dritter in den
+Release-Archiven und unter `/licenses` in den Images) und das Release 0.1.0.
 
-1. **Lizenz festlegen.** Das Repository hat noch keine `LICENSE`; ohne sie darf niemand den Code oder die Images
-   nutzen. Die Wahl trifft der Maintainer.
-2. **Nach dem ersten Release:** die Pakete `quackmux` und `duckdb-engine` auf GHCR öffentlich stellen
+1. **Nach dem ersten Release:** die Pakete `quackmux` und `duckdb-engine` auf GHCR öffentlich stellen
    ([docs/releasing.md](releasing.md)), sonst brauchen Cluster ein Pull-Secret.
-3. **Upstream-Bug in client-go einreichen:** Der Entwurf liegt in
+2. **Upstream-Bug in client-go einreichen:** Der Entwurf liegt in
    [docs/upstream/client-go-leaderelection-release.md](upstream/client-go-leaderelection-release.md) (ein
    Leader, der nach einer Pause aufwacht, gibt die Lease des neuen Leaders frei; quackmux umgeht das schon).
-4. Optional:
+3. Optional:
    * TLS-Zertifikat ohne Neustart neu laden (das Gateway liest `server.tls` nur beim Start). Gepinnte Clients
      (`ssl_fingerprint`) haben 30 s `http_timeout` nur mit geladenem httpfs, sonst 300 s; statt eines Warm-Pools
      hilft `SET GLOBAL http_timeout = 86400` vor dem `ATTACH` ([docs/tls.md](tls.md)).
@@ -247,6 +246,5 @@ make help   # oder Makefile ansehen: build, test, docker-engine, docker-gateway,
 **Prompt für die nächste Cloud-Session** (zum Einfügen):
 
 > Lies `docs/HANDOVER.md` und die dort verlinkten Dokumente. Arbeite dann die „Nächsten Schritte“ in der
-> angegebenen Reihenfolge ab (die Lizenz wählt der Maintainer, frag nach). Halte dich strikt an die „Harten
-> Randbedingungen“.
+> angegebenen Reihenfolge ab. Halte dich strikt an die „Harten Randbedingungen“.
 > Committe in kleinen Schritten auf einem Feature-Branch und antworte mir auf Deutsch.

@@ -125,7 +125,8 @@ LABEL org.opencontainers.image.title="quackmux-duckdb-engine" \
       org.opencontainers.image.version="${DUCKDB_VERSION}" \
       org.opencontainers.image.base.name="${BASE_IMAGE}" \
       io.quackmux.duckdb.version="${DUCKDB_VERSION}" \
-      io.quackmux.duckdb.extensions="${DUCKDB_EXTENSIONS}"
+      io.quackmux.duckdb.extensions="${DUCKDB_EXTENSIONS}" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT"
 
 # User and group 1000 "duckdb" with HOME=/tmp; /data is a mount point for
 # database files that the engine user may write to.
@@ -142,6 +143,8 @@ COPY --from=duckdb /opt/duckdb/extensions /opt/duckdb/extensions
 COPY --from=duckdb /usr/local/bin/quackmux-engine /usr/local/bin/quackmux-engine-selftest /usr/local/bin/quackmux-authorize-test \
      /usr/local/bin/
 COPY --from=duckdb /usr/local/share/quackmux /usr/local/share/quackmux
+# quackmux (Apache-2.0), DuckDB and its extensions (MIT); see licenses/README.
+COPY licenses/ /licenses/
 
 ENV HOME=/tmp
 WORKDIR /tmp

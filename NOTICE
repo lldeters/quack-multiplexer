@@ -1,0 +1,8 @@
+quackmux
+Copyright 2026 Leif Deters
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The release archives and the container images also contain third-party
+software under its own licenses: THIRD_PARTY_LICENSES in the archives,
+/licenses in the images.

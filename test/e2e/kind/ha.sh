@@ -735,6 +735,14 @@ trap 'exit 143' TERM
 
 scenario_failed_hook() {
 	local f
+	# A scenario that failed while a gateway was frozen resumes it: the
+	# clients' keep-alive connections to it would hang in the steps after it
+	# (such as the final DETACH) until its liveness probe restarts it.
+	if [ -n "$FROZEN_PID" ]; then
+		say "  kill -CONT $FROZEN_PID: resuming the gateway the failed scenario froze"
+		docker exec "$FROZEN_NODE" kill -CONT "$FROZEN_PID" 2>/dev/null || true
+		FROZEN_NODE='' FROZEN_PID=''
+	fi
 	for f in "$E2E_WORK"/c*.log; do
 		if [ -f "$f" ]; then
 			say "  client output ($(basename "$f")):"
@@ -1058,6 +1066,38 @@ ATTACH '$uri' AS remote (DISABLE_SSL true);
 SELECT '$1-attached=' || x AS result FROM remote.query('SELECT ''ok'' AS x');"
 }
 
+# attach_persistent ID SUBDOMAIN attaches like start_persistent through the
+# Service, right after a failover: the EndpointSlice may name the new leader
+# before kube-proxy routes to it, and a connect in that gap fails with "Could
+# not connect to server" without running anything (deploy/kubernetes/README.md,
+# "Hochverfügbarkeit"). Such an ATTACH is retried; later waits on the session
+# must not fail on the word Error of an earlier attempt.
+attach_persistent() {
+	local id=$1 attempt=1 uri=quack:$SVC:$SVC_PORT
+	session_start "$id" "${CLIENT_CMD[@]}" || return 1
+	session_send "$id" "$(client_preamble)
+CREATE SECRET (TYPE quack, TOKEN '$CLIENT_TOKEN?share_level=user&profile=persistent&subdomain=$2', SCOPE '$uri');
+SELECT '$id-secret' AS result;" || return 1
+	session_wait "$id" "$id-secret" 60 || return 1
+	while :; do
+		session_send "$id" "ATTACH '$uri' AS remote (DISABLE_SSL true);
+SELECT '$id-attached=' || x AS result FROM remote.query('SELECT ''ok'' AS x');
+SELECT '$id-attach-$attempt' AS result;" || return 1
+		session_wait "$id" "$id-attach-$attempt" "$ATTACH_TIMEOUT" '' || return 1
+		if session_output "$id" | grep -qF -- "$id-attached=ok"; then
+			return 0
+		fi
+		if [ "$attempt" -ge 5 ] || ! session_output "$id" | grep -qF -- "Could not connect to server"; then
+			bad "session $id did not attach:"
+			session_output "$id" | indent
+			return 1
+		fi
+		warn "session $id: the Service does not route to the new leader yet (attempt $attempt); retrying"
+		attempt=$((attempt + 1))
+		sleep 2
+	done
+}
+
 # persistent_engine SUBDOMAIN prints the engine pod of the key
 # USER/HA_USER/SUBDOMAIN/persistent that is not being deleted.
 persistent_engine() {
@@ -1138,10 +1178,9 @@ SELECT 'p1-created' AS result;" || return 1
 	wait_for 90 "$takeover to take over the lease" leader_is "$takeover" || return 1
 	wait_for 60 "service/$SVC to route to $takeover only" routes_only_to "$takeover" || return 1
 	ok "$takeover leads $(($(now) - start))s after the freeze, and the Service routes to it"
-	start_persistent p2 default || return 1
-	session_wait p2 p2-attached=ok "$ATTACH_TIMEOUT" || return 1
+	attach_persistent p2 default || return 1
 	session_send p2 "SELECT 'p2-sees=' || CAST(x AS VARCHAR) AS result FROM remote.h6_t;" || return 1
-	session_wait p2 p2-sees=7 60 || return 1
+	session_wait p2 p2-sees=7 60 '' || return 1
 	expect_eq "$(persistent_engine default)" "$e" "the new leader gives a new session of the key the adopted engine $e" || return 1
 	pf_start "$takeover" || return 1
 	api GET "$ADMIN_URL" "/api/v1/volumes?owner=$HA_USER" "$out"

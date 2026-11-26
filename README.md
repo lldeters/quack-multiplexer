@@ -130,3 +130,14 @@ Die Unit- und Integrationstests laufen gegen einen protokolltreuen Fake-Quack-Se
 noch DuckDB. Die E2E-Tests in [test/e2e](test/e2e) prüfen das Zusammenspiel mit echten DuckDB-2.0-Clients und
 -Engines. GitHub Actions führt alles bei jedem Pull Request aus, die HA-Szenarien nächtlich
 ([docs/releasing.md](docs/releasing.md)).
+
+## Lizenz
+
+quackmux steht unter der [Apache License 2.0](LICENSE), Copyright 2026 Leif Deters ([NOTICE](NOTICE)): Jeder
+darf es kostenlos nutzen, ändern und weitergeben, auch kommerziell, solange LICENSE und NOTICE dabei bleiben.
+
+Die Release-Archive und Images enthalten außerdem Software Dritter unter deren Lizenzen, alle ohne Copyleft:
+die Go-Module des Gateways (Apache 2.0, MIT, BSD; `THIRD_PARTY_LICENSES` in den Archiven, `/licenses` im
+Gateway-Image, erzeugt mit [scripts/third-party-licenses.sh](scripts/third-party-licenses.sh)) und im
+Engine-Image DuckDB mit den Extensions `quack` und `httpfs` (MIT, `/licenses` im Image,
+[images/engine/licenses](images/engine/licenses)).

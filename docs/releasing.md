@@ -18,7 +18,10 @@ Ein Tag `vX.Y.Z` startet `release.yml`:
 
 1. Die Checks laufen noch einmal, und `scripts/check-image-refs.sh X.Y.Z` prüft, dass das Repository genau dieses
    Release referenziert, auch `version` und `appVersion` des Helm-Charts.
-2. Ein GitHub-Release mit den Binaries für linux, darwin und windows (amd64 und arm64) als `tar.gz` bzw. `zip`,
+2. Ein GitHub-Release mit den Binaries für linux, darwin und windows (amd64 und arm64) als `tar.gz` bzw. `zip`
+   (jeweils mit `LICENSE`, `NOTICE` und `THIRD_PARTY_LICENSES`, den Lizenzen der Go-Module aus
+   [scripts/third-party-licenses.sh](../scripts/third-party-licenses.sh); ein Modul ohne Lizenzdatei bricht das
+   Release ab),
    dem Helm-Chart als `quackmux-X.Y.Z.tgz` ([deploy/helm/quackmux](../deploy/helm/quackmux/README.md)) und
    `SHA256SUMS`.
 3. Images für amd64 und arm64 auf der GitHub Container Registry:

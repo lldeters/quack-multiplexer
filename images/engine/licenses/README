@@ -1,0 +1,11 @@
+Licenses of the software in the quackmux engine image (/licenses):
+
+  LICENSE, NOTICE        quackmux (the entrypoint and scripts of this image),
+                         Apache License 2.0
+  duckdb.LICENSE         DuckDB 2.0.0 CLI (github.com/duckdb/duckdb, v2.0.0), MIT
+  duckdb-quack.LICENSE   the quack extension (github.com/duckdb/duckdb-quack), MIT
+  duckdb-httpfs.LICENSE  the httpfs extension (github.com/duckdb/duckdb-httpfs), MIT
+
+tini, ca-certificates and the Debian base keep their copyright files under
+/usr/share/doc. An image built with other extensions (DUCKDB_EXTENSIONS) must
+add their licenses here.
